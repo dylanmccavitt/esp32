@@ -1,6 +1,8 @@
-#include "renderer.hpp"
+#include "fluid_app.hpp"
 
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 
 #include "esp_heap_caps.h"
@@ -11,14 +13,13 @@ namespace fluid_demo {
 
 namespace {
 
-constexpr const char *kTAG = "renderer";
+constexpr const char *kTag = "fluid_demo";
 
-// Native square panel geometry is canonical on the shell's DisplayService;
-// these aliases keep the raster code below unchanged.
-constexpr int kWidth = DisplayService::kWidth;
-constexpr int kHeight = DisplayService::kHeight;
-constexpr int kStripeRows = DisplayService::kStripeRows;
-constexpr int kStripeCount = DisplayService::kStripeCount;
+// Native square panel geometry (mirrors DisplayService constants; the app
+// drives sequencing through DisplayFrame ops, but the raster row strides here
+// are canonical and byte-identical to the pre-split renderer).
+constexpr int kWidth = 240;
+constexpr int kHeight = 240;
 constexpr int kSurfaceScale = 2;
 constexpr int kSurfaceWidth = kWidth / kSurfaceScale;
 constexpr int kSurfaceHeight = kHeight / kSurfaceScale;
@@ -51,20 +52,25 @@ inline int max_int(int a, int b) { return a > b ? a : b; }
 
 }  // namespace
 
-Renderer::Renderer() = default;
+FluidBoxApp s_fluid_app;
 
-Renderer::~Renderer()
+FluidBoxApp::~FluidBoxApp()
 {
     free_buffers();
 }
 
-esp_err_t Renderer::init(DisplayService *display)
+// ---------------------------------------------------------------------------
+// Setup / teardown
+// ---------------------------------------------------------------------------
+
+esp_err_t FluidBoxApp::setup_once()
 {
-    if (display == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (initialized_) {
+    if (setup_done_) {
         return ESP_OK;  // idempotent
+    }
+
+    if (!fluid_.init(kInitialParticles)) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     const size_t surface_bytes =
@@ -83,7 +89,7 @@ esp_err_t Renderer::init(DisplayService *display)
         heap_caps_free(heat);
         heap_caps_free(depth);
         heap_caps_free(proj);
-        ESP_LOGE(kTAG, "surface renderer buffer allocation failed");
+        ESP_LOGE(kTag, "fluid app buffer allocation failed");
         return ESP_ERR_NO_MEM;
     }
 
@@ -92,15 +98,14 @@ esp_err_t Renderer::init(DisplayService *display)
     surface_depth_ = depth;
     proj_ = proj;
     build_luts();
+    setup_done_ = true;
 
-    display_ = display;
-    initialized_ = true;
-    ESP_LOGI(kTAG, "init: 240x240x16bpp, %d stripes x %d rows, %dx%d connected surface",
-             kStripeCount, kStripeRows, kSurfaceWidth, kSurfaceHeight);
+    ESP_LOGI(kTag, "fluid initialized: %u particles, radius %.4f",
+             static_cast<unsigned>(fluid_.count()), fluid_.particle_radius());
     return ESP_OK;
 }
 
-void Renderer::free_buffers()
+void FluidBoxApp::free_buffers()
 {
     heap_caps_free(surface_field_);
     heap_caps_free(surface_heat_);
@@ -110,35 +115,254 @@ void Renderer::free_buffers()
     surface_heat_ = nullptr;
     surface_depth_ = nullptr;
     proj_ = nullptr;
-    initialized_ = false;
+    setup_done_ = false;
 }
 
-RenderStats Renderer::stats() const
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+esp_err_t FluidBoxApp::enter()
 {
-    RenderStats s = {};
-    s.frame_us = frame_us_;
-    s.raster_us = raster_us_;
-    s.dma_wait_us = dma_wait_us_;
-    s.missed_transfers = (display_ != nullptr) ? display_->missed_transfers() : 0;
-    return s;
+    // Post-barrier: the render lane is idle, so this drain is the sole
+    // snapshot consumer. Retire any stale READY frames so the first post-enter
+    // render shows a fresh exchange entry rather than a pre-transition frame.
+    const ParticleFrame *stale = snapshots_.acquire_latest();
+    while (stale != nullptr) {
+        snapshots_.release(stale);
+        stale = snapshots_.acquire_latest();
+    }
+    frame_seen_ = false;
+    // A pending reset set while inactive stays set: the first update() below
+    // consumes it via exchange(false) exactly once (never dropped, never
+    // doubled). Running-time requests were already consumed before the lanes
+    // acked the quiesce, so nothing stale leaks across the transition.
+    return ESP_OK;
 }
 
-esp_err_t Renderer::request_capture()
+void FluidBoxApp::leave()
 {
-    return (display_ != nullptr) ? display_->request_capture() : ESP_ERR_INVALID_STATE;
+    // No allocation; quiesce motion validity so a resumed run never applies a
+    // stale gravity vector from a previous lifecycle.
+    portENTER_CRITICAL(&motion_mux_);
+    motion_.valid = false;
+    portEXIT_CRITICAL(&motion_mux_);
 }
 
-bool Renderer::capture_ready() const
+ShellAction FluidBoxApp::handle_event(AppEvent event)
 {
-    return display_ != nullptr && display_->capture_ready();
+    // PlusPress is the only routed event: it sets the app's reset atomic,
+    // consumed exactly once by the first post-enter update(). No event
+    // requires a shell action in this slice.
+    if (event == AppEvent::PlusPress) {
+        request_fluid_reset();
+    }
+    return ShellAction::None;
 }
 
-const uint8_t *Renderer::capture_data() const
+// ---------------------------------------------------------------------------
+// Sensor lane: motion filter + override bypass
+// ---------------------------------------------------------------------------
+
+bool FluidBoxApp::on_motion(const MotionTick &tick)
 {
-    return (display_ != nullptr) ? display_->capture_data() : nullptr;
+    if (!tick.fresh) {
+        // A stale/failed IMU read still honors an active override (legacy
+        // app_main.cpp:313-320): the injected value publishes, the last valid
+        // raw read stays untouched.
+        if (tick.override_active) {
+            portENTER_CRITICAL(&motion_mux_);
+            motion_.apparent_accel = tick.apparent_accel;
+            motion_.valid = true;
+            portEXIT_CRITICAL(&motion_mux_);
+        }
+        return false;
+    }
+
+    // The filter always tracks the physical IMU, so a later `release` resumes
+    // from a live state. An override only replaces the published apparent
+    // value (bypasses the filter verbatim, matching app_main.cpp:296-320).
+    const Vec3 apparent = filter_.update(tick.accel_mps2, tick.gyro_rads, tick.dt);
+    const bool accepted = filter_.last_sample_accepted();
+    if (!accepted) {
+        // A rejected fresh sample keeps the last valid raw/filter state, but
+        // an active override still publishes verbatim (the legacy override
+        // check ran after the filter branch regardless of acceptance).
+        if (tick.override_active) {
+            portENTER_CRITICAL(&motion_mux_);
+            motion_.apparent_accel = tick.apparent_accel;
+            motion_.valid = true;
+            portEXIT_CRITICAL(&motion_mux_);
+        }
+        return false;
+    }
+    portENTER_CRITICAL(&motion_mux_);
+    motion_.apparent_accel = tick.override_active ? tick.apparent_accel : apparent;
+    motion_.raw_accel = tick.accel_mps2;
+    motion_.valid = true;
+    portEXIT_CRITICAL(&motion_mux_);
+    return true;
 }
 
-void Renderer::build_luts()
+void FluidBoxApp::request_fluid_reset()
+{
+    reset_requested_.store(true, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------------------
+// Physics lane: consume reset, step, publish
+// ---------------------------------------------------------------------------
+
+esp_err_t FluidBoxApp::update(float dt)
+{
+    // Handle a reset notification in this lane's context: swap the flag, then
+    // re-roll the fluid into its deterministic lattice. A request issued while
+    // inactive was never cleared by enter(), so this is its exactly-once
+    // consumption point.
+    if (reset_requested_.exchange(false)) {
+        fluid_.reset();
+        ESP_LOGI(kTag, "PLUS press - fluid reset (epoch %u)", fluid_.reset_epoch());
+    }
+
+    // Latest apparent acceleration from the sensor lane.
+    Vec3 apparent{0.0f, 0.0f, 6.0f};
+    portENTER_CRITICAL(&motion_mux_);
+    if (motion_.valid) {
+        apparent = motion_.apparent_accel;
+    }
+    portEXIT_CRITICAL(&motion_mux_);
+
+    // step() returns false only on a skip (never happens here: count is set at
+    // boot and dt is fixed finite) or when nonfinite state forced a
+    // deterministic reset — either way the frame below is still valid.
+    const int64_t step_start_us = esp_timer_get_time();
+    static_cast<void>(fluid_.step(apparent, dt));
+    physics_us_.store(static_cast<uint32_t>(esp_timer_get_time() - step_start_us));
+    const FluidStats &fluid_stats = fluid_.stats();
+    epoch_.store(fluid_.reset_epoch());
+    candidate_checks_.store(fluid_stats.candidate_checks);
+    nonfinite_resets_.store(fluid_stats.nonfinite_resets);
+
+    ParticleFrame *slot = snapshots_.begin_write();
+    if (slot == nullptr) {
+        return ESP_OK;  // defensive pool exhaustion; the lane guard preserves WDT
+    }
+    fluid_.fill_frame(*slot, ++sequence_);
+    snapshots_.publish(slot);
+    return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Render lane
+// ---------------------------------------------------------------------------
+
+AppStats FluidBoxApp::stats()
+{
+    AppStats st = {};
+    st.count = fluid_.count();
+    st.epoch = epoch_.load();
+    st.candidate_checks = candidate_checks_.load();
+    st.nonfinite_resets = nonfinite_resets_.load();
+    st.physics_us = physics_us_.load();
+    portENTER_CRITICAL(&motion_mux_);
+    st.raw[0] = motion_.raw_accel.x;
+    st.raw[1] = motion_.raw_accel.y;
+    st.raw[2] = motion_.raw_accel.z;
+    st.apparent[0] = motion_.apparent_accel.x;
+    st.apparent[1] = motion_.apparent_accel.y;
+    st.apparent[2] = motion_.apparent_accel.z;
+    portEXIT_CRITICAL(&motion_mux_);
+    st.raster_us = raster_us_;
+    st.frame_us = frame_us_;
+    return st;
+}
+
+bool FluidBoxApp::render(DisplayFrame &frame)
+{
+    if (!setup_done_ || frame.transport == nullptr) {
+        ESP_LOGW(kTag, "render failed: %s", esp_err_to_name(ESP_ERR_INVALID_STATE));
+        return false;
+    }
+    const ParticleFrame *snapshot = snapshots_.acquire_latest();
+    if (snapshot == nullptr) {
+        return false;  // blank pass: no new frame, no transport touched
+    }
+    const esp_err_t ret = render_frame(*snapshot, frame);
+    snapshots_.release(snapshot);
+    if (ret != ESP_OK) {
+        ESP_LOGW(kTag, "render failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+    return true;
+}
+
+esp_err_t FluidBoxApp::render_frame(const ParticleFrame &frame, DisplayFrame &df)
+{
+    const int64_t t_frame = esp_timer_get_time();
+    uint32_t raster_total = 0;
+
+    // The previous frame leaves its final stripe queued. Retire it before
+    // touching either ping-pong buffer; after a timeout, retrying this wait on
+    // the next frame remains safe because the in-flight flag stays set.
+    if (df.ops.wait_previous(df.transport) != ESP_OK) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const int count = (frame.count > kMaxParticles) ? kMaxParticles : frame.count;
+    preproject(frame, count);
+    project_box_edges();
+    const int64_t t_surface = esp_timer_get_time();
+    build_surface();
+    raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_surface);
+
+    // Frame-boundary capture latch (the old renderer.cpp:602 exchange point).
+    // The DisplayService mirrors when armed and re-arms on any mid-frame
+    // failure, so a request is never latched lazily mid-frame.
+    static_cast<void>(df.ops.latch_capture(df.transport));
+
+    for (int s = 0; s < df.stripe_count; s++) {
+        const int y0 = s * df.stripe_rows;
+        const int rows = min_int(df.stripe_rows, df.height - y0);
+        uint16_t *buf = df.stripe[s & 1];
+
+        // Rasterize into the idle stripe buffer while the previous stripe's DMA
+        // (stripe s-1, the other buffer) is still running.
+        const int64_t t_raster = esp_timer_get_time();
+        std::memset(buf, 0, static_cast<size_t>(df.width) * rows * sizeof(uint16_t));
+        draw_box_edges(buf, y0, rows);
+        shade_surface(buf, y0, rows);
+        raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_raster);
+
+        // Mirror (if armed) -> wait for the previous transfer (including the
+        // one carried from the previous frame) -> draw -> mark in flight.
+        esp_err_t ret = df.ops.submit(df.transport, s, y0, rows, buf);
+        if (ret != ESP_OK) {
+            // The DisplayService handles re-arming a failed capture; frame
+            // telemetry keeps the last completed frame's values.
+            return ret;
+        }
+    }
+
+    esp_err_t ret = df.ops.finish(df.transport);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    frame_us_ = static_cast<uint32_t>(esp_timer_get_time() - t_frame);
+    // The DisplayService resets its capture-copy counter at each latch and
+    // accumulates PSRAM mirror time across the armed frame's stripes; the
+    // reported raster duration includes it (byte-identical to the pre-split
+    // renderer's frame telemetry).
+    raster_us_ = raster_total + df.ops.capture_copy_us(df.transport);
+    frame_seen_ = true;
+    return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Raster helpers (moved verbatim from renderer.cpp)
+// ---------------------------------------------------------------------------
+
+void FluidBoxApp::build_luts()
 {
     // sqrt/shade LUT: nz = sqrt(1 - t), t = (d/r)^2, in [0, 1].
     // Used both for the front-surface depth reduction and the radial shade.
@@ -160,7 +384,7 @@ void Renderer::build_luts()
     }
 }
 
-uint16_t Renderer::hsv_to_rgb565(float h, float s, float v)
+uint16_t FluidBoxApp::hsv_to_rgb565(float h, float s, float v)
 {
     const float c = v * s;
     const float hp = h / 60.0f;
@@ -197,7 +421,7 @@ uint16_t Renderer::hsv_to_rgb565(float h, float s, float v)
     return static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5);
 }
 
-void Renderer::preproject(const ParticleFrame &frame, int count)
+void FluidBoxApp::preproject(const ParticleFrame &frame, int count)
 {
     active_count_ = count;
     const float radius_world = frame.particle_radius;
@@ -234,7 +458,7 @@ void Renderer::preproject(const ParticleFrame &frame, int count)
     }
 }
 
-void Renderer::project_box_edges()
+void FluidBoxApp::project_box_edges()
 {
     constexpr float corners[8][3] = {
         {-kBoxHalfX, kBoxHalfY, 0.0f},   // front TL
@@ -268,7 +492,7 @@ void Renderer::project_box_edges()
     edges_[11] = {sx[3], sy[3], sx[7], sy[7]};
 }
 
-void Renderer::draw_box_edges(uint16_t *buf, int y0, int rows)
+void FluidBoxApp::draw_box_edges(uint16_t *buf, int y0, int rows)
 {
     const int y1 = y0 + rows;
     const uint16_t edge = __builtin_bswap16(kEdgeColor);
@@ -313,7 +537,7 @@ void Renderer::draw_box_edges(uint16_t *buf, int y0, int rows)
     }
 }
 
-void Renderer::build_surface()
+void FluidBoxApp::build_surface()
 {
     constexpr size_t kSurfacePixels =
         static_cast<size_t>(kSurfaceWidth) * kSurfaceHeight;
@@ -384,7 +608,7 @@ void Renderer::build_surface()
     }
 }
 
-void Renderer::shade_surface(uint16_t *buf, int y0, int rows)
+void FluidBoxApp::shade_surface(uint16_t *buf, int y0, int rows)
 {
     constexpr uint32_t kBoxDepthFx =
         static_cast<uint32_t>(kBoxDepthZ * kDepthFxScale + 0.5f);
@@ -476,71 +700,6 @@ void Renderer::shade_surface(uint16_t *buf, int y0, int rows)
                 static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5));
         }
     }
-}
-
-esp_err_t Renderer::render(const ParticleFrame &frame)
-{
-    if (!initialized_ || display_ == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const int64_t t_frame = esp_timer_get_time();
-    const uint32_t dma_wait_begin = display_->dma_wait_us();
-    uint32_t raster_total = 0;
-
-    // The previous frame leaves its final stripe queued. Retire it before
-    // touching either ping-pong buffer; after a timeout, retrying this wait on
-    // the next frame remains safe because the in-flight flag stays set.
-    if (display_->wait_previous_transfer() != ESP_OK) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    const int count = (frame.count > kMaxParticles) ? kMaxParticles : frame.count;
-    preproject(frame, count);
-    project_box_edges();
-    const int64_t t_surface = esp_timer_get_time();
-    build_surface();
-    raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_surface);
-
-    // Frame-boundary capture latch (the old renderer.cpp:602 exchange point).
-    // The DisplayService mirrors when armed and re-arms on any mid-frame
-    // failure, so a request is never latched lazily mid-frame.
-    display_->latch_capture();
-
-    for (int s = 0; s < kStripeCount; s++) {
-        const int y0 = s * kStripeRows;
-        const int rows = min_int(kStripeRows, kHeight - y0);
-        uint16_t *buf = display_->stripe_buffer(s);
-
-        // Rasterize into the idle stripe buffer while the previous stripe's DMA
-        // (stripe s-1, the other buffer) is still running.
-        const int64_t t_raster = esp_timer_get_time();
-        std::memset(buf, 0, static_cast<size_t>(kWidth) * rows * sizeof(uint16_t));
-        draw_box_edges(buf, y0, rows);
-        shade_surface(buf, y0, rows);
-        raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_raster);
-
-        // Mirror (if armed) -> wait for the previous transfer (including the
-        // one carried from the previous frame) -> draw -> mark in flight.
-        esp_err_t ret = display_->submit_stripe(s, y0, rows, buf);
-        if (ret != ESP_OK) {
-            // The DisplayService handles re-arming a failed capture; frame
-            // telemetry keeps the last completed frame's values.
-            return ret;
-        }
-    }
-
-    esp_err_t ret = display_->finish_frame();
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    frame_us_ = static_cast<uint32_t>(esp_timer_get_time() - t_frame);
-    raster_us_ = raster_total + display_->capture_copy_us();
-    // The display accumulates wall time cumulatively; the delta since this
-    // frame began is the per-frame DMA wait (carry + all stripe waits).
-    dma_wait_us_ = display_->dma_wait_us() - dma_wait_begin;
-    return ESP_OK;
 }
 
 }  // namespace fluid_demo

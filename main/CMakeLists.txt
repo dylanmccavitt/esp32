@@ -3,10 +3,10 @@ idf_component_register(
          "board.cpp"
          "dev_console.cpp"
          "display_service.cpp"
+         "fluid_app.cpp"
          "motion.cpp"
          "fluid.cpp"
          "snapshot_exchange.cpp"
-         "renderer.cpp"
     INCLUDE_DIRS "."
     PRIV_REQUIRES console esp_lcd esp_driver_gpio esp_driver_i2c esp_driver_spi esp_timer esp_psram spi_flash heap
 )

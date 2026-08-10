@@ -6,11 +6,11 @@
 
 namespace fluid_demo {
 
-class Renderer;
+class DisplayService;
 using DevResetCallback = void (*)();
 
 /** Start the USB Serial/JTAG development REPL and register fluid controls. */
-esp_err_t dev_console_start(Renderer *renderer, DevResetCallback reset_callback);
+esp_err_t dev_console_start(DisplayService *display, DevResetCallback reset_callback);
 
 /** Override the live IMU with a box-space acceleration when a dev drive is active. */
 bool dev_console_motion_override(Vec3 *apparent_accel);

@@ -17,7 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "renderer.hpp"
+#include "display_service.hpp"
 
 namespace fluid_demo {
 namespace {
@@ -28,7 +28,7 @@ constexpr size_t kBase64InputPerLine = 768;
 constexpr char kBase64[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-Renderer *s_renderer = nullptr;
+DisplayService *s_display = nullptr;
 DevResetCallback s_reset_callback = nullptr;
 esp_console_repl_t *s_repl = nullptr;
 std::atomic<bool> s_dumping{false};
@@ -142,7 +142,7 @@ int command_status(int argc, char **argv)
                 static_cast<double>(snapshot.acceleration.x),
                 static_cast<double>(snapshot.acceleration.y),
                 static_cast<double>(snapshot.acceleration.z),
-                s_renderer != nullptr && s_renderer->capture_ready() ? 1u : 0u);
+                s_display != nullptr && s_display->capture_ready() ? 1u : 0u);
     return 0;
 }
 
@@ -227,7 +227,7 @@ size_t encode_base64(const uint8_t *data, size_t length, char *output)
 
 int command_framebuffer(int argc, char **argv)
 {
-    if ((argc != 1 && argc != 2) || s_renderer == nullptr) {
+    if ((argc != 1 && argc != 2) || s_display == nullptr) {
         std::printf("usage: fb [request_id]\r\n");
         return 1;
     }
@@ -240,7 +240,7 @@ int command_framebuffer(int argc, char **argv)
     } else {
         sequence = ++s_capture_sequence;
     }
-    const esp_err_t request = s_renderer->request_capture();
+    const esp_err_t request = s_display->request_capture();
     if (request != ESP_OK) {
         std::printf("@FB ERROR %" PRIu32 " capture request failed: %s\r\n",
                     sequence, esp_err_to_name(request));
@@ -249,29 +249,29 @@ int command_framebuffer(int argc, char **argv)
 
     const int64_t deadline =
         esp_timer_get_time() + static_cast<int64_t>(kCaptureTimeoutMs) * 1000;
-    while (!s_renderer->capture_ready() && esp_timer_get_time() < deadline) {
+    while (!s_display->capture_ready() && esp_timer_get_time() < deadline) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (!s_renderer->capture_ready()) {
+    if (!s_display->capture_ready()) {
         std::printf("@FB ERROR %" PRIu32 " capture timed out\r\n", sequence);
         return 1;
     }
 
-    const uint8_t *data = s_renderer->capture_data();
+    const uint8_t *data = s_display->capture_data();
     s_dumping.store(true, std::memory_order_release);
-    // The renderer is CPU-bound on core 0. Give it one scheduling window to
-    // observe s_dumping and park before this lower-priority REPL task streams.
+    // The render task is CPU-bound on core 0. Give it one scheduling window
+    // to observe s_dumping and park before this lower-priority REPL streams.
     vTaskDelay(pdMS_TO_TICKS(10));
     std::printf("@FB BEGIN %" PRIu32 " %d %d RGB565BE %zu\r\n",
-                sequence, Renderer::kCaptureWidth, Renderer::kCaptureHeight,
-                Renderer::kCaptureBytes);
+                sequence, DisplayService::kCaptureWidth, DisplayService::kCaptureHeight,
+                DisplayService::kCaptureBytes);
 
     char encoded[((kBase64InputPerLine + 2) / 3) * 4 + 1] = {};
-    for (size_t offset = 0; offset < Renderer::kCaptureBytes;
+    for (size_t offset = 0; offset < DisplayService::kCaptureBytes;
          offset += kBase64InputPerLine) {
         const size_t chunk =
-            (Renderer::kCaptureBytes - offset < kBase64InputPerLine)
-                ? Renderer::kCaptureBytes - offset
+            (DisplayService::kCaptureBytes - offset < kBase64InputPerLine)
+                ? DisplayService::kCaptureBytes - offset
                 : kBase64InputPerLine;
         encode_base64(data + offset, chunk, encoded);
         std::printf("@FB DATA %" PRIu32 " %s\r\n", sequence, encoded);
@@ -297,15 +297,15 @@ esp_err_t register_command(const char *name, const char *help, const char *hint,
 
 }  // namespace
 
-esp_err_t dev_console_start(Renderer *renderer, DevResetCallback reset_callback)
+esp_err_t dev_console_start(DisplayService *display, DevResetCallback reset_callback)
 {
-    if (renderer == nullptr || reset_callback == nullptr) {
+    if (display == nullptr || reset_callback == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_repl != nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
-    s_renderer = renderer;
+    s_display = display;
     s_reset_callback = reset_callback;
 
     esp_err_t err = esp_console_register_help_command();

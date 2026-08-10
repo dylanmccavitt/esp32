@@ -1,18 +1,25 @@
 // app_main.cpp — fluid_box_3d application glue.
 //
-// Brings the board, motion, fluid, snapshot-exchange and renderer modules
-// together in three pinned RTOS tasks:
+// Brings the board, the shell's DisplayService and the registered FluidBoxApp
+// together in three pinned RTOS tasks (direct boot, Fluid stays the running
+// app until the launcher slice):
 //
-//   sensor/control  core0  prio 7  ~100 Hz  IMU filtering, motion publish,
-//                                           PLUS reset, PWR off, BOOT reboot
-//   physics         core1  prio 8  ~30 Hz   PBF step + frame publish
-//   render          core0  prio 5  ~30 Hz   acquire -> render -> release,
+//   sensor/control  core0  prio 7  ~100 Hz  IMU poll + motion tick, PLUS reset,
+//                                           PWR off, BOOT reboot
+//   physics         core1  prio 8  ~30 Hz   app.update(): PBF step + frame publish
+//   render          core0  prio 5  ~30 Hz   app.render(): acquire -> raster,
 //                                           once-a-second telemetry
 //
-// All large state (fluid arrays, snapshot slots, renderer buffers) lives in
-// file-scope statics, never on task stacks. Nothing here writes flash.
+// All heavy state lives inside the namespace-scope s_fluid_app (Fluid,
+// MotionFilter, SnapshotExchange, reset/telemetry atomics, raster buffers) and
+// the shell's s_display (DMA stripes, capture), never on task stacks. Nothing
+// here writes flash.
+//
+// The render lane measures the per-frame display DMA wait around
+// s_fluid_app.render() (the DisplayService only exposes a cumulative counter
+// and the app drives transport exclusively through DisplayFrame ops), feeding
+// the byte-identical telemetry line composed with the app's stats.
 
-#include <atomic>
 #include <cstdint>
 
 #include "freertos/FreeRTOS.h"
@@ -26,26 +33,21 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 
+#include "app_shell.hpp"
 #include "app_types.hpp"
 #include "board.hpp"
 #include "dev_console.hpp"
 #include "display_service.hpp"
-#include "fluid.hpp"
-#include "motion.hpp"
-#include "renderer.hpp"
-#include "snapshot_exchange.hpp"
+#include "fluid_app.hpp"
 
 namespace {
 
+using fluid_demo::AppStats;
+using fluid_demo::DisplayFrame;
 using fluid_demo::DisplayService;
-using fluid_demo::Fluid;
-using fluid_demo::FluidStats;
-using fluid_demo::MotionFilter;
-using fluid_demo::ParticleFrame;
-using fluid_demo::Renderer;
-using fluid_demo::RenderStats;
-using fluid_demo::SnapshotExchange;
+using fluid_demo::MotionTick;
 using fluid_demo::Vec3;
+using fluid_demo::s_fluid_app;
 
 constexpr char kTag[] = "fluid_demo";
 
@@ -66,9 +68,6 @@ constexpr TickType_t kPhysicsPeriodTicks =
 constexpr TickType_t kRenderPeriodTicks =
     static_cast<TickType_t>((1000000ULL / kRenderHz * configTICK_RATE_HZ + 999999ULL) / 1000000ULL);
 
-// Fixed simulation step, independent of wake-up granularity.
-constexpr float kPhysicsDt = 1.0f / 30.0f;
-
 // Sensor dt clamp [2 ms, 100 ms] keeps the motion filter stable across
 // scheduling jitter and the first sample.
 constexpr float kMinDt = 0.002f;
@@ -80,47 +79,64 @@ constexpr uint32_t kBootGraceMs = 500;         // ignore the button right after 
 constexpr uint32_t kBootShortMaxMs = 1000;     // longer hold => not a reboot press
 constexpr uint32_t kPowerOffHoldMs = 2000;     // matches factory long-press default
 
-// Bounded task stacks; all heavy objects are static.
+// Bounded task stacks; all heavy objects live in s_fluid_app / s_display.
 constexpr uint32_t kSensorStackBytes = 4096;
 constexpr uint32_t kPhysicsStackBytes = 4096;
 constexpr uint32_t kRenderStackBytes = 4096;
 
 // ---------------------------------------------------------------------------
-// Global/static state — never on task stacks.
+// Global/static state — never on task stacks. All simulation, motion and
+// raster state is owned by the app; the shell keeps only board/display.
 // ---------------------------------------------------------------------------
 
 fluid_demo::BoardHandles s_board;
-MotionFilter s_filter;
-Fluid s_fluid;
-SnapshotExchange s_snapshots;
 DisplayService s_display;
-Renderer s_renderer;
+DisplayFrame s_display_frame;
 
-// Motion state published by the sensor task to the physics task under a short
-// critical section.
-struct SharedMotion {
-    Vec3 apparent_accel{0.0f, 0.0f, 6.0f};  // rest-gravity placeholder until a valid sample
-    Vec3 raw_accel{0.0f, 0.0f, 0.0f};
-    bool valid{false};
-};
-portMUX_TYPE s_motion_mux = portMUX_INITIALIZER_UNLOCKED;
-SharedMotion s_motion;
-
-// Reset request: sensor task sets, physics task consumes (and applies) in its
-// own context.
-std::atomic<bool> s_reset_requested{false};
-
-void request_fluid_reset() {
-    s_reset_requested.store(true, std::memory_order_release);
+// Shell-bound transport ops: the app drives render sequencing through them.
+esp_err_t frame_wait_previous(void *transport)
+{
+    return static_cast<DisplayService *>(transport)->wait_previous_transfer();
 }
 
-// Physics step wall time, written by the physics task, read for telemetry.
-// Fluid telemetry is copied by its owner (physics task) into atomics. Reading
-// FluidStats directly from the render core would be a C++ data race.
-std::atomic<uint32_t> s_fluid_epoch{0};
-std::atomic<uint64_t> s_candidate_checks{0};
-std::atomic<uint32_t> s_nonfinite_resets{0};
-std::atomic<uint32_t> s_physics_us{0};
+bool frame_latch_capture(void *transport)
+{
+    static_cast<DisplayService *>(transport)->latch_capture();
+    return true;
+}
+
+esp_err_t frame_submit(void *transport, int s, int y0, int rows, const uint16_t *pixels)
+{
+    return static_cast<DisplayService *>(transport)->submit_stripe(s, y0, rows, pixels);
+}
+
+esp_err_t frame_finish(void *transport)
+{
+    return static_cast<DisplayService *>(transport)->finish_frame();
+}
+
+uint32_t frame_capture_copy_us(void *transport)
+{
+    return static_cast<DisplayService *>(transport)->capture_copy_us();
+}
+
+void bind_display_frame()
+{
+    s_display_frame.stripe[0] = s_display.stripe_buffer(0);
+    s_display_frame.stripe[1] = s_display.stripe_buffer(1);
+    s_display_frame.transport = &s_display;
+    s_display_frame.ops.wait_previous = frame_wait_previous;
+    s_display_frame.ops.latch_capture = frame_latch_capture;
+    s_display_frame.ops.submit = frame_submit;
+    s_display_frame.ops.finish = frame_finish;
+    s_display_frame.ops.capture_copy_us = frame_capture_copy_us;
+}
+
+// Reset trampoline consumed by the dev console; the app owns the atomic.
+void app_reset_trampoline()
+{
+    s_fluid_app.request_fluid_reset();
+}
 
 // BOOT button debounce state (sensor task only).
 struct BootButton {
@@ -150,6 +166,10 @@ struct PowerButton {
     uint32_t press_start_ms = 0;
 };
 PowerButton s_power_button;
+
+// Per-frame display DMA wait (render task only): cumulative counter delta
+// measured around s_fluid_app.render(), printed by the telemetry line.
+uint32_t s_last_frame_dma_us = 0;
 
 // ---------------------------------------------------------------- utilities
 
@@ -228,7 +248,7 @@ void process_reset_button() {
             s_reset_button.pressed_debounced = raw_pressed;
             if (raw_pressed && s_reset_button.armed) {
                 s_reset_button.armed = false;
-                s_reset_requested.store(true);
+                s_fluid_app.request_fluid_reset();
             } else if (!raw_pressed) {
                 s_reset_button.armed = true;
             }
@@ -284,25 +304,11 @@ void sensor_task(void *arg) {
 
         const int64_t now_us = esp_timer_get_time();
 
-        // --- IMU + motion filter ---
+        // --- IMU poll + motion tick (the app owns the filter) ---
         Vec3 accel_mps2{}, gyro_rads{};
         bool fresh = false;
         const esp_err_t motion_err = board_read_motion(&accel_mps2, &gyro_rads, &fresh);
-        if (motion_err == ESP_OK && fresh) {
-            float dt = static_cast<float>(now_us - last_motion_us) * 1e-6f;
-            if (dt < kMinDt || dt > kMaxDt || dt != dt) {  // clamp; NaN check included
-                dt = 1.0f / static_cast<float>(kSensorHz);
-            }
-            const Vec3 apparent = s_filter.update(accel_mps2, gyro_rads, dt);
-            if (s_filter.last_sample_accepted()) {
-                last_motion_us = now_us;
-                portENTER_CRITICAL(&s_motion_mux);
-                s_motion.apparent_accel = apparent;
-                s_motion.raw_accel = accel_mps2;
-                s_motion.valid = true;
-                portEXIT_CRITICAL(&s_motion_mux);
-            }
-        } else if (motion_err != ESP_OK) {
+        if (motion_err != ESP_OK) {
             const uint32_t now_s = static_cast<uint32_t>(now_us / 1000000ULL);
             if (now_s != last_err_log_s && !fluid_demo::dev_console_dump_active()) {
                 last_err_log_s = now_s;
@@ -310,13 +316,28 @@ void sensor_task(void *arg) {
             }
         }
 
+        MotionTick tick{};
+        tick.accel_mps2 = accel_mps2;
+        tick.gyro_rads = gyro_rads;
+        tick.fresh = (motion_err == ESP_OK) && fresh;
+        if (tick.fresh) {
+            float dt = static_cast<float>(now_us - last_motion_us) * 1e-6f;
+            if (dt < kMinDt || dt > kMaxDt || dt != dt) {  // clamp; NaN check included
+                dt = 1.0f / static_cast<float>(kSensorHz);
+            }
+            tick.dt = dt;
+        }
         // A development-console drive bypasses the physical IMU deterministically.
         Vec3 injected{};
         if (fluid_demo::dev_console_motion_override(&injected)) {
-            portENTER_CRITICAL(&s_motion_mux);
-            s_motion.apparent_accel = injected;
-            s_motion.valid = true;
-            portEXIT_CRITICAL(&s_motion_mux);
+            tick.apparent_accel = injected;
+            tick.override_active = true;
+        }
+        // The IMU time anchor advances only when the filter accepts the fresh
+        // physical sample (legacy app_main.cpp:304-309); a rejected sample is
+        // re-clamped against the previous accepted one on the next attempt.
+        if (s_fluid_app.on_motion(tick)) {
+            last_motion_us = now_us;
         }
 
         const uint32_t now_ms = static_cast<uint32_t>(now_us / 1000ULL);
@@ -338,44 +359,14 @@ void sensor_task(void *arg) {
 void physics_task(void *arg) {
     static_cast<void>(arg);
 
-    uint32_t sequence = 0;
     TickType_t last_wake = xTaskGetTickCount();
     for (;;) {
         vTaskDelayUntil(&last_wake, kPhysicsPeriodTicks);
 
-        // Handle a reset notification in this task's context: swap the flag,
-        // then re-roll the fluid into its deterministic lattice.
-        if (s_reset_requested.exchange(false)) {
-            s_fluid.reset();
-            ESP_LOGI(kTag, "PLUS press - fluid reset (epoch %u)", s_fluid.reset_epoch());
-        }
+        // Pending reset consumption, motion read, PBF step and snapshot
+        // publish all live inside the app (update lane).
+        static_cast<void>(s_fluid_app.update(fluid_demo::App::kPhysicsDt));
 
-        // Latest apparent acceleration from the sensor task.
-        Vec3 apparent{0.0f, 0.0f, 6.0f};
-        portENTER_CRITICAL(&s_motion_mux);
-        if (s_motion.valid) {
-            apparent = s_motion.apparent_accel;
-        }
-        portEXIT_CRITICAL(&s_motion_mux);
-
-        // step() returns false only on a skip (never happens here: count is
-        // set at boot and dt is fixed finite) or when nonfinite state forced
-        // a deterministic reset — either way the frame below is still valid.
-        const int64_t step_start_us = esp_timer_get_time();
-        static_cast<void>(s_fluid.step(apparent, kPhysicsDt));
-        s_physics_us.store(static_cast<uint32_t>(esp_timer_get_time() - step_start_us));
-        const FluidStats &fluid_stats = s_fluid.stats();
-        s_fluid_epoch.store(s_fluid.reset_epoch());
-        s_candidate_checks.store(fluid_stats.candidate_checks);
-        s_nonfinite_resets.store(fluid_stats.nonfinite_resets);
-
-        ParticleFrame *slot = s_snapshots.begin_write();
-        if (slot == nullptr) {
-            vTaskDelay(1);
-            continue;  // defensive pool exhaustion; preserve idle watchdog
-        }
-        s_fluid.fill_frame(*slot, ++sequence);
-        s_snapshots.publish(slot);
         // vTaskDelayUntil() does not block after an overrun. One tick here
         // guarantees idle/watchdog service without changing on-time cadence.
         vTaskDelay(1);
@@ -383,12 +374,13 @@ void physics_task(void *arg) {
 }
 
 // ---------------------------------------------------------------------------
-// Render task — core0, prio 5, ~30 Hz. Holds a snapshot only through render.
+// Render task — core0, prio 5, ~30 Hz. The app internally holds a snapshot
+// only through render.
 // ---------------------------------------------------------------------------
 
 void log_telemetry() {
-    const RenderStats rs = s_renderer.stats();
-    const uint64_t current_checks = s_candidate_checks.load();
+    const AppStats st = s_fluid_app.stats();
+    const uint64_t current_checks = st.candidate_checks;
     static uint64_t last_candidate_checks = 0;
     const uint64_t candidate_delta =
         current_checks >= last_candidate_checks
@@ -396,32 +388,27 @@ void log_telemetry() {
             : current_checks;  // reset() clears the per-run counter
     last_candidate_checks = current_checks;
 
-    SharedMotion motion{};
-    portENTER_CRITICAL(&s_motion_mux);
-    motion = s_motion;
-    portEXIT_CRITICAL(&s_motion_mux);
-
     ESP_LOGI(kTag,
              "count=%u epoch=%u phys=%uus raster=%uus dma=%uus frame=%uus "
              "cand/s=%llu raw=(%.2f,%.2f,%.2f) sim=(%.2f,%.2f,%.2f) "
              "heap_int_min=%u heap_psram_min=%u missed=%u nonfinite=%u",
-             static_cast<unsigned>(s_fluid.count()),
-             static_cast<unsigned>(s_fluid_epoch.load()),
-             static_cast<unsigned>(s_physics_us.load()),
-             static_cast<unsigned>(rs.raster_us),
-             static_cast<unsigned>(rs.dma_wait_us),
-             static_cast<unsigned>(rs.frame_us),
+             static_cast<unsigned>(st.count),
+             static_cast<unsigned>(st.epoch),
+             static_cast<unsigned>(st.physics_us),
+             static_cast<unsigned>(st.raster_us),
+             static_cast<unsigned>(s_last_frame_dma_us),
+             static_cast<unsigned>(st.frame_us),
              static_cast<unsigned long long>(candidate_delta),
-             static_cast<double>(motion.raw_accel.x),
-             static_cast<double>(motion.raw_accel.y),
-             static_cast<double>(motion.raw_accel.z),
-             static_cast<double>(motion.apparent_accel.x),
-             static_cast<double>(motion.apparent_accel.y),
-             static_cast<double>(motion.apparent_accel.z),
+             static_cast<double>(st.raw[0]),
+             static_cast<double>(st.raw[1]),
+             static_cast<double>(st.raw[2]),
+             static_cast<double>(st.apparent[0]),
+             static_cast<double>(st.apparent[1]),
+             static_cast<double>(st.apparent[2]),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
              static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)),
-             static_cast<unsigned>(rs.missed_transfers),
-             static_cast<unsigned>(s_nonfinite_resets.load()));
+             static_cast<unsigned>(s_display.missed_transfers()),
+             static_cast<unsigned>(st.nonfinite_resets));
 }
 
 void render_task(void *arg) {
@@ -439,13 +426,15 @@ void render_task(void *arg) {
             continue;
         }
 
-        const ParticleFrame *frame = s_snapshots.acquire_latest();
-        if (frame != nullptr) {
-            const esp_err_t rerr = s_renderer.render(*frame);
-            if (rerr != ESP_OK) {
-                ESP_LOGW(kTag, "render failed: %s", esp_err_to_name(rerr));
-            }
-            s_snapshots.release(frame);
+        // Per-frame display DMA wait: cumulative counter delta across the
+        // app's render call. The delta is stored only when a frame was
+        // actually rendered — a blank pass (no new snapshot) or a failed
+        // pass touches no/incomplete transport, so the last completed
+        // frame's coherent timing tuple is preserved. Kept in sync with the
+        // app's own last-frame raster/frame telemetry for the composed line.
+        const uint32_t dma_wait_begin = s_display.dma_wait_us();
+        if (s_fluid_app.render(s_display_frame)) {
+            s_last_frame_dma_us = s_display.dma_wait_us() - dma_wait_begin;
         }
 
         // Once-a-second telemetry.
@@ -474,27 +463,24 @@ extern "C" void app_main(void) {
     }
 
     // The shell's DisplayService owns the panel transport + PSRAM capture and
-    // must init first; the Renderer binds it for stripe streaming.
+    // must init first; the app then drives it through a bound DisplayFrame.
     ESP_LOGI(kTag, "display init");
     err = s_display.init(s_board.panel, s_board.io);
     if (err != ESP_OK) {
         fatal_startup("display init", err);
     }
 
-    ESP_LOGI(kTag, "renderer init");
-    err = s_renderer.init(&s_display);
+    bind_display_frame();
+
+    ESP_LOGI(kTag, "fluid app init");
+    err = s_fluid_app.setup_once();
     if (err != ESP_OK) {
-        fatal_startup("renderer init", err);
+        fatal_startup("fluid app init", err);
     }
 
-    // Tuned count for the 240x240 panel and measured 30 Hz physics budget.
-    if (!s_fluid.init(fluid_demo::kInitialParticles)) {
-        fatal_startup("fluid init", ESP_ERR_INVALID_ARG);
-    }
-    ESP_LOGI(kTag, "fluid initialized: %u particles, radius %.4f",
-             static_cast<unsigned>(s_fluid.count()), s_fluid.particle_radius());
-
-    err = fluid_demo::dev_console_start(&s_renderer, request_fluid_reset);
+    // The console binds the shell's DisplayService for capture; the reset
+    // callback is the app's reset atomic via a one-time trampoline.
+    err = fluid_demo::dev_console_start(&s_display, app_reset_trampoline);
     if (err != ESP_OK) {
         fatal_startup("dev console init", err);
     }
