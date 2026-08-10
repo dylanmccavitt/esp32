@@ -1,19 +1,20 @@
 // app_main.cpp — fluid_box_3d application glue.
 //
-// Brings the board, the shell's DisplayService and the registered FluidBoxApp
-// together in three pinned RTOS tasks (direct boot, Fluid stays the running
-// app until the launcher slice):
+// Brings the board, the shell's DisplayService/InputService/MotionService/
+// ConsoleService and the registered FluidBoxApp together in three pinned RTOS
+// tasks (direct boot, Fluid stays the running app until the launcher slice):
 //
-//   sensor/control  core0  prio 7  ~100 Hz  IMU poll + motion tick, PLUS reset,
-//                                           PWR off, BOOT reboot
+//   sensor/control  core0  prio 7  ~100 Hz  MotionService poll + app.on_motion,
+//                                           InputService buttons (PLUS reset,
+//                                           PWR off, BOOT reboot)
 //   physics         core1  prio 8  ~30 Hz   app.update(): PBF step + frame publish
 //   render          core0  prio 5  ~30 Hz   app.render(): acquire -> raster,
 //                                           once-a-second telemetry
 //
 // All heavy state lives inside the namespace-scope s_fluid_app (Fluid,
 // MotionFilter, SnapshotExchange, reset/telemetry atomics, raster buffers) and
-// the shell's s_display (DMA stripes, capture), never on task stacks. Nothing
-// here writes flash.
+// the shell services (s_display DMA stripes/capture, s_input debounce state,
+// s_motion override state), never on task stacks. Nothing here writes flash.
 //
 // The render lane measures the per-frame display DMA wait around
 // s_fluid_app.render() (the DisplayService only exposes a cumulative counter
@@ -36,17 +37,23 @@
 #include "app_shell.hpp"
 #include "app_types.hpp"
 #include "board.hpp"
-#include "dev_console.hpp"
+#include "console_service.hpp"
 #include "display_service.hpp"
 #include "fluid_app.hpp"
+#include "input_service.hpp"
+#include "motion_service.hpp"
 
 namespace {
 
+using fluid_demo::AppEvent;
 using fluid_demo::AppStats;
+using fluid_demo::ButtonEvent;
+using fluid_demo::ConsoleService;
 using fluid_demo::DisplayFrame;
 using fluid_demo::DisplayService;
+using fluid_demo::InputService;
+using fluid_demo::MotionService;
 using fluid_demo::MotionTick;
-using fluid_demo::Vec3;
 using fluid_demo::s_fluid_app;
 
 constexpr char kTag[] = "fluid_demo";
@@ -68,17 +75,6 @@ constexpr TickType_t kPhysicsPeriodTicks =
 constexpr TickType_t kRenderPeriodTicks =
     static_cast<TickType_t>((1000000ULL / kRenderHz * configTICK_RATE_HZ + 999999ULL) / 1000000ULL);
 
-// Sensor dt clamp [2 ms, 100 ms] keeps the motion filter stable across
-// scheduling jitter and the first sample.
-constexpr float kMinDt = 0.002f;
-constexpr float kMaxDt = 0.100f;
-
-// BOOT (GPIO0, active low) debounce and short-press window.
-constexpr uint8_t kBootDebounceSamples = 4;    // ~33 ms at ~120 Hz
-constexpr uint32_t kBootGraceMs = 500;         // ignore the button right after boot
-constexpr uint32_t kBootShortMaxMs = 1000;     // longer hold => not a reboot press
-constexpr uint32_t kPowerOffHoldMs = 2000;     // matches factory long-press default
-
 // Bounded task stacks; all heavy objects live in s_fluid_app / s_display.
 constexpr uint32_t kSensorStackBytes = 4096;
 constexpr uint32_t kPhysicsStackBytes = 4096;
@@ -92,6 +88,11 @@ constexpr uint32_t kRenderStackBytes = 4096;
 fluid_demo::BoardHandles s_board;
 DisplayService s_display;
 DisplayFrame s_display_frame;
+
+// Shell services (S3): buttons/reboot/power-off, raw motion + override, REPL.
+InputService s_input;
+MotionService s_motion;
+ConsoleService s_console;
 
 // Shell-bound transport ops: the app drives render sequencing through them.
 esp_err_t frame_wait_previous(void *transport)
@@ -132,40 +133,12 @@ void bind_display_frame()
     s_display_frame.ops.capture_copy_us = frame_capture_copy_us;
 }
 
-// Reset trampoline consumed by the dev console; the app owns the atomic.
+// Reset trampoline consumed by the console; the app owns the atomic. Bound
+// exactly once at console start and never rebound (non-lifecycle callback).
 void app_reset_trampoline()
 {
     s_fluid_app.request_fluid_reset();
 }
-
-// BOOT button debounce state (sensor task only).
-struct BootButton {
-    bool pressed_debounced = false;   // debounced level (true = pressed)
-    uint8_t stable_count = 0;         // consecutive agreeing samples
-    bool armed = false;               // a validated release has been seen
-    uint32_t press_start_ms = 0;
-};
-BootButton s_boot;
-
-// PLUS button debounce state (sensor task only). One validated press creates
-// one reset request; release re-arms it.
-struct ResetButton {
-    bool pressed_debounced = false;
-    uint8_t stable_count = 0;
-    bool armed = true;
-};
-ResetButton s_reset_button;
-
-// PWR starts disarmed so holding it through power-up cannot immediately turn
-// the board back off. The first validated release arms the 2-second hold.
-struct PowerButton {
-    bool pressed_debounced = false;
-    uint8_t stable_count = 0;
-    bool armed = false;
-    bool poweroff_sent = false;
-    uint32_t press_start_ms = 0;
-};
-PowerButton s_power_button;
 
 // Per-frame display DMA wait (render task only): cumulative counter delta
 // measured around s_fluid_app.render(), printed by the telemetry line.
@@ -200,102 +173,17 @@ void log_startup_info() {
 }
 
 // ---------------------------------------------------------------------------
-// Sensor/control task — core0, prio 7, 100 Hz.
+// Sensor/control task — core0, prio 7, 100 Hz. A thin poll/router: the IMU
+// poll, dt clamp and override live in MotionService (whose dt anchor advances
+// only through the app's acceptance acknowledgement), and the BOOT/PLUS/PWR
+// debounce + power/reboot actions live in InputService. PwrShort is observed
+// here but deliberately routed nowhere until the launcher slice wires it
+// shell-side (home/launch).
 // ---------------------------------------------------------------------------
-
-// Debounced BOOT press: treated as a reboot only when a validated short press
-// fully releases; never on an initial low or while held.
-void process_boot_button(const uint32_t now_ms) {
-    // board_boot_pressed() reports the pressed state of the active-low GPIO0
-    // level: true when the button is down (level low).
-    const bool raw_pressed = fluid_demo::board_boot_pressed();
-    const bool level_changed = raw_pressed != s_boot.pressed_debounced;
-    if (level_changed) {
-        if (++s_boot.stable_count >= kBootDebounceSamples) {
-            s_boot.stable_count = 0;
-            s_boot.pressed_debounced = raw_pressed;
-            if (raw_pressed) {
-                // Validated press edge; record start only when armed so a
-                // button held across boot can never schedule a reboot.
-                if (s_boot.armed && now_ms >= kBootGraceMs) {
-                    s_boot.press_start_ms = now_ms;
-                }
-            } else {
-                // Validated release edge: reboot if it was a short press.
-                if (s_boot.press_start_ms != 0) {
-                    const uint32_t held_ms = now_ms - s_boot.press_start_ms;
-                    if (held_ms <= kBootShortMaxMs) {
-                        ESP_LOGI(kTag, "BOOT short press (%u ms) - rebooting", held_ms);
-                        esp_restart();
-                    } else {
-                        ESP_LOGI(kTag, "BOOT held %u ms - long press ignored", held_ms);
-                    }
-                    s_boot.press_start_ms = 0;
-                }
-            }
-            s_boot.armed = true;
-        }
-    } else {
-        s_boot.stable_count = 0;
-    }
-}
-
-void process_reset_button() {
-    const bool raw_pressed = fluid_demo::board_reset_pressed();
-    if (raw_pressed != s_reset_button.pressed_debounced) {
-        if (++s_reset_button.stable_count >= kBootDebounceSamples) {
-            s_reset_button.stable_count = 0;
-            s_reset_button.pressed_debounced = raw_pressed;
-            if (raw_pressed && s_reset_button.armed) {
-                s_reset_button.armed = false;
-                s_fluid_app.request_fluid_reset();
-            } else if (!raw_pressed) {
-                s_reset_button.armed = true;
-            }
-        }
-    } else {
-        s_reset_button.stable_count = 0;
-    }
-}
-
-void process_power_button(const uint32_t now_ms) {
-    const bool raw_pressed = fluid_demo::board_power_pressed();
-    if (raw_pressed != s_power_button.pressed_debounced) {
-        if (++s_power_button.stable_count >= kBootDebounceSamples) {
-            s_power_button.stable_count = 0;
-            s_power_button.pressed_debounced = raw_pressed;
-            if (raw_pressed) {
-                if (s_power_button.armed) {
-                    s_power_button.press_start_ms = now_ms;
-                }
-            } else {
-                s_power_button.armed = true;
-                s_power_button.poweroff_sent = false;
-                s_power_button.press_start_ms = 0;
-            }
-        }
-    } else {
-        s_power_button.stable_count = 0;
-        if (!raw_pressed && !s_power_button.armed) {
-            s_power_button.armed = true;
-        }
-    }
-
-    if (s_power_button.pressed_debounced && s_power_button.armed &&
-        !s_power_button.poweroff_sent && s_power_button.press_start_ms != 0 &&
-        now_ms - s_power_button.press_start_ms >= kPowerOffHoldMs) {
-        s_power_button.poweroff_sent = true;
-        const esp_err_t err = fluid_demo::board_power_off();
-        if (err != ESP_OK) {
-            ESP_LOGE(kTag, "board_power_off failed: %s", esp_err_to_name(err));
-        }
-    }
-}
 
 void sensor_task(void *arg) {
     static_cast<void>(arg);
 
-    int64_t last_motion_us = esp_timer_get_time();
     uint32_t last_err_log_s = 0;
 
     TickType_t last_wake = xTaskGetTickCount();
@@ -304,47 +192,32 @@ void sensor_task(void *arg) {
 
         const int64_t now_us = esp_timer_get_time();
 
-        // --- IMU poll + motion tick (the app owns the filter) ---
-        Vec3 accel_mps2{}, gyro_rads{};
-        bool fresh = false;
-        const esp_err_t motion_err = board_read_motion(&accel_mps2, &gyro_rads, &fresh);
+        // --- raw motion via MotionService: poll + dt clamp + override ---
+        const MotionTick tick = s_motion.motion_tick();
+        const esp_err_t motion_err = s_motion.last_read_error();
         if (motion_err != ESP_OK) {
             const uint32_t now_s = static_cast<uint32_t>(now_us / 1000000ULL);
-            if (now_s != last_err_log_s && !fluid_demo::dev_console_dump_active()) {
+            if (now_s != last_err_log_s && !s_console.dump_active()) {
                 last_err_log_s = now_s;
                 ESP_LOGW(kTag, "board_read_motion failed: %s", esp_err_to_name(motion_err));
             }
         }
+        // Feed the app's on_motion() result back so the service advances its
+        // IMU time anchor only when the app accepts a fresh physical sample;
+        // a rejected sample re-clamps against the previous accepted anchor.
+        // An active override still publishes verbatim on rejection.
+        s_motion.acknowledge(s_fluid_app.on_motion(tick));
 
-        MotionTick tick{};
-        tick.accel_mps2 = accel_mps2;
-        tick.gyro_rads = gyro_rads;
-        tick.fresh = (motion_err == ESP_OK) && fresh;
-        if (tick.fresh) {
-            float dt = static_cast<float>(now_us - last_motion_us) * 1e-6f;
-            if (dt < kMinDt || dt > kMaxDt || dt != dt) {  // clamp; NaN check included
-                dt = 1.0f / static_cast<float>(kSensorHz);
-            }
-            tick.dt = dt;
-        }
-        // A development-console drive bypasses the physical IMU deterministically.
-        Vec3 injected{};
-        if (fluid_demo::dev_console_motion_override(&injected)) {
-            tick.apparent_accel = injected;
-            tick.override_active = true;
-        }
-        // The IMU time anchor advances only when the filter accepts the fresh
-        // physical sample (legacy app_main.cpp:304-309); a rejected sample is
-        // re-clamped against the previous accepted one on the next attempt.
-        if (s_fluid_app.on_motion(tick)) {
-            last_motion_us = now_us;
-        }
-
+        // --- buttons: PLUS -> app event; PWR short -> observed, no action ---
         const uint32_t now_ms = static_cast<uint32_t>(now_us / 1000ULL);
-        // --- PLUS press -> reset; PWR 2-second hold -> power off; BOOT tap -> reboot ---
-        process_reset_button();
-        process_power_button(now_ms);
-        process_boot_button(now_ms);
+        ButtonEvent event;
+        if (s_input.poll(now_ms, &event)) {
+            if (event == ButtonEvent::PlusPress) {
+                static_cast<void>(s_fluid_app.handle_event(AppEvent::PlusPress));
+            }
+            // ButtonEvent::PwrShort: no action until the launcher slice routes
+            // it through the coordinator (queue arrives with the runtime slice).
+        }
         // Always give the watched idle task a scheduling window, even if an
         // I2C timeout made this periodic iteration overrun.
         vTaskDelay(1);
@@ -418,7 +291,7 @@ void render_task(void *arg) {
     TickType_t last_wake = xTaskGetTickCount();
     for (;;) {
         vTaskDelayUntil(&last_wake, kRenderPeriodTicks);
-        if (fluid_demo::dev_console_dump_active()) {
+        if (s_console.dump_active()) {
             // The console also runs on core 0. Park raster work while it owns
             // stdout so protocol lines stay intact and IDLE0 services the WDT.
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -439,7 +312,7 @@ void render_task(void *arg) {
 
         // Once-a-second telemetry.
         const uint32_t now_s = static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
-        if (now_s != last_log_s && !fluid_demo::dev_console_dump_active()) {
+        if (now_s != last_log_s && !s_console.dump_active()) {
             last_log_s = now_s;
             log_telemetry();
         }
@@ -478,11 +351,12 @@ extern "C" void app_main(void) {
         fatal_startup("fluid app init", err);
     }
 
-    // The console binds the shell's DisplayService for capture; the reset
-    // callback is the app's reset atomic via a one-time trampoline.
-    err = fluid_demo::dev_console_start(&s_display, app_reset_trampoline);
+    // The console binds the shell's DisplayService (capture) and MotionService
+    // (motion/release/status); the reset callback is the app's reset atomic
+    // via a trampoline bound exactly once here, never rebound.
+    err = s_console.start(&s_display, &s_motion, app_reset_trampoline);
     if (err != ESP_OK) {
-        fatal_startup("dev console init", err);
+        fatal_startup("console service init", err);
     }
 
     BaseType_t ok = xTaskCreatePinnedToCore(sensor_task, "sensor", kSensorStackBytes,
