@@ -5,6 +5,7 @@ idf_component_register(
          "display_service.cpp"
          "fluid_app.cpp"
          "input_service.cpp"
+         "launcher.cpp"
          "motion_service.cpp"
          "runtime.cpp"
          "motion.cpp"

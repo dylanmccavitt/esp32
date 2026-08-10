@@ -1,40 +1,55 @@
-// runtime.cpp — S4 dispatch + generation barrier (coordinator).
+// runtime.cpp — persistent app dispatch and generation-barrier coordinator.
 //
 // Ownership moved out of app_main: this file owns the compile-time registry
 // (exactly {fluid_box, "Fluid Box"}), the shell service instances, the packed
-// active-selection word, the per-lane acknowledgement bits, the three pinned
-// lanes (created exactly once) and the coordinator loop that runs on the ESP
-// main task. app_main is startup wiring only: it calls runtime_run(), which
-// boots (board -> display -> console -> Fluid setup_once -> enter), spawns
-// the lanes, then never returns.
+// dispatch word, the per-lane acknowledgement bits, the three pinned lanes
+// (created exactly once) and the coordinator loop that runs on the ESP main
+// task. app_main is startup wiring only: it calls runtime_run(), which boots
+// (board -> display -> console -> Fluid setup_once; the launcher stable mode
+// boots WITHOUT calling the Fluid app's enter()), spawns the lanes, then
+// never returns.
 //
-// Transition protocol (every request, both directions, committed mode change
+// Packed dispatch word (one std::atomic<uint32_t>, one acquire load per lane
+// iteration): low 4 bits = registry index (kNoAppIndex while no app runs),
+// bits 4-5 = the published AppMode (Transition while quiescing; Launcher or
+// Running once committed), high 26 bits = the monotonic quiesce/run
+// generation. A lane can never observe a torn (app, mode, generation) triple.
+//
+// Transition protocol (Launch/Home, both directions, committed mode change
 // emitted as "@DEV MODE fluid_box|launcher"):
 //   1. Quiesce: clear the per-lane ack mask, set mode=Transition, bump the
-//      generation and publish the packed word with kNoAppIndex (one release
-//      store — lanes do exactly one acquire load per iteration, so they can
-//      never observe a torn (app, generation) pair).
+//      generation and publish the packed (kNoAppIndex, Transition, gen) word
+//      (one release store).
 //   2. Wait for all three lane ack bits within 500 ms; on timeout the system
 //      fails CLOSED with esp_restart(). Each lane acks exactly once per
-//      transition, after its last old-generation app callback has returned.
+//      transition, after its last old-generation app callback has returned;
+//      Transition mode parks every lane, so no display work happens mid-
+//      transition and no app callback runs after a lane acks.
 //   3. Mandatory DisplayService::drain() before any leave — retire the
 //      carried final stripe so the incoming app starts on a drained panel;
 //      a failure also fails closed (esp_restart, never reused).
 //   4. leave() the outgoing app (no allocation).
 //   5. mode=Entering, enter() the incoming app (no allocation; drains stale
 //      snapshots, opens the first-frame gate, leaves a pending reset alone),
-//      then mode=Running. enter() failure fails closed.
-//   6. Publish the run generation; each lane rebases its vTaskDelayUntil
-//      anchor (last_wake = xTaskGetTickCount()) on the new generation before
-//      resuming callbacks, so resume never bursts/catches up and the cadence
-//      is 30/30/100 Hz on the immediate next iteration.
-//   7. Emit "@DEV MODE <id|launcher>" (additive host protocol line).
+//      then the committed stable mode (Running or Launcher). enter() failure
+//      fails closed.
+//   6. Publish the run generation with the committed mode; each lane rebases
+//      its vTaskDelayUntil anchor (last_wake = xTaskGetTickCount()) on a new
+//      Running generation before resuming callbacks, so resume never
+//      bursts/catches up and the cadence is 30/30/100 Hz on the immediate
+//      next iteration. A Launcher generation parks physics and makes the
+//      render lane draw the launcher.
+//   7. Emit "@DEV MODE <id|launcher>" (additive host protocol line) and
+//      publish the stable-mode name for status telemetry.
 //
-// While no app is selected (launcher/idle), the sensor lane keeps polling the
-// shell InputService so BOOT-reboot/PWR-off/PLUS stay live, motion/on_motion
-// stop, and the render lane parks on a 10 ms vTaskDelay so IDLE0 keeps
-// feeding the task watchdog. No task is recreated and no hardware is
-// re-initialized after boot; enter/leave allocate nothing.
+// While the launcher is committed, the sensor lane keeps polling the shell
+// InputService so BOOT-reboot/PWR-off/PLUS stay live and routes PLUS ->
+// Launch / short PWR -> Home through the request queue; motion/on_motion
+// stop; the render lane draws the launcher frame at the 30 Hz render cadence
+// through the same bound DisplayFrame transport, and vanishes entirely during
+// a Transition (only the coordinator's mandatory drain touches the display
+// then). No task is recreated and no hardware is re-initialized after boot;
+// enter/leave allocate nothing.
 //
 // Constants here (cores, priorities, stacks, 100/30/30 cadences, dump gate,
 // telemetry line, motion acceptance ack, capture sequencing, reset trampoline
@@ -64,6 +79,7 @@
 #include "display_service.hpp"
 #include "fluid_app.hpp"
 #include "input_service.hpp"
+#include "launcher.hpp"
 #include "motion_service.hpp"
 
 namespace fluid_demo {
@@ -86,21 +102,40 @@ constexpr size_t kRegistryCount = sizeof(kRegistry) / sizeof(kRegistry[0]);
 static_assert(kRegistryCount <= kNoAppIndex,
               "registry must fit below the reserved kNoAppIndex slot");
 
-constexpr uint32_t kAppGenMask = ~kAppIndexMask;
+constexpr uint32_t kAppGenMask = ~(kAppIndexMask | kAppModeMask);
 
-uint32_t pack_selection(uint32_t index, uint32_t generation)
+uint32_t pack_selection(uint32_t index, uint32_t mode, uint32_t generation)
 {
-    return ((generation << kAppGenShift) & kAppGenMask) | (index & kAppIndexMask);
+    return ((generation << kAppGenShift) & kAppGenMask) |
+           ((mode << kAppModeShift) & kAppModeMask) |
+           (index & kAppIndexMask);
 }
+
+/// AppMode published in the packed word. Entering is coordinator-side only
+/// and never appears in the word: between the quiesce and run publishes every
+/// lane parks on the Transition mode.
+AppMode word_mode(uint32_t word)
+{
+    return static_cast<AppMode>((word >> kAppModeShift) & 0x3u);
+}
+
+static_assert(static_cast<uint32_t>(AppMode::Transition) < (1u << 2),
+              "AppMode must fit the packed 2-bit mode field");
 
 // ---------------------------------------------------------------------------
 // Coordinator state (main-task-owned; the lanes only load s_active_selection).
 // ---------------------------------------------------------------------------
 
-/// Packed dispatch word: app index (low 4) + quiesce/run generation (high 28).
-/// One acquire load per lane iteration => no torn (app, generation) pair.
-/// AppMode (s_mode) is coordinator-side only.
-std::atomic<uint32_t> s_active_selection{pack_selection(0, 0)};  // Fluid, gen 0
+/// Packed dispatch word: app index (low 4) + AppMode (bits 4-5) +
+/// quiesce/run generation (high 26). One acquire load per lane iteration =>
+/// no torn (app, mode, generation) triple. Boots into the Launcher stable
+/// mode (runtime_run() republishes the same value before the lanes start).
+std::atomic<uint32_t> s_active_selection{
+    pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0)};
+
+/// Coordinator-side committed stable-mode name mirrored for any-task status
+/// telemetry; updated once per committed transition and at boot.
+std::atomic<const char *> s_mode_name{"launcher"};
 
 /// Per-lane quiesce acknowledgement bits (never an ambiguous counter): each
 /// lane sets its own bit exactly once per transition, after its last old-
@@ -178,6 +213,22 @@ void app_reset_trampoline()
     s_fluid_app.request_fluid_reset();
 }
 
+// Power-off marker trampoline consumed by InputService: the console's
+// @DEV POWEROFF line, emitted and flushed immediately before
+// board_power_off(), from the sensor lane. Bound exactly once at startup.
+void emit_poweroff_marker()
+{
+    s_console.emit_poweroff();
+}
+
+// Reboot marker trampoline consumed by InputService: the console's
+// @DEV REBOOTING line, emitted and flushed immediately before esp_restart()
+// from the sensor lane. Bound exactly once at startup.
+void emit_reboot_marker()
+{
+    s_console.emit_rebooting();
+}
+
 // Per-frame display DMA wait (render task only): cumulative counter delta
 // measured around the app's render(), printed by the telemetry line.
 uint32_t s_last_frame_dma_us = 0;
@@ -218,7 +269,7 @@ void log_startup_info()
 /// the shell continue with a torn transition. Called from the main task.
 [[noreturn]] void fail_closed(const char *what)
 {
-    ESP_LOGE(kTag, "S4 BARRIER: %s - fail-closed esp_restart()", what);
+    ESP_LOGE(kTag, "TRANSITION BARRIER: %s - fail-closed esp_restart()", what);
     esp_restart();
 }
 
@@ -244,25 +295,28 @@ constexpr uint32_t kRenderStackBytes = 4096;
 
 /// The dispatch check shared by every lane: exactly ONE acquire load per
 /// iteration (returned to the caller), then react to the generation once
-/// (quiesce -> park + ack; run -> rebase the cadence anchor). Callers use the
-/// returned word for all gating so no lane ever branches on a second, possibly
-/// newer observation — a torn (app, generation) pair is impossible.
+/// (Transition -> park + ack; Running -> rebase the cadence anchor; Launcher
+/// -> park without ack). Callers use the returned word for all gating so no
+/// lane ever branches on a second, possibly newer observation — a torn (app,
+/// mode, generation) triple is impossible.
 uint32_t dispatch_step(uint32_t *seen_gen, TickType_t *last_wake, uint32_t ack_bit)
 {
     const uint32_t word = s_active_selection.load(std::memory_order_acquire);
-    const uint32_t index = word & kAppIndexMask;
     const uint32_t gen = word >> kAppGenShift;
     if (gen != *seen_gen) {
-        if (index == kNoAppIndex) {
-            // New quiesce generation: this lane's app callbacks are done.
-            // Ack exactly once per transition (an already-parked lane re-acks
-            // harmlessly — the coordinator clears the mask before publishing).
+        if (word_mode(word) == AppMode::Transition) {
+            // New quiesce generation: this lane's old-generation app
+            // callbacks are done. Ack exactly once per transition (an
+            // already-parked lane re-acks harmlessly — the coordinator clears
+            // the mask before publishing). Because the same word also gates
+            // app callbacks to off, no app callback can run after this ack.
             s_lane_acks.fetch_or(ack_bit, std::memory_order_release);
-        } else {
+        } else if (word_mode(word) == AppMode::Running) {
             // New run generation: rebase before resuming so the cadence is
             // exact on the next iteration — never a catch-up burst.
             *last_wake = xTaskGetTickCount();
         }
+        // Launcher: stable park mode — no app callbacks, no ack.
         *seen_gen = gen;
     }
     return word;
@@ -273,11 +327,12 @@ uint32_t dispatch_step(uint32_t *seen_gen, TickType_t *last_wake, uint32_t ack_b
 // poll/router: the IMU poll, dt clamp and override live in MotionService
 // (whose dt anchor advances only through the app's acceptance acknowledge-
 // ment), and the BOOT/PLUS/PWR debounce + power/reboot actions live in
-// InputService. Button polling stays live in every mode — the shell's
-// input/power/reboot stays responsive in launcher/idle — while motion ticks
-// and app callbacks stop when no app is selected or a transition is parked.
-// PwrShort is observed here but deliberately routed nowhere until the
-// launcher slice wires it shell-side (home/launch).
+// InputService, including the dev-console synthetic gesture FIFO. Button
+// polling stays live in every mode — the shell's input/power/reboot stays
+// responsive in launcher — while motion ticks and app callbacks stop when
+// the committed mode is Launcher or a transition is parked. PLUS routes to
+// the app while Running, to a Launch request from the launcher; short PWR
+// routes a Home request while Running and no-ops at the launcher.
 // ---------------------------------------------------------------------------
 
 void sensor_task(void *arg)
@@ -289,11 +344,31 @@ void sensor_task(void *arg)
     uint32_t seen_gen = UINT32_MAX;
 
     uint32_t last_err_log_s = 0;
+    // Sensor-originated target requests are never dropped on coordinator
+    // queue backpressure. Launch/Home are idempotent target intents, so one
+    // retained slot is sufficient while the committed mode is unchanged.
+    RuntimeRequest pending_request = RuntimeRequest::Launch;
+    bool request_pending = false;
+    auto enqueue_or_retain = [&](RuntimeRequest request) {
+        if (request_pending) {
+            pending_request = request;
+            return;
+        }
+        if (runtime_enqueue_request(request) != ESP_OK) {
+            pending_request = request;
+            request_pending = true;
+        }
+    };
     TickType_t last_wake = xTaskGetTickCount();
     for (;;) {
         vTaskDelayUntil(&last_wake, kSensorPeriodTicks);
         const uint32_t word = dispatch_step(&seen_gen, &last_wake, kAckSensor);
-        const bool app_active = (word & kAppIndexMask) != kNoAppIndex;
+        const AppMode mode = word_mode(word);
+        const bool app_active = mode == AppMode::Running;
+        if (request_pending &&
+            runtime_enqueue_request(pending_request) == ESP_OK) {
+            request_pending = false;
+        }
 
         if (app_active) {
             // --- raw motion via MotionService: poll + dt clamp + override ---
@@ -313,16 +388,32 @@ void sensor_task(void *arg)
             s_motion.acknowledge(s_fluid_app.on_motion(tick));
         }
 
-        // --- buttons: PLUS -> app event (only while an app runs); PWR short
-        // --- observed, no action; BOOT/PWR hold handled inside InputService ---
+        // --- buttons: PLUS runs the launch/reset dispatch (app event while
+        // --- Running, Launch request from the launcher); short PWR returns
+        // --- home while Running and no-ops at the launcher; BOOT/PWR hold are
+        // --- handled inside InputService. Requests are queued only — the
+        // --- coordinator performs every transition synchronously.
         const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
         ButtonEvent event;
         if (s_input.poll(now_ms, &event)) {
-            if (event == ButtonEvent::PlusPress && app_active) {
-                static_cast<void>(s_fluid_app.handle_event(AppEvent::PlusPress));
+            if (event == ButtonEvent::PlusPress) {
+                if (mode == AppMode::Running) {
+                    // PLUS while Fluid runs resets the simulation.
+                    static_cast<void>(s_fluid_app.handle_event(AppEvent::PlusPress));
+                } else if (mode == AppMode::Launcher) {
+                    // PLUS from the launcher launches Fluid. During a
+                    // Transition the event is dropped (no lifecycle work).
+                    enqueue_or_retain(RuntimeRequest::Launch);
+                }
+            } else if (event == ButtonEvent::PwrShort) {
+                if (mode == AppMode::Running) {
+                    // Short PWR while Fluid runs returns to the launcher;
+                    // InputService guarantees this is never a leftover of a
+                    // long hold (poweroff_sent suppression).
+                    enqueue_or_retain(RuntimeRequest::Home);
+                }
+                // Short PWR at the launcher: nothing to return to — no-op.
             }
-            // ButtonEvent::PwrShort: no action until the launcher slice routes
-            // it through the coordinator.
         }
         // Always give the watched idle task a scheduling window, even if an
         // I2C timeout made this periodic iteration overrun. While parked
@@ -348,8 +439,8 @@ void physics_task(void *arg)
     for (;;) {
         vTaskDelayUntil(&last_wake, kPhysicsPeriodTicks);
         const uint32_t word = dispatch_step(&seen_gen, &last_wake, kAckPhysics);
-        if ((word & kAppIndexMask) == kNoAppIndex) {
-            // Parked: no app callbacks during transition or launcher/idle.
+        if (word_mode(word) != AppMode::Running) {
+            // Parked: no app callbacks during a Transition or the launcher.
             vTaskDelay(1);
             continue;
         }
@@ -416,10 +507,26 @@ void render_task(void *arg)
     for (;;) {
         vTaskDelayUntil(&last_wake, kRenderPeriodTicks);
         const uint32_t word = dispatch_step(&seen_gen, &last_wake, kAckRender);
-        if ((word & kAppIndexMask) == kNoAppIndex) {
-            // Parked (transition or launcher/idle): keep IDLE0 runnable so
-            // the WDT is served; no raster or telemetry without an app.
+        if (word_mode(word) == AppMode::Transition) {
+            // Mid-transition: no display work at all — the coordinator's
+            // mandatory drain retires the carried stripe once all lanes ack.
+            // Park on 10 ms so IDLE0 keeps feeding the task watchdog.
             vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (word_mode(word) == AppMode::Launcher) {
+            if (s_console.dump_active()) {
+                // The console owns stdout; park raster work so protocol lines
+                // stay intact and IDLE0 services the WDT (same rule as Fluid).
+                vTaskDelay(pdMS_TO_TICKS(10));
+                last_wake = xTaskGetTickCount();
+                continue;
+            }
+            // Launcher stable mode: draw the full launcher frame through the
+            // same bound DisplayFrame transport at the 30 Hz render cadence.
+            // No app telemetry exists here.
+            static_cast<void>(render_launcher(s_display_frame));
+            vTaskDelay(1);
             continue;
         }
         if (s_console.dump_active()) {
@@ -459,29 +566,52 @@ void render_task(void *arg)
 
 void emit_mode_line(const char *name)
 {
-    // Additive host-protocol line on every committed mode change (S4; the
-    // temporary `mode` command is removed at the S6 clean cutover).
-    std::printf("@DEV MODE %s\r\n", name);
+    // Additive host-protocol line on every committed mode change.
+    std::printf("\r\n@DEV MODE %s\r\n", name);
     std::fflush(stdout);
 }
 
 /// Execute one transition request synchronously (main task; the queue
 /// serializes requests, so transitions never overlap). No allocation, no
-/// task recreation, no hardware reinit.
-void commit_transition()
+/// task recreation, no hardware reinit. A request whose target equals the
+/// already committed side is a no-op: no barrier, no wire line.
+void commit_transition(RuntimeRequest request)
 {
     const RegistryEntry *old_app = s_active_app;
-    const bool leaving_app = old_app != nullptr;
-    const uint32_t next_index = leaving_app ? kNoAppIndex : 0;
-    const RegistryEntry *next_app = leaving_app ? nullptr : &kRegistry[0];
+    // nullptr target means the launcher stable mode.
+    const RegistryEntry *next_app = nullptr;
+    switch (request) {
+        case RuntimeRequest::Launch:
+            // PLUS from the launcher: Fluid Box is selected but not running.
+            if (s_mode != AppMode::Launcher) {
+                return;
+            }
+            next_app = &kRegistry[0];
+            break;
+        case RuntimeRequest::Home:
+            // Short PWR while Fluid runs: return to the launcher. A short
+            // PWR at the launcher is a no-op by design.
+            if (s_mode != AppMode::Running) {
+                return;
+            }
+            break;
+        default:
+            return;  // defensive; the queue only ever carries the above
+    }
+    const uint32_t next_index = next_app != nullptr
+                                    ? static_cast<uint32_t>(next_app - kRegistry)
+                                    : kNoAppIndex;
 
     // 1. Publish Quiesce: clear per-lane ack bits, mode=Transition, bump the
-    //    generation, store the packed (kNoAppIndex, gen) word once (release).
+    //    generation, store the packed (kNoAppIndex, Transition, gen) word
+    //    once (release).
     s_mode = AppMode::Transition;
     s_lane_acks.store(0, std::memory_order_release);
     const uint32_t quiesce_gen = ++s_generation;
-    s_active_selection.store(pack_selection(kNoAppIndex, quiesce_gen),
-                             std::memory_order_release);
+    s_active_selection.store(
+        pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Transition),
+                       quiesce_gen),
+        std::memory_order_release);
 
     // 2. Wait for all three lane acks; fail closed on a 500 ms timeout.
     //    Every lane finishes its current callback before acking, so no app
@@ -496,17 +626,20 @@ void commit_transition()
     }
 
     // 3. Mandatory DisplayService::drain() before any leave: retire the
-    //    carried final stripe so the incoming app starts on a drained panel.
+    //    carried final stripe so the incoming side starts on a drained panel
+    //    (the launcher's last frame in either direction).
     if (s_display.drain() != ESP_OK) {
         fail_closed("display drain failed");
     }
 
-    // 4. leave() the outgoing app (no allocation).
+    // 4. leave() the outgoing app (no allocation). Nothing to leave when the
+    //    launcher is the outgoing side.
     if (old_app != nullptr) {
         old_app->app->leave();
     }
 
-    // 5. Entering -> enter() the incoming app (no allocation), then Running.
+    // 5. Entering -> enter() the incoming app (no allocation; leaves a
+    //    pending reset alone), then the committed stable mode.
     s_mode = AppMode::Entering;
     s_active_app = next_app;
     if (next_app != nullptr) {
@@ -515,12 +648,18 @@ void commit_transition()
             fail_closed("app enter failed");
         }
     }
-    s_mode = AppMode::Running;
+    s_mode = next_app != nullptr ? AppMode::Running : AppMode::Launcher;
 
-    // 6. Publish the run generation; lanes rebase and resume asynchronously.
+    // 6. Publish the run generation with the committed mode; lanes rebase and
+    //    resume (Running) or park and draw the launcher (Launcher).
     const uint32_t run_gen = ++s_generation;
-    s_active_selection.store(pack_selection(next_index, run_gen),
-                             std::memory_order_release);
+    s_active_selection.store(
+        pack_selection(next_index, static_cast<uint32_t>(s_mode), run_gen),
+        std::memory_order_release);
+
+    // Publish the committed stable-mode name for status telemetry.
+    s_mode_name.store(next_app != nullptr ? next_app->id : "launcher",
+                      std::memory_order_release);
 
     // 7. Committed mode change on the wire.
     const char *name = next_app != nullptr ? next_app->id : "launcher";
@@ -546,6 +685,11 @@ esp_err_t runtime_enqueue_request(RuntimeRequest request)
         return ESP_ERR_INVALID_STATE;
     }
     return xQueueSend(queue, &request, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+const char *runtime_mode_name()
+{
+    return s_mode_name.load(std::memory_order_acquire);
 }
 
 [[noreturn]] void runtime_run()
@@ -580,27 +724,35 @@ esp_err_t runtime_enqueue_request(RuntimeRequest request)
         fatal_startup("fluid app init", err);
     }
 
-    // The console binds the shell's DisplayService (capture) and MotionService
-    // (motion/release/status); the reset callback is the app's reset atomic
-    // via a trampoline bound exactly once here, never rebound. The temporary
-    // `mode next` command enqueues into the coordinator queue created above.
-    err = s_console.start(&s_display, &s_motion, app_reset_trampoline);
+    // The console binds the shell's DisplayService (capture), MotionService
+    // (motion/release/status) and InputService (synthetic `input` gestures);
+    // the reset callback is the app's reset atomic via a trampoline bound
+    // exactly once here, never rebound.
+    err = s_console.start(&s_display, &s_motion, &s_input, app_reset_trampoline);
     if (err != ESP_OK) {
         fatal_startup("console service init", err);
     }
 
-    // Boot into Fluid: enter happens before the lanes start so the first run
-    // generation is already published when they first acquire-load the word.
-    s_active_app = &kRegistry[0];
-    s_mode = AppMode::Entering;
-    err = s_active_app->app->enter();
-    if (err != ESP_OK) {
-        fatal_startup("fluid app enter", err);
-    }
-    s_mode = AppMode::Running;
+    // InputService terminal-action markers: emit and flush the console's wire
+    // marker immediately before restart/power-off from the sensor lane. Each
+    // callback is bound exactly once here, never rebound.
+    s_input.set_reboot_marker(&emit_reboot_marker);
+    s_input.set_power_off_marker(&emit_poweroff_marker);
+
+    // Boot stable mode is Launcher: the Fluid app's setup_once() above ran
+    // exactly once, but enter() is deliberately deferred — the first Launch
+    // (PLUS from the launcher) performs it inside the full barrier. Publishing
+    // the (Launcher, gen 0) word before the lanes start means each lane's
+    // first acquire load sees the stable mode: sensor polls buttons, render
+    // draws the launcher, physics parks. No lifecycle work runs at boot.
+    s_active_app = nullptr;
+    s_mode = AppMode::Launcher;
     s_generation = 0;
-    s_active_selection.store(pack_selection(0, 0), std::memory_order_release);
-    emit_mode_line(kRegistry[0].id);
+    s_mode_name.store("launcher", std::memory_order_release);
+    s_active_selection.store(
+        pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0),
+        std::memory_order_release);
+    emit_mode_line("launcher");
 
     // Create the three pinned lanes exactly once; they are never recreated.
     BaseType_t ok = xTaskCreatePinnedToCore(sensor_task, "sensor", kSensorStackBytes,
@@ -620,21 +772,19 @@ esp_err_t runtime_enqueue_request(RuntimeRequest request)
     }
 
     ESP_LOGI(kTag,
-             "S4 coordinator live: %u registered app(s), `mode next` toggles "
-             "Fluid Box <-> launcher/idle",
+             "coordinator live: %u registered app(s), launcher boot stable, "
+             "PLUS launch / short PWR home",
              static_cast<unsigned>(kRegistryCount));
 
     // Coordinator loop on the ESP main task; transitions run synchronously,
-    // one at a time, in queue order.
+    // one at a time, in queue order. Requests whose target equals the
+    // committed side are no-ops inside commit_transition.
     for (;;) {
         RuntimeRequest request;
         if (xQueueReceive(s_request_queue, &request, portMAX_DELAY) != pdTRUE) {
             continue;  // unreachable: portMAX_DELAY only returns on a send
         }
-        if (request == RuntimeRequest::NextMode) {
-            commit_transition();
-        }
-        // Unknown enum values cannot be produced; ignore them defensively.
+        commit_transition(request);
     }
 }
 

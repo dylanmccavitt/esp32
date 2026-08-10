@@ -98,6 +98,13 @@ esp_err_t FluidBoxApp::setup_once()
     surface_depth_ = depth;
     proj_ = proj;
     build_luts();
+    // setup_once() initializes Fluid before the lanes start. Publish the same
+    // initialized epoch/stats immediately so launcher-era telemetry cannot
+    // expose the atomics' zero defaults while Fluid already holds epoch 1.
+    const FluidStats &initial_stats = fluid_.stats();
+    epoch_.store(fluid_.reset_epoch(), std::memory_order_relaxed);
+    candidate_checks_.store(initial_stats.candidate_checks, std::memory_order_relaxed);
+    nonfinite_resets_.store(initial_stats.nonfinite_resets, std::memory_order_relaxed);
     setup_done_ = true;
 
     ESP_LOGI(kTag, "fluid initialized: %u particles, radius %.4f",

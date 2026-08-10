@@ -28,8 +28,8 @@ enum class ShellAction : uint8_t {
 
 /// One motion sample delivered by the shell's raw-motion pipeline.
 ///
-/// The shell (sensor lane today, MotionService from S3 onward) owns the IMU
-/// poll, the [2 ms, 100 ms] dt clamp and the dev-console override check. The
+/// The shell's sensor lane and MotionService own the IMU poll, the
+/// [2 ms, 100 ms] dt clamp and the dev-console override check. The
 /// app owns the MotionFilter and decides to bypass it verbatim when an
 /// override is active (matches the legacy sensor task, app_main.cpp:312).
 struct MotionTick {

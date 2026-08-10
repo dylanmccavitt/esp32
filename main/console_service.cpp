@@ -1,8 +1,8 @@
 // console_service.cpp — USB Serial/JTAG dev REPL (replaces dev_console.cpp).
 //
 // Commands, help text, @DEV/@FB wire format, the std::atomic<bool> s_dumping
-// stdout dump gate, the 768-byte base64 line format and the REPL parameters
-// (prompt "fluid> ", prio 2, core 0, 6144-byte stack) are preserved verbatim.
+// stdout dump gate, bounded base64 lines and the REPL parameters (prompt
+// "fluid> ", prio 2, core 0, 6144-byte stack) are preserved.
 // State moved from dev_console's file statics: the override now lives in the
 // shell's MotionService and the reset path uses a trampoline bound exactly
 // once at start() to the Fluid app's reset atomic.
@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <inttypes.h>
+#include <unistd.h>
 
 #include "esp_console.h"
 #include "esp_log.h"
@@ -26,6 +27,7 @@
 #include "freertos/task.h"
 
 #include "display_service.hpp"
+#include "input_service.hpp"
 #include "motion_service.hpp"
 #include "runtime.hpp"
 
@@ -35,7 +37,7 @@ namespace {
 
 constexpr char kTag[] = "console_service";
 constexpr uint32_t kCaptureTimeoutMs = 2000;
-constexpr size_t kBase64InputPerLine = 768;
+constexpr size_t kBase64InputPerLine = 168;
 constexpr char kBase64[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -120,9 +122,10 @@ esp_err_t register_command(const char *name, const char *help, const char *hint,
 ConsoleService *ConsoleService::s_active = nullptr;
 
 esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
-                                ResetTrampoline reset_callback)
+                                InputService *input, ResetTrampoline reset_callback)
 {
-    if (display == nullptr || motion == nullptr || reset_callback == nullptr) {
+    if (display == nullptr || motion == nullptr || input == nullptr ||
+        reset_callback == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     if (repl_ != nullptr) {
@@ -130,6 +133,7 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
     }
     display_ = display;
     motion_ = motion;
+    input_ = input;
     reset_callback_ = reset_callback;
     s_active = this;
 
@@ -149,8 +153,8 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
                                 command_reset)) != ESP_OK ||
         (err = register_command("reboot", "Restart the firmware", nullptr,
                                 command_reboot)) != ESP_OK ||
-        (err = register_command("mode", "Queue a Fluid Box <-> launcher/idle transition (temporary S4 barrier exercise)", "next",
-                                command_mode)) != ESP_OK) {
+        (err = register_command("input", "Inject a debounced shell button gesture",
+                                "<plus|pwr|boot> [hold_ms]", command_input)) != ESP_OK) {
         return err;
     }
 
@@ -170,12 +174,48 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
     repl_ = repl;
     err = esp_console_start_repl(repl);
     if (err != ESP_OK) return err;
-    ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot/mode");
+    ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot/input");
     return ESP_OK;
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }
+void ConsoleService::begin_protocol_output()
+{
+    // The USB Serial/JTAG VFS has a 256-byte TX ring and may drop bytes after
+    // 50 ms of backpressure. Park the render/telemetry lane, drain prior
+    // output, then keep each bounded @DEV line wholly inside an empty ring.
+    dumping_.store(true, std::memory_order_release);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    drain_protocol_output();
+}
+
+void ConsoleService::drain_protocol_output()
+{
+    std::fflush(stdout);
+    static_cast<void>(::fsync(STDOUT_FILENO));
+}
+
+void ConsoleService::end_protocol_output()
+{
+    drain_protocol_output();
+    dumping_.store(false, std::memory_order_release);
+}
+
+void ConsoleService::emit_poweroff()
+{
+    begin_protocol_output();
+    std::printf("\r\n@DEV POWEROFF\r\n");
+    end_protocol_output();
+}
+
+void ConsoleService::emit_rebooting()
+{
+    begin_protocol_output();
+    std::printf("\r\n@DEV REBOOTING\r\n");
+    end_protocol_output();
+}
+
 
 int ConsoleService::command_ping(int argc, char **argv)
 {
@@ -196,15 +236,18 @@ int ConsoleService::command_status(int argc, char **argv)
         return 1;
     }
 
+    s_active->begin_protocol_output();
     const MotionService::OverrideSnapshot snapshot = s_active->motion_->override_snapshot();
     const uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     std::printf("@DEV STATUS uptime_ms=%" PRIu64
-                " override=%u accel=%.3f,%.3f,%.3f capture_ready=%u\r\n",
+                " override=%u accel=%.3f,%.3f,%.3f capture_ready=%u mode=%s\r\n",
                 uptime_ms, snapshot.active ? 1u : 0u,
                 static_cast<double>(snapshot.acceleration.x),
                 static_cast<double>(snapshot.acceleration.y),
                 static_cast<double>(snapshot.acceleration.z),
-                s_active->display_ != nullptr && s_active->display_->capture_ready() ? 1u : 0u);
+                s_active->display_ != nullptr && s_active->display_->capture_ready() ? 1u : 0u,
+                runtime_mode_name());
+    s_active->end_protocol_output();
     return 0;
 }
 
@@ -261,30 +304,46 @@ int ConsoleService::command_reboot(int argc, char **argv)
         std::printf("usage: reboot\r\n");
         return 1;
     }
-    std::printf("@DEV REBOOTING\r\n");
-    std::fflush(stdout);
+    s_active->emit_rebooting();
     vTaskDelay(pdMS_TO_TICKS(50));
     esp_restart();
     return 0;
 }
 
-int ConsoleService::command_mode(int argc, char **argv)
+int ConsoleService::command_input(int argc, char **argv)
 {
-    if (argc != 2 || std::strcmp(argv[1], "next") != 0) {
-        std::printf("usage: mode next\r\n");
+    if ((argc != 2 && argc != 3) || s_active->input_ == nullptr) {
+        std::printf("usage: input <plus|pwr|boot> [hold_ms]\r\n");
         return 1;
     }
-    // Queue only, never perform synchronously: the coordinator on the main
-    // task runs the full barrier (quiesce -> 3-lane acks -> DisplayService
-    // drain -> leave/enter -> run publish) and emits the committed
-    // "@DEV MODE fluid_box|launcher" line itself.
-    const esp_err_t err = runtime_enqueue_request(RuntimeRequest::NextMode);
+
+    ButtonId button;
+    if (std::strcmp(argv[1], "plus") == 0) {
+        button = ButtonId::Plus;
+    } else if (std::strcmp(argv[1], "pwr") == 0) {
+        button = ButtonId::Pwr;
+    } else if (std::strcmp(argv[1], "boot") == 0) {
+        button = ButtonId::Boot;
+    } else {
+        std::printf("usage: input <plus|pwr|boot> [hold_ms]\r\n");
+        return 1;
+    }
+
+    uint32_t hold_ms = InputService::kDefaultGestureHoldMs;
+    if (argc == 3 &&
+        (!parse_duration_ms(argv[2], &hold_ms) ||
+         hold_ms < InputService::kMinimumGestureHoldMs)) {
+        std::printf("input: hold_ms must be within [40,600000]\r\n");
+        return 1;
+    }
+    const esp_err_t err = s_active->input_->enqueue_gesture(button, hold_ms);
     if (err != ESP_OK) {
-        std::printf("mode: transition queue full\r\n");
+        std::printf("input: gesture queue full\r\n");
         return 1;
     }
     return 0;
 }
+
 
 int ConsoleService::command_framebuffer(int argc, char **argv)
 {
@@ -319,13 +378,11 @@ int ConsoleService::command_framebuffer(int argc, char **argv)
     }
 
     const uint8_t *data = s_active->display_->capture_data();
-    s_active->dumping_.store(true, std::memory_order_release);
-    // The render task is CPU-bound on core 0. Give it one scheduling window
-    // to observe s_dumping and park before this lower-priority REPL streams.
-    vTaskDelay(pdMS_TO_TICKS(10));
+    s_active->begin_protocol_output();
     std::printf("@FB BEGIN %" PRIu32 " %d %d RGB565BE %zu\r\n",
                 sequence, DisplayService::kCaptureWidth, DisplayService::kCaptureHeight,
                 DisplayService::kCaptureBytes);
+    s_active->drain_protocol_output();
 
     char encoded[((kBase64InputPerLine + 2) / 3) * 4 + 1] = {};
     for (size_t offset = 0; offset < DisplayService::kCaptureBytes;
@@ -336,12 +393,13 @@ int ConsoleService::command_framebuffer(int argc, char **argv)
                 : kBase64InputPerLine;
         encode_base64(data + offset, chunk, encoded);
         std::printf("@FB DATA %" PRIu32 " %s\r\n", sequence, encoded);
-        // Keep IDLE0 runnable throughout a full framebuffer dump.
+        // The complete worst-case wire line is 246 bytes, below the USB
+        // Serial/JTAG VFS's 256-byte ring. Yield so USB can drain it before
+        // the next bounded write without paying an fsync round trip per line.
         vTaskDelay(1);
     }
     std::printf("@FB END %" PRIu32 "\r\n", sequence);
-    std::fflush(stdout);
-    s_active->dumping_.store(false, std::memory_order_release);
+    s_active->end_protocol_output();
     return 0;
 }
 

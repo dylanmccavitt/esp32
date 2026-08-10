@@ -445,73 +445,58 @@ class FirmwareShellAcceptance:
         )
         self.mode = None
 
-    def _wait_for_transport_loss(
+    def _request_status(self, label: str, timeout: float) -> tuple[str, int]:
+        checkpoint = self.dev.checkpoint()
+        self.dev.echo_send("status")
+        _, line = self.dev.wait_line(
+            lambda candidate: candidate.strip().startswith(STATUS_PREFIX),
+            checkpoint,
+            timeout,
+            "the requested status response for {}".format(label),
+        )
+
+        actual = validate_status(line, label)
+        for token in line.strip()[len(STATUS_PREFIX):].split():
+            name, separator, value = token.partition("=")
+            if separator and name == "uptime_ms":
+                return actual, int(value)
+        raise UserError("{} validated status omitted uptime_ms".format(label))
+
+    def _scan_reboot_lines(
         self,
+        dev: AcceptanceDevice,
+        after: int,
         label: str,
-        deadline: float,
-        command_checkpoint: int,
-    ):
-        """Observe device-generated link loss without closing the live handle."""
-        dev = self.dev
-        if dev is None:
-            raise UserError(
-                "{} cannot prove a reboot because the serial link was already closed"
-                .format(label)
-            )
-
-        failure_cursor = command_checkpoint
-        failure_description = "device-generated transport loss after {}".format(label)
-
-        while True:
-            failure_cursor = dev.scan_command_failures(
-                failure_cursor,
-                failure_description,
-            )
-            if not dev.reader.is_alive():
-                # The reader cannot append more lines once it has stopped.  Scan once
-                # more to close the race between the first scan and reader shutdown.
-                dev.scan_command_failures(failure_cursor, failure_description)
-                if dev._stop.is_set():
+        reboot_sequence: int | None,
+        launcher_sequence: int | None,
+        through: int | None = None,
+    ) -> tuple[int, int | None, int | None]:
+        cursor = after
+        description = "reboot evidence after {}".format(label)
+        for sequence, line in dev.lines_since(after):
+            if through is not None and sequence > through:
+                break
+            dev._raise_if_command_rejected(line, description)
+            cursor = sequence
+            stripped = line.strip()
+            if stripped == "@DEV REBOOTING":
+                reboot_sequence = sequence
+                launcher_sequence = None
+            elif stripped.startswith("@DEV MODE "):
+                if stripped not in (MODE_LAUNCHER, MODE_FLUID):
                     raise UserError(
-                        "{} cannot prove a reboot because the host closed the serial "
-                        "link before device-generated transport loss was observed"
-                        .format(label)
+                        "{} emitted unknown mode marker {!r}".format(label, stripped)
                     )
-                print(
-                    "[accept] {} device-generated transport loss observed"
-                    .format(label)
-                )
-                return
+                if reboot_sequence is not None:
+                    if stripped != MODE_LAUNCHER:
+                        raise UserError(
+                            "{} emitted {!r} after @DEV REBOOTING; expected {!r}"
+                            .format(label, stripped, MODE_LAUNCHER)
+                        )
+                    launcher_sequence = sequence
+        return cursor, reboot_sequence, launcher_sequence
 
-            if (
-                self._identity_was_enumerated
-                and not self.port_identity.present_devices()
-            ):
-                dev.scan_command_failures(failure_cursor, failure_description)
-                print(
-                    "[accept] {} target disappeared from serial enumeration"
-                    .format(label)
-                )
-                return
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                dev.scan_command_failures(failure_cursor, failure_description)
-                raise UserError(
-                    "{} did not produce observable device-generated transport loss "
-                    "within {:.1f}s; refusing a host-induced close/reconnect"
-                    .format(label, self.args.reconnect_timeout)
-                )
-            time.sleep(min(PORT_POLL_SECONDS, remaining))
-
-    def _observe_reconnected_launcher(
-        self,
-        label: str,
-        command_checkpoint: int,
-    ):
-        """Require transport loss, reconnect by identity, then verify launcher."""
-        deadline = time.monotonic() + self.args.reconnect_timeout
-        self._wait_for_transport_loss(label, deadline, command_checkpoint)
+    def _finish_reconnected_launcher(self, label: str, deadline: float):
         self._reconnect(max(0.001, deadline - time.monotonic()))
         while True:
             remaining = deadline - time.monotonic()
@@ -522,13 +507,9 @@ class FirmwareShellAcceptance:
                 )
 
             try:
-                checkpoint = self.dev.checkpoint()
-                self.dev.echo_send("status")
-                _, line = self.dev.wait_line(
-                    lambda candidate: candidate.strip().startswith(STATUS_PREFIX),
-                    checkpoint,
+                actual, _ = self._request_status(
+                    label,
                     min(STATUS_RETRY_SECONDS, remaining),
-                    "the requested status response for {}".format(label),
                 )
             except AcceptanceTimeout:
                 continue
@@ -536,7 +517,6 @@ class FirmwareShellAcceptance:
                 self._reconnect(max(0.001, deadline - time.monotonic()))
                 continue
 
-            actual = validate_status(line, label)
             if actual != "launcher":
                 raise UserError(
                     "{} returned in {} mode; expected launcher"
@@ -559,29 +539,239 @@ class FirmwareShellAcceptance:
             )
             return
 
+    def _observe_rebooted_launcher(
+        self,
+        label: str,
+        command_checkpoint: int,
+        baseline_uptime_ms: int,
+    ):
+        """Accept identity reconnect or prove an ordered in-place USB restart."""
+        deadline = time.monotonic() + self.args.reconnect_timeout
+        dev = self.dev
+        if dev is None:
+            raise UserError(
+                "{} cannot prove a reboot because the serial link was already closed"
+                .format(label)
+            )
+
+        cursor = command_checkpoint
+        reboot_sequence = None
+        launcher_sequence = None
+        while True:
+            cursor, reboot_sequence, launcher_sequence = self._scan_reboot_lines(
+                dev,
+                cursor,
+                label,
+                reboot_sequence,
+                launcher_sequence,
+            )
+
+            transport_lost = (
+                not dev.reader.is_alive()
+                or (
+                    self._identity_was_enumerated
+                    and not self.port_identity.present_devices()
+                )
+            )
+            if transport_lost:
+                if dev._stop.is_set():
+                    raise UserError(
+                        "{} cannot prove a reboot because the host closed the serial "
+                        "link before device-generated transport loss was observed"
+                        .format(label)
+                    )
+
+                # Stop and join the sole reader before the final scan so a marker
+                # appended during transport teardown cannot race reconnect.
+                dev.close()
+                cursor, reboot_sequence, launcher_sequence = self._scan_reboot_lines(
+                    dev,
+                    cursor,
+                    label,
+                    reboot_sequence,
+                    launcher_sequence,
+                )
+                self.dev = None
+                if reboot_sequence is None:
+                    raise UserError(
+                        "{} lost transport before the required post-command "
+                        "@DEV REBOOTING marker was observed".format(label)
+                    )
+                print(
+                    "[accept] {} device-generated transport loss observed"
+                    .format(label)
+                )
+                self._finish_reconnected_launcher(label, deadline)
+                return
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                dev.scan_command_failures(
+                    cursor,
+                    "reboot evidence after {}".format(label),
+                )
+                if reboot_sequence is None:
+                    missing = "@DEV REBOOTING followed by a fresh launcher marker"
+                elif launcher_sequence is None:
+                    missing = "a fresh launcher marker after @DEV REBOOTING"
+                else:
+                    missing = "a validated freshly booted launcher STATUS"
+                raise UserError(
+                    "{} produced neither transport loss nor {} within {:.1f}s"
+                    .format(label, missing, self.args.reconnect_timeout)
+                )
+
+            if reboot_sequence is None or launcher_sequence is None:
+                time.sleep(min(PORT_POLL_SECONDS, remaining))
+                continue
+
+            status_checkpoint = self.dev.checkpoint()
+            self.dev.echo_send("status")
+            try:
+                status_sequence, status_line = self.dev.wait_line(
+                    lambda candidate: candidate.strip().startswith(STATUS_PREFIX),
+                    status_checkpoint,
+                    min(STATUS_RETRY_SECONDS, remaining),
+                    "the requested post-boot status response for {}".format(label),
+                )
+            except AcceptanceTimeout:
+                continue
+            except DeviceGone:
+                continue
+
+            cursor, reboot_sequence, launcher_sequence = self._scan_reboot_lines(
+                dev,
+                cursor,
+                label,
+                reboot_sequence,
+                launcher_sequence,
+                status_sequence,
+            )
+            if reboot_sequence is None or launcher_sequence is None:
+                continue
+
+            actual = validate_status(status_line, label)
+            if actual != "launcher":
+                raise UserError(
+                    "{} returned in {} mode after reboot; expected launcher"
+                    .format(label, actual)
+                )
+            post_uptime_ms = next(
+                int(token.partition("=")[2])
+                for token in status_line.strip()[len(STATUS_PREFIX):].split()
+                if token.partition("=")[:2] == ("uptime_ms", "=")
+            )
+            fresh_limit_ms = math.ceil(self.args.reconnect_timeout * 1000.0)
+            if post_uptime_ms >= baseline_uptime_ms:
+                raise UserError(
+                    "{} post-reboot uptime {}ms was not lower than the pre-command "
+                    "launcher uptime {}ms"
+                    .format(label, post_uptime_ms, baseline_uptime_ms)
+                )
+            if post_uptime_ms > fresh_limit_ms:
+                raise UserError(
+                    "{} post-reboot uptime {}ms exceeded the {:.1f}s fresh-boot "
+                    "bound".format(
+                        label,
+                        post_uptime_ms,
+                        self.args.reconnect_timeout,
+                    )
+                )
+
+            transport_lost = (
+                not dev.reader.is_alive()
+                or (
+                    self._identity_was_enumerated
+                    and not self.port_identity.present_devices()
+                )
+            )
+            if transport_lost:
+                continue
+            self.mode = actual
+            print(
+                "[accept] {} restarted in place in launcher mode "
+                "(uptime {}ms < baseline {}ms)"
+                .format(label, post_uptime_ms, baseline_uptime_ms)
+            )
+            return
+
+    def _aged_reboot_baseline(
+        self,
+        label: str,
+        allowed_modes: tuple[str, ...],
+    ) -> int:
+        minimum_uptime_ms = 3000
+        deadline = time.monotonic() + self.args.timeout
+        last_mode = None
+        last_uptime_ms = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                observed = (
+                    "no validated STATUS"
+                    if last_uptime_ms is None
+                    else "mode={} uptime_ms={}".format(last_mode, last_uptime_ms)
+                )
+                raise UserError(
+                    "{} did not reach the {}ms pre-reboot uptime floor within "
+                    "{:.1f}s; last observed {}"
+                    .format(
+                        label,
+                        minimum_uptime_ms,
+                        self.args.timeout,
+                        observed,
+                    )
+                )
+
+            try:
+                actual, uptime_ms = self._request_status(
+                    label,
+                    min(STATUS_RETRY_SECONDS, remaining),
+                )
+            except AcceptanceTimeout:
+                continue
+            if actual not in allowed_modes:
+                raise UserError(
+                    "{} returned in {} mode; expected one of {}"
+                    .format(label, actual, ", ".join(allowed_modes))
+                )
+
+            self.mode = actual
+            last_mode = actual
+            last_uptime_ms = uptime_ms
+            if uptime_ms >= minimum_uptime_ms:
+                print(
+                    "[accept] {} confirmed {} mode at {}ms uptime"
+                    .format(label, actual, uptime_ms)
+                )
+                return uptime_ms
+
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(
+                    min(
+                        STATUS_RETRY_SECONDS,
+                        (minimum_uptime_ms - uptime_ms) / 1000.0,
+                        remaining,
+                    )
+                )
+
     def _probe_mode(
         self,
         expected: str,
         label: str,
         timeout: float | None = None,
-    ):
+    ) -> int:
         if expected not in ("launcher", "fluid_box"):
             raise UserError(
                 "{} requested an unsupported mode probe: {}"
                 .format(label, expected)
             )
 
-        checkpoint = self.dev.checkpoint()
-        self.dev.echo_send("status")
-        _, line = self.dev.wait_line(
-            lambda candidate: candidate.strip().startswith(STATUS_PREFIX),
-            checkpoint,
+        actual, uptime_ms = self._request_status(
+            label,
             self.args.timeout if timeout is None else timeout,
-            "the requested status response for {}".format(label),
         )
-
-        actual = validate_status(line, label)
-
         if actual != expected:
             raise UserError(
                 "{} returned in {} mode; expected {}"
@@ -589,6 +779,7 @@ class FirmwareShellAcceptance:
             )
         self.mode = actual
         print("[accept] {} confirmed {} mode".format(label, actual))
+        return uptime_ms
 
 
     def _send_wait_exact(self, command: str, marker: str):
@@ -607,17 +798,29 @@ class FirmwareShellAcceptance:
         return sequence
 
     def _boot_to_launcher(self):
+        baseline_uptime_ms = self._aged_reboot_baseline(
+            "short BOOT pre-command status",
+            ("launcher", "fluid_box"),
+        )
         checkpoint = self.dev.checkpoint()
         self.dev.echo_send("input boot 150")
         try:
-            self._observe_reconnected_launcher("short BOOT input", checkpoint)
+            self._observe_rebooted_launcher(
+                "short BOOT input",
+                checkpoint,
+                baseline_uptime_ms,
+            )
         except UserError as exc:
             raise UserError(
-                "short BOOT input did not reboot and re-enumerate in launcher "
-                "mode: {}".format(exc)
+                "short BOOT input did not prove a reboot into launcher mode: {}"
+                .format(exc)
             ) from exc
 
     def _legacy_reboot_to_launcher(self):
+        baseline_uptime_ms = self._aged_reboot_baseline(
+            "legacy reboot pre-command status",
+            ("launcher",),
+        )
         checkpoint = self.dev.checkpoint()
         self.dev.echo_send("reboot")
         try:
@@ -634,10 +837,14 @@ class FirmwareShellAcceptance:
             ) from exc
 
         try:
-            self._observe_reconnected_launcher("legacy reboot command", checkpoint)
+            self._observe_rebooted_launcher(
+                "legacy reboot command",
+                checkpoint,
+                baseline_uptime_ms,
+            )
         except UserError as exc:
             raise UserError(
-                "legacy reboot command did not re-enumerate in launcher mode: {}"
+                "legacy reboot command did not prove a reboot into launcher mode: {}"
                 .format(exc)
             ) from exc
 
@@ -994,21 +1201,25 @@ class FirmwareShellAcceptance:
         self.dev.echo_send("input pwr 3000")
         deadline = time.monotonic() + self.args.power_off_timeout
         ping_sent = False
+        poweroff_marker_seen = False
         absent_since = None
 
         def reject_protocol_activity(dev):
+            nonlocal poweroff_marker_seen
             for _, line in dev.lines_since(checkpoint):
                 dev._raise_if_command_rejected(
                     line,
                     "device-generated transport loss after long PWR input",
                 )
                 stripped = line.strip()
-                if stripped == MODE_LAUNCHER:
+                if stripped == "@DEV POWEROFF":
+                    poweroff_marker_seen = True
+                elif stripped == MODE_LAUNCHER:
                     raise UserError(
                         "long PWR input emitted launcher mode; the hold was also "
                         "misclassified as a short press"
                     )
-                if stripped == "@DEV PONG":
+                elif stripped == "@DEV PONG":
                     raise UserError(
                         "device still answered ping after long PWR power-off input"
                     )
@@ -1080,6 +1291,11 @@ class FirmwareShellAcceptance:
                 "power-off deadline; require at least {:.2f}s to distinguish "
                 "power-off from a late reboot"
                 .format(continuous_absence, minimum_absence)
+            )
+        if not poweroff_marker_seen:
+            raise UserError(
+                "long PWR input did not emit the required post-command "
+                "@DEV POWEROFF marker before sustained transport absence"
             )
         print(
             "[accept] power-off kept the serial device continuously absent for "
