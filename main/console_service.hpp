@@ -40,6 +40,10 @@ private:
     static int command_release(int argc, char **argv);
     static int command_reset(int argc, char **argv);
     static int command_reboot(int argc, char **argv);
+    /// Temporary S4 command (removed at the S6 clean cutover): `mode next`
+    /// queues a Fluid Box <-> launcher/idle transition for the coordinator;
+    /// it never performs the transition synchronously.
+    static int command_mode(int argc, char **argv);
 
     /// The single running instance (esp_console commands are plain function
     /// pointers without user context).

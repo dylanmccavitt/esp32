@@ -27,6 +27,7 @@
 
 #include "display_service.hpp"
 #include "motion_service.hpp"
+#include "runtime.hpp"
 
 namespace fluid_demo {
 
@@ -147,7 +148,9 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
         (err = register_command("reset", "Reset only the in-memory fluid simulation", nullptr,
                                 command_reset)) != ESP_OK ||
         (err = register_command("reboot", "Restart the firmware", nullptr,
-                                command_reboot)) != ESP_OK) {
+                                command_reboot)) != ESP_OK ||
+        (err = register_command("mode", "Queue a Fluid Box <-> launcher/idle transition (temporary S4 barrier exercise)", "next",
+                                command_mode)) != ESP_OK) {
         return err;
     }
 
@@ -167,7 +170,7 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
     repl_ = repl;
     err = esp_console_start_repl(repl);
     if (err != ESP_OK) return err;
-    ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot");
+    ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot/mode");
     return ESP_OK;
 #else
     return ESP_ERR_NOT_SUPPORTED;
@@ -262,6 +265,24 @@ int ConsoleService::command_reboot(int argc, char **argv)
     std::fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(50));
     esp_restart();
+    return 0;
+}
+
+int ConsoleService::command_mode(int argc, char **argv)
+{
+    if (argc != 2 || std::strcmp(argv[1], "next") != 0) {
+        std::printf("usage: mode next\r\n");
+        return 1;
+    }
+    // Queue only, never perform synchronously: the coordinator on the main
+    // task runs the full barrier (quiesce -> 3-lane acks -> DisplayService
+    // drain -> leave/enter -> run publish) and emits the committed
+    // "@DEV MODE fluid_box|launcher" line itself.
+    const esp_err_t err = runtime_enqueue_request(RuntimeRequest::NextMode);
+    if (err != ESP_OK) {
+        std::printf("mode: transition queue full\r\n");
+        return 1;
+    }
     return 0;
 }
 

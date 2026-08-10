@@ -6,6 +6,7 @@ idf_component_register(
          "fluid_app.cpp"
          "input_service.cpp"
          "motion_service.cpp"
+         "runtime.cpp"
          "motion.cpp"
          "fluid.cpp"
          "snapshot_exchange.cpp"
