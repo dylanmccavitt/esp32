@@ -1477,32 +1477,190 @@ class FirmwareShellAcceptance:
 
     def check_soak(self):
         if self.mode != "fluid_box":
-            self._ensure_fluid()
-        health = self._health_baseline(
-            self.dev.checkpoint(), "bounded soak"
+            self._ensure_launcher()
+            soak_entry = self._transition("input plus", MODE_FLUID)
+        else:
+            soak_entry = self.dev.checkpoint()
+
+        label = "bounded soak"
+
+        def reject_forbidden_line(line: str):
+            self.dev._raise_if_command_rejected(line, label)
+            stripped = line.strip()
+            if stripped == MODE_LAUNCHER:
+                raise UserError(
+                    "{} returned to Launcher before deliberate cleanup Home"
+                    .format(label)
+                )
+            if stripped == "@DEV REBOOTING":
+                raise UserError(
+                    "{} rebooted before deliberate cleanup Home".format(label)
+                )
+            if stripped == "@DEV POWEROFF":
+                raise UserError(
+                    "{} powered off before deliberate cleanup Home".format(label)
+                )
+            if stripped == MODE_FLUID:
+                raise UserError(
+                    "{} emitted a duplicate fluid_box mode marker; Fluid "
+                    "transitioned or re-entered after the accepted soak entry"
+                    .format(label)
+                )
+            if stripped.startswith("@DEV MODE"):
+                raise UserError(
+                    "{} emitted malformed or unknown mode marker {!r}"
+                    .format(label, stripped)
+                )
+
+        def observe_complete_telemetry(line: str) -> bool:
+            reject_forbidden_line(line)
+            sample = parse_telemetry(0, line)
+            return (
+                sample is not None
+                and sample.missed is not None
+                and sample.nonfinite is not None
+            )
+
+        def wait_complete_telemetry(
+            after: int,
+            timeout: float,
+            description: str,
+        ) -> tuple[int, str]:
+            return self.dev.wait_line(
+                observe_complete_telemetry,
+                after,
+                timeout,
+                description,
+            )
+
+        def validate_telemetry_health(sequence: int, line: str):
+            sample = parse_telemetry(sequence, line)
+            if sample is None:
+                return
+            if sample.missed is None or sample.nonfinite is None:
+                raise UserError(
+                    "{} telemetry line {} omitted a cumulative missed or "
+                    "nonfinite counter after the health baseline: {}"
+                    .format(label, sequence, line.strip())
+                )
+            for field in ("missed", "nonfinite"):
+                initial = getattr(health, field)
+                value = getattr(sample, field)
+                if value != initial:
+                    raise UserError(
+                        "{} changed cumulative {} telemetry from baseline {} to "
+                        "{} at line {}; every observed value through cleanup Home "
+                        "must remain exactly equal to baseline"
+                        .format(label, field, initial, value, sequence)
+                    )
+
+        def scan_through(after: int, through: int) -> int:
+            cursor = after
+            for sequence, line in self.dev.lines_since(after):
+                if sequence > through:
+                    break
+                reject_forbidden_line(line)
+                if sequence > health.sequence:
+                    validate_telemetry_health(sequence, line)
+                cursor = sequence
+            return cursor
+
+        entry_checkpoint = soak_entry
+        baseline_sequence, _ = wait_complete_telemetry(
+            entry_checkpoint,
+            self.args.telemetry_timeout,
+            (
+                "one passive Running-mode telemetry line containing both "
+                "cumulative missed and nonfinite counters for {}"
+            ).format(label),
         )
+        health = self._health_baseline(entry_checkpoint, label)
+        cursor = scan_through(entry_checkpoint, baseline_sequence)
+
         start_frame = self._capture("fluid-soak-start")
+        cursor = scan_through(cursor, self.dev.checkpoint())
         deadline = time.monotonic() + self.args.soak_seconds
 
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            self._probe_mode(
-                "fluid_box",
-                "bounded soak",
-                min(self.args.timeout, remaining),
-            )
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(1.0, remaining))
+            wait_timeout = min(self.args.telemetry_timeout, remaining)
+            try:
+                telemetry_sequence, _ = wait_complete_telemetry(
+                    cursor,
+                    wait_timeout,
+                    (
+                        "continuous complete Running-mode telemetry during the "
+                        "{} passive interval"
+                    ).format(label),
+                )
+            except AcceptanceTimeout:
+                cursor = scan_through(cursor, self.dev.checkpoint())
+                if time.monotonic() >= deadline:
+                    break
+                raise
+            cursor = scan_through(cursor, telemetry_sequence)
 
         end_frame = self._capture("fluid-soak-end")
         self._assert_frame_shape(start_frame, "fluid-soak-start")
         self._assert_frame_shape(end_frame, "fluid-soak-end")
         action_end = self.dev.checkpoint()
-        self._assert_health(health, action_end, "bounded soak")
-        self._transition("input pwr 120", MODE_LAUNCHER)
+        cursor = scan_through(cursor, action_end)
+
+        post_sequence, _ = wait_complete_telemetry(
+            action_end,
+            self.args.telemetry_timeout,
+            (
+                "a post-end-capture complete Running-mode telemetry line for {}"
+            ).format(label),
+        )
+        cursor = scan_through(cursor, post_sequence)
+        self._assert_health(health, action_end, label)
+
+        home_checkpoint = self.dev.checkpoint()
+        cursor = scan_through(cursor, home_checkpoint)
+        self.dev.echo_send("input pwr 120")
+
+        def accept_cleanup_launcher(line: str) -> bool:
+            self.dev._raise_if_command_rejected(
+                line, "the deliberate cleanup Home for {}".format(label)
+            )
+            stripped = line.strip()
+            if stripped == MODE_LAUNCHER:
+                return True
+            if stripped == "@DEV REBOOTING":
+                raise UserError(
+                    "{} rebooted while waiting for deliberate cleanup Home"
+                    .format(label)
+                )
+            if stripped == "@DEV POWEROFF":
+                raise UserError(
+                    "{} powered off while waiting for deliberate cleanup Home"
+                    .format(label)
+                )
+            if stripped == MODE_FLUID:
+                raise UserError(
+                    "{} emitted fluid_box while waiting for deliberate cleanup "
+                    "Home".format(label)
+                )
+            if stripped.startswith("@DEV MODE"):
+                raise UserError(
+                    "{} emitted malformed or unknown mode marker {!r} while "
+                    "waiting for deliberate cleanup Home".format(label, stripped)
+                )
+            validate_telemetry_health(0, line)
+            return False
+
+        self.dev.wait_line(
+            accept_cleanup_launcher,
+            home_checkpoint,
+            self.args.timeout,
+            "the exact cleanup Home marker {!r} for {}".format(
+                MODE_LAUNCHER, label
+            ),
+        )
+        self.mode = "launcher"
 
     def check_power_off(self):
         self._ensure_fluid()
