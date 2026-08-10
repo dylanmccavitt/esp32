@@ -24,6 +24,21 @@ inline constexpr uint16_t kLauncherAffordanceRgb565 = 0x8493;  // muted steel
 inline constexpr int kLauncherBandTop = 56;
 inline constexpr int kLauncherBandBottom = 184;
 
+/// Touching the selected entry or its PLUS affordance launches Fluid Box.
+/// The left HOME affordance occupies x < 56 and remains a no-op at home.
+inline constexpr int kLauncherLaunchTouchLeft = 56;
+inline constexpr int kLauncherLaunchTouchRight = kLauncherWidth;
+
+constexpr bool launcher_accepts_launch_touch(uint16_t x, uint16_t y)
+{
+    return x >= kLauncherLaunchTouchLeft && x < kLauncherLaunchTouchRight &&
+           y >= kLauncherBandTop && y < kLauncherBandBottom;
+}
+
+static_assert(launcher_accepts_launch_touch(120, 120));
+static_assert(!launcher_accepts_launch_touch(32, 120));
+static_assert(!launcher_accepts_launch_touch(120, 32));
+
 /// Centered 8x8 Fluid Box vessel glyph. Each set bit is an 8x8 pixel cell, so
 /// the exact glyph bounding box is [88, 152) x [88, 152). Bit 7 is the left
 /// cell. Unset cells show the band color.

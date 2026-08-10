@@ -43,6 +43,28 @@ esp_err_t InputService::enqueue_gesture(const ButtonId button, const uint32_t ho
     return full ? ESP_ERR_NO_MEM : ESP_OK;
 }
 
+bool InputService::poll_touch(TouchEvent *out)
+{
+    TouchSample sample{};
+    last_touch_error_ = fluid_demo::board_read_touch(&sample);
+    if (last_touch_error_ != ESP_OK || !sample.fresh) {
+        return false;
+    }
+    if (!sample.pressed) {
+        touch_contact_active_ = false;
+        return false;
+    }
+    if (touch_contact_active_) {
+        return false;
+    }
+    touch_contact_active_ = true;
+    if (out != nullptr) {
+        out->x = sample.x;
+        out->y = sample.y;
+    }
+    return true;
+}
+
 void InputService::set_power_off_marker(const PowerOffMarker marker)
 {
     power_off_marker_ = marker;

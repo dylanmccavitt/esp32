@@ -323,16 +323,15 @@ uint32_t dispatch_step(uint32_t *seen_gen, TickType_t *last_wake, uint32_t ack_b
 }
 
 // ---------------------------------------------------------------------------
-// Sensor/control task — core0, prio 7, 100 Hz while an app runs. A thin
-// poll/router: the IMU poll, dt clamp and override live in MotionService
-// (whose dt anchor advances only through the app's acceptance acknowledge-
-// ment), and the BOOT/PLUS/PWR debounce + power/reboot actions live in
-// InputService, including the dev-console synthetic gesture FIFO. Button
-// polling stays live in every mode — the shell's input/power/reboot stays
-// responsive in launcher — while motion ticks and app callbacks stop when
-// the committed mode is Launcher or a transition is parked. PLUS routes to
-// the app while Running, to a Launch request from the launcher; short PWR
-// routes a Home request while Running and no-ops at the launcher.
+// Sensor/control task — core0, prio 7, 100 Hz. A thin poll/router: the IMU
+// poll, dt clamp and override live in MotionService; its dt anchor advances
+// only through the app's acceptance acknowledgement. InputService owns the
+// dev-console synthetic gesture FIFO plus physical button and IRQ-latched
+// touch polling in every mode. Motion ticks and app callbacks stop when the
+// committed mode is Launcher or a transition is parked. PLUS routes to the
+// app while Running or to Launch from launcher; a touch on the selected
+// launcher entry also requests Launch. Short PWR routes Home while Running
+// and no-ops at launcher.
 // ---------------------------------------------------------------------------
 
 void sensor_task(void *arg)
@@ -344,6 +343,7 @@ void sensor_task(void *arg)
     uint32_t seen_gen = UINT32_MAX;
 
     uint32_t last_err_log_s = 0;
+    uint32_t last_touch_err_log_s = UINT32_MAX;
     // Sensor-originated target requests are never dropped on coordinator
     // queue backpressure. Launch/Home are idempotent target intents, so one
     // retained slot is sufficient while the committed mode is unchanged.
@@ -388,14 +388,14 @@ void sensor_task(void *arg)
             s_motion.acknowledge(s_fluid_app.on_motion(tick));
         }
 
-        // --- buttons: PLUS runs the launch/reset dispatch (app event while
-        // --- Running, Launch request from the launcher); short PWR returns
-        // --- home while Running and no-ops at the launcher; BOOT/PWR hold are
-        // --- handled inside InputService. Requests are queued only — the
-        // --- coordinator performs every transition synchronously.
+        // --- shell input: buttons preserve their existing launch/reset/home
+        // --- behavior. Touch reports are consumed in every mode, but only the
+        // --- visible selected launcher target has touch semantics; no app
+        // --- callback or lifecycle work runs directly from this lane.
         const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
         ButtonEvent event;
-        if (s_input.poll(now_ms, &event)) {
+        const bool button_emitted = s_input.poll(now_ms, &event);
+        if (button_emitted) {
             if (event == ButtonEvent::PlusPress) {
                 if (mode == AppMode::Running) {
                     // PLUS while Fluid runs resets the simulation.
@@ -415,10 +415,31 @@ void sensor_task(void *arg)
                 // Short PWR at the launcher: nothing to return to — no-op.
             }
         }
+
+        TouchEvent touch;
+        if (s_input.poll_touch(&touch)) {
+            if (!button_emitted && mode == AppMode::Launcher &&
+                launcher_accepts_launch_touch(touch.x, touch.y)) {
+                ESP_LOGI(kTag, "touch launch x=%u y=%u",
+                         static_cast<unsigned>(touch.x),
+                         static_cast<unsigned>(touch.y));
+                enqueue_or_retain(RuntimeRequest::Launch);
+            }
+        } else {
+            const esp_err_t touch_err = s_input.last_touch_error();
+            if (touch_err != ESP_OK) {
+                const uint32_t now_s =
+                    static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
+                if (now_s != last_touch_err_log_s && !s_console.dump_active()) {
+                    last_touch_err_log_s = now_s;
+                    ESP_LOGW(kTag, "board_read_touch failed: %s",
+                             esp_err_to_name(touch_err));
+                }
+            }
+        }
         // Always give the watched idle task a scheduling window, even if an
-        // I2C timeout made this periodic iteration overrun. While parked
-        // (transition/launcher) this is the whole body: poll buttons at the
-        // 100 Hz cadence, then yield.
+        // I2C timeout made this periodic iteration overrun. While parked, this
+        // polling plus the yield is the whole sensor-lane body.
         vTaskDelay(1);
     }
 }
@@ -773,7 +794,7 @@ const char *runtime_mode_name()
 
     ESP_LOGI(kTag,
              "coordinator live: %u registered app(s), launcher boot stable, "
-             "PLUS launch / short PWR home",
+             "PLUS/touch launch / short PWR home",
              static_cast<unsigned>(kRegistryCount));
 
     // Coordinator loop on the ESP main task; transitions run synchronously,

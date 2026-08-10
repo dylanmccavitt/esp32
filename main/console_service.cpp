@@ -26,6 +26,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "board.hpp"
 #include "display_service.hpp"
 #include "input_service.hpp"
 #include "motion_service.hpp"
@@ -240,12 +241,14 @@ int ConsoleService::command_status(int argc, char **argv)
     const MotionService::OverrideSnapshot snapshot = s_active->motion_->override_snapshot();
     const uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     std::printf("@DEV STATUS uptime_ms=%" PRIu64
-                " override=%u accel=%.3f,%.3f,%.3f capture_ready=%u mode=%s\r\n",
+                " override=%u accel=%.3f,%.3f,%.3f capture_ready=%u"
+                " battery_hold=%u mode=%s\r\n",
                 uptime_ms, snapshot.active ? 1u : 0u,
                 static_cast<double>(snapshot.acceleration.x),
                 static_cast<double>(snapshot.acceleration.y),
                 static_cast<double>(snapshot.acceleration.z),
                 s_active->display_ != nullptr && s_active->display_->capture_ready() ? 1u : 0u,
+                board_battery_hold_enabled() ? 1u : 0u,
                 runtime_mode_name());
     s_active->end_protocol_output();
     return 0;

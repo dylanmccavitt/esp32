@@ -15,6 +15,12 @@ enum class ButtonEvent : uint8_t {
     PwrShort = 1,   ///< Validated PWR release < kPowerOffHoldMs, never after a long hold.
 };
 
+/// One fresh, native-orientation touch report from the shell-owned controller.
+struct TouchEvent {
+    uint16_t x = 0;
+    uint16_t y = 0;
+};
+
 /// Synthetic button id for the dev-console `input <plus|pwr|boot>` command.
 enum class ButtonId : uint8_t {
     Plus = 0,
@@ -79,6 +85,13 @@ public:
     /// success. Processing order is the legacy order (PLUS, PWR, BOOT) and
     /// the first event in that order wins the single out slot.
     bool poll(uint32_t now_ms, ButtonEvent *out);
+
+    /// Consume controller reports and emit one event per physical contact.
+    /// Repeated pressed reports are suppressed until an explicit zero-finger
+    /// release report re-arms the shell. Board owns all GPIO/I2C access.
+    bool poll_touch(TouchEvent *out);
+
+    esp_err_t last_touch_error() const { return last_touch_error_; }
 
 private:
     // ---- synthetic gesture FIFO (bounded, thread-safe; no allocation) ----
@@ -146,6 +159,8 @@ private:
     BootButton boot_;
     ResetButton reset_button_;
     PowerButton power_button_;
+    bool touch_contact_active_ = false;
+    esp_err_t last_touch_error_ = ESP_OK;
 };
 
 }  // namespace fluid_demo

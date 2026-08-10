@@ -36,8 +36,13 @@ DEFAULT_RECONNECT_TIMEOUT = 25.0
 DEFAULT_TELEMETRY_TIMEOUT = 4.0
 DEFAULT_SOAK_SECONDS = 60.0
 DEFAULT_CYCLES = 100
+DEFAULT_TOUCH_TIMEOUT = 30.0
+TOUCH_RELEASE_QUIET_SECONDS = 0.5
 DEFAULT_POWER_OFF_MIN_ABSENCE = 2.0
 STATUS_RETRY_SECONDS = 1.0
+# @DEV POWEROFF fires at 2000 ms; the 3000 ms gesture then releases and
+# traverses the 40 ms debouncer. This margin keeps STATUS strictly post-release.
+POWER_OFF_POST_MARKER_RELEASE_SECONDS = 1.1
 FREEZE_DRIFT_CALIBRATION_FRAMES = 3
 PORT_POLL_SECONDS = 0.05
 
@@ -45,11 +50,16 @@ MODE_LAUNCHER = "@DEV MODE launcher"
 MODE_FLUID = "@DEV MODE fluid_box"
 CORE_CHECKS = ("launcher", "once", "cycles", "freeze", "reboot")
 ALL_CHECKS = CORE_CHECKS + ("soak",)
+CHECK_CHOICES = ALL_CHECKS + ("touch",)
 COMMAND_FAILURE_MARKERS = (
     "unrecognized command",
     "unknown command",
     "command not found",
     "invalid command",
+)
+TOUCH_LAUNCH_LOG = re.compile(
+    r"I \([0-9]+\) fluid_demo: touch launch x=([0-9]+) y=([0-9]+)"
+    r"(?:\x1b\[[0-9;]*m)?$"
 )
 TELEMETRY_FIELD = re.compile(r"\b(reset_epoch|epoch|missed|nonfinite)=(\d+)\b")
 STATUS_PREFIX = "@DEV STATUS "
@@ -59,6 +69,7 @@ STATUS_VALUE_PATTERNS = {
     "accel": re.compile(r"-?\d+\.\d{3},-?\d+\.\d{3},-?\d+\.\d{3}"),
     "capture_ready": re.compile(r"[01]"),
     "mode": re.compile(r"launcher|fluid_box"),
+    "battery_hold": re.compile(r"[01]"),
 }
 STATUS_VALUE_DESCRIPTIONS = {
     "uptime_ms": "an unsigned decimal integer",
@@ -66,11 +77,22 @@ STATUS_VALUE_DESCRIPTIONS = {
     "accel": "three comma-separated fixed-point values with three decimals",
     "capture_ready": "0 or 1",
     "mode": "launcher or fluid_box",
+    "battery_hold": "0 or 1",
 }
 
 
 class AcceptanceTimeout(UserError):
     """A bounded acceptance observation did not arrive."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Status:
+    uptime_ms: int
+    override: int
+    accel: str
+    capture_ready: int
+    mode: str
+    battery_hold: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,21 +105,16 @@ class Telemetry:
 
 
 @dataclasses.dataclass(frozen=True)
-class HealthBaseline:
-    missed: Telemetry | None
-    nonfinite: Telemetry | None
-
-
-@dataclasses.dataclass(frozen=True)
 class SerialPortIdentity:
     device: str
     serial_number: str | None
     vid: int | None
     pid: int | None
     location: str | None
+    explicit: bool
 
     @classmethod
-    def capture(cls, device: str) -> "SerialPortIdentity":
+    def capture(cls, device: str, explicit: bool) -> "SerialPortIdentity":
         if list_ports is not None:
             for info in list_ports.comports():
                 if info.device == device:
@@ -107,8 +124,9 @@ class SerialPortIdentity:
                         vid=info.vid,
                         pid=info.pid,
                         location=info.location,
+                        explicit=explicit,
                     )
-        return cls(device, None, None, None, None)
+        return cls(device, None, None, None, None, explicit)
 
     def matches(self, candidate) -> bool:
         same_usb_kind = (
@@ -143,18 +161,10 @@ class SerialPortIdentity:
             )
             if matches:
                 return matches
-            has_enumerated_metadata = any(
-                value is not None
-                for value in (
-                    self.serial_number,
-                    self.vid,
-                    self.pid,
-                    self.location,
-                )
-            )
-            if has_enumerated_metadata:
-                return ()
-        if os.path.exists(self.device):
+            if self.explicit and os.path.exists(self.device):
+                return (self.device,)
+            return ()
+        if self.explicit and os.path.exists(self.device):
             return (self.device,)
         return ()
 
@@ -290,8 +300,8 @@ def parse_telemetry(sequence: int, line: str) -> Telemetry | None:
     )
 
 
-def validate_status(line: str, label: str) -> str:
-    """Validate the preserved STATUS contract and return its single mode."""
+def validate_status(line: str, label: str) -> Status:
+    """Validate and parse the complete STATUS contract exactly once."""
     stripped = line.strip()
     if not stripped.startswith(STATUS_PREFIX):
         raise UserError(
@@ -322,7 +332,14 @@ def validate_status(line: str, label: str) -> str:
                 )
             )
 
-    return observed["mode"][0]
+    return Status(
+        uptime_ms=int(observed["uptime_ms"][0]),
+        override=int(observed["override"][0]),
+        accel=observed["accel"][0],
+        capture_ready=int(observed["capture_ready"][0]),
+        mode=observed["mode"][0],
+        battery_hold=int(observed["battery_hold"][0]),
+    )
 
 
 def positive_int(text: str) -> int:
@@ -374,7 +391,9 @@ class FirmwareShellAcceptance:
         self.requested_port = args.port
         self.port = args.port
         self.dev = self._connect(args.reconnect_timeout)
-        self.port_identity = SerialPortIdentity.capture(self.port)
+        self.port_identity = SerialPortIdentity.capture(
+            self.port, explicit=args.port is not None
+        )
         self._identity_was_enumerated = bool(
             self.port_identity.present_devices()
         )
@@ -445,7 +464,7 @@ class FirmwareShellAcceptance:
         )
         self.mode = None
 
-    def _request_status(self, label: str, timeout: float) -> tuple[str, int]:
+    def _request_status(self, label: str, timeout: float) -> Status:
         checkpoint = self.dev.checkpoint()
         self.dev.echo_send("status")
         _, line = self.dev.wait_line(
@@ -454,13 +473,7 @@ class FirmwareShellAcceptance:
             timeout,
             "the requested status response for {}".format(label),
         )
-
-        actual = validate_status(line, label)
-        for token in line.strip()[len(STATUS_PREFIX):].split():
-            name, separator, value = token.partition("=")
-            if separator and name == "uptime_ms":
-                return actual, int(value)
-        raise UserError("{} validated status omitted uptime_ms".format(label))
+        return validate_status(line, label)
 
     def _scan_reboot_lines(
         self,
@@ -507,7 +520,7 @@ class FirmwareShellAcceptance:
                 )
 
             try:
-                actual, _ = self._request_status(
+                status = self._request_status(
                     label,
                     min(STATUS_RETRY_SECONDS, remaining),
                 )
@@ -517,10 +530,10 @@ class FirmwareShellAcceptance:
                 self._reconnect(max(0.001, deadline - time.monotonic()))
                 continue
 
-            if actual != "launcher":
+            if status.mode != "launcher":
                 raise UserError(
                     "{} returned in {} mode; expected launcher"
-                    .format(label, actual)
+                    .format(label, status.mode)
                 )
             observed_markers = {
                 candidate.strip()
@@ -532,7 +545,7 @@ class FirmwareShellAcceptance:
                     "{} emitted a fluid_box MODE marker while reconnect status "
                     "reported launcher".format(label)
                 )
-            self.mode = actual
+            self.mode = status.mode
             print(
                 "[accept] {} re-enumerated in launcher mode"
                 .format(label)
@@ -650,17 +663,13 @@ class FirmwareShellAcceptance:
             if reboot_sequence is None or launcher_sequence is None:
                 continue
 
-            actual = validate_status(status_line, label)
-            if actual != "launcher":
+            status = validate_status(status_line, label)
+            if status.mode != "launcher":
                 raise UserError(
                     "{} returned in {} mode after reboot; expected launcher"
-                    .format(label, actual)
+                    .format(label, status.mode)
                 )
-            post_uptime_ms = next(
-                int(token.partition("=")[2])
-                for token in status_line.strip()[len(STATUS_PREFIX):].split()
-                if token.partition("=")[:2] == ("uptime_ms", "=")
-            )
+            post_uptime_ms = status.uptime_ms
             fresh_limit_ms = math.ceil(self.args.reconnect_timeout * 1000.0)
             if post_uptime_ms >= baseline_uptime_ms:
                 raise UserError(
@@ -687,7 +696,7 @@ class FirmwareShellAcceptance:
             )
             if transport_lost:
                 continue
-            self.mode = actual
+            self.mode = status.mode
             print(
                 "[accept] {} restarted in place in launcher mode "
                 "(uptime {}ms < baseline {}ms)"
@@ -724,34 +733,34 @@ class FirmwareShellAcceptance:
                 )
 
             try:
-                actual, uptime_ms = self._request_status(
+                status = self._request_status(
                     label,
                     min(STATUS_RETRY_SECONDS, remaining),
                 )
             except AcceptanceTimeout:
                 continue
-            if actual not in allowed_modes:
+            if status.mode not in allowed_modes:
                 raise UserError(
                     "{} returned in {} mode; expected one of {}"
-                    .format(label, actual, ", ".join(allowed_modes))
+                    .format(label, status.mode, ", ".join(allowed_modes))
                 )
 
-            self.mode = actual
-            last_mode = actual
-            last_uptime_ms = uptime_ms
-            if uptime_ms >= minimum_uptime_ms:
+            self.mode = status.mode
+            last_mode = status.mode
+            last_uptime_ms = status.uptime_ms
+            if status.uptime_ms >= minimum_uptime_ms:
                 print(
                     "[accept] {} confirmed {} mode at {}ms uptime"
-                    .format(label, actual, uptime_ms)
+                    .format(label, status.mode, status.uptime_ms)
                 )
-                return uptime_ms
+                return status.uptime_ms
 
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(
                     min(
                         STATUS_RETRY_SECONDS,
-                        (minimum_uptime_ms - uptime_ms) / 1000.0,
+                        (minimum_uptime_ms - status.uptime_ms) / 1000.0,
                         remaining,
                     )
                 )
@@ -768,18 +777,18 @@ class FirmwareShellAcceptance:
                 .format(label, expected)
             )
 
-        actual, uptime_ms = self._request_status(
+        status = self._request_status(
             label,
             self.args.timeout if timeout is None else timeout,
         )
-        if actual != expected:
+        if status.mode != expected:
             raise UserError(
                 "{} returned in {} mode; expected {}"
-                .format(label, actual, expected)
+                .format(label, status.mode, expected)
             )
-        self.mode = actual
-        print("[accept] {} confirmed {} mode".format(label, actual))
-        return uptime_ms
+        self.mode = status.mode
+        print("[accept] {} confirmed {} mode".format(label, status.mode))
+        return status.uptime_ms
 
 
     def _send_wait_exact(self, command: str, marker: str):
@@ -906,72 +915,100 @@ class FirmwareShellAcceptance:
             raise UserError("internal telemetry observation error")
         return sample
 
-    def _health_baseline(self, after: int, label: str) -> HealthBaseline | None:
-        observed = {}
-        for field in ("missed", "nonfinite"):
-            try:
-                sequence, line = self.dev.wait_telemetry(
-                    lambda sample, field=field: getattr(sample, field) is not None,
-                    after,
-                    self.args.telemetry_timeout,
-                    "{} telemetry for {}".format(field, label),
-                )
-            except AcceptanceTimeout:
-                print(
-                    "[accept] {}: {} telemetry not observable; skipped"
-                    .format(label, field)
-                )
-                continue
-            observed[field] = parse_telemetry(sequence, line)
-
-        if not observed:
-            return None
-        return HealthBaseline(
-            missed=observed.get("missed"),
-            nonfinite=observed.get("nonfinite"),
+    def _health_baseline(self, after: int, label: str) -> Telemetry:
+        sequence, line = self.dev.wait_telemetry(
+            lambda sample: (
+                sample.missed is not None
+                and sample.nonfinite is not None
+            ),
+            after,
+            self.args.telemetry_timeout,
+            (
+                "one Running-mode telemetry line containing both cumulative "
+                "missed and nonfinite counters for {}"
+            ).format(label),
         )
+        baseline = parse_telemetry(sequence, line)
+        if (
+            baseline is None
+            or baseline.missed is None
+            or baseline.nonfinite is None
+        ):
+            raise UserError(
+                "{} health baseline did not contain both cumulative missed and "
+                "nonfinite counters: {}".format(label, line.strip())
+            )
+        print(
+            "[accept] {} health baseline: missed={} nonfinite={}"
+            .format(label, baseline.missed, baseline.nonfinite)
+        )
+        return baseline
 
     def _assert_health(
         self,
-        baseline: HealthBaseline | None,
+        baseline: Telemetry,
         action_end: int,
         label: str,
     ):
-        if baseline is None:
-            return
-
-        stable = {}
-        for field in ("missed", "nonfinite"):
-            initial_sample = getattr(baseline, field)
-            if initial_sample is None:
-                continue
-            initial = getattr(initial_sample, field)
-            post_sequence, _ = self.dev.wait_telemetry(
-                lambda sample, field=field: getattr(sample, field) is not None,
-                action_end,
-                self.args.telemetry_timeout,
-                "post-action {} telemetry for {}".format(field, label),
-            )
-            observed = [
-                value
-                for sample in self.dev.telemetry_since(initial_sample.sequence)
-                if sample.sequence <= post_sequence
-                and (value := getattr(sample, field)) is not None
-            ]
-            changed = next(
-                (value for value in observed if value != initial),
-                None,
-            )
-            if changed is not None:
-                raise UserError(
-                    "{} changed cumulative {} telemetry from baseline {} to {}; "
-                    "every observed value must remain exactly equal to baseline"
-                    .format(label, field, initial, changed)
+        post_sequence, post_line = self.dev.wait_telemetry(
+            lambda sample: (
+                sample.missed is not None
+                and sample.nonfinite is not None
+            ),
+            action_end,
+            self.args.telemetry_timeout,
+            (
+                "a post-action Running-mode telemetry line containing both "
+                "cumulative missed and nonfinite counters for {}"
+            ).format(label),
+        )
+        post_sample = parse_telemetry(post_sequence, post_line)
+        if (
+            post_sample is None
+            or post_sample.missed is None
+            or post_sample.nonfinite is None
+        ):
+            raise UserError(
+                "{} post-action health sample did not contain both cumulative "
+                "missed and nonfinite counters: {}".format(
+                    label, post_line.strip()
                 )
-            stable[field] = initial
+            )
+
+        observed = [baseline]
+        observed.extend(
+            sample
+            for sample in self.dev.telemetry_since(baseline.sequence)
+            if sample.sequence <= post_sequence
+        )
+        for sample in observed:
+            if sample.missed is None or sample.nonfinite is None:
+                raise UserError(
+                    "{} telemetry line {} omitted a cumulative missed or "
+                    "nonfinite counter between the health baseline and required "
+                    "post-action sample: {}".format(
+                        label, sample.sequence, sample.line.strip()
+                    )
+                )
+            for field in ("missed", "nonfinite"):
+                initial = getattr(baseline, field)
+                value = getattr(sample, field)
+                if value != initial:
+                    raise UserError(
+                        "{} changed cumulative {} telemetry from baseline {} to {} "
+                        "at line {}; every observed value through the required "
+                        "post-action Running sample must remain exactly equal to "
+                        "baseline".format(
+                            label,
+                            field,
+                            initial,
+                            value,
+                            sample.sequence,
+                        )
+                    )
         print(
             "[accept] {} health stable: missed={} nonfinite={}"
-            .format(label, stable.get("missed"), stable.get("nonfinite"))
+            .format(label, baseline.missed, baseline.nonfinite)
         )
 
 
@@ -982,32 +1019,310 @@ class FirmwareShellAcceptance:
         self._probe_mode("launcher", "launcher check")
         self.launcher_frame = self._capture("launcher")
 
+    def check_touch(self):
+        self._ensure_launcher()
+        self._probe_mode("launcher", "touch check precondition")
+
+        def parse_touch_launch(stripped: str) -> tuple[int, int]:
+            match = TOUCH_LAUNCH_LOG.search(stripped)
+            if match is None:
+                raise UserError(
+                    "touch check emitted a malformed or non-ESP touch-launch log; "
+                    "expected an ESP log under the fluid_demo tag containing exact "
+                    "payload 'touch launch x=<uint> y=<uint>': {}"
+                    .format(stripped)
+                )
+
+            x, y = (int(value) for value in match.groups())
+            if not (56 <= x < PANEL_WIDTH and 56 <= y < 184):
+                raise UserError(
+                    "touch check logged coordinates x={} y={} outside the launcher "
+                    "target x=[56,240), y=[56,184); out-of-panel and HOME touches "
+                    "must not launch".format(x, y)
+                )
+            return x, y
+
+        def run_touch_round(round_number: int) -> FrameEvent:
+            label = "touch round {}".format(round_number)
+            checkpoint = self.dev.checkpoint()
+            print(
+                "[accept] ACTION: {} tap and release the centered Fluid Box entry "
+                "on the touchscreen"
+                .format("first" if round_number == 1 else "second")
+            )
+
+            touch_seen = False
+            touch_coordinates = None
+
+            def observe_touch_transition(line: str) -> bool:
+                nonlocal touch_seen, touch_coordinates
+                stripped = line.strip()
+
+                if stripped == MODE_FLUID:
+                    if not touch_seen:
+                        raise UserError(
+                            "{} reached fluid_box without a fresh "
+                            "'touch launch x=<uint> y=<uint>' log after the "
+                            "operator checkpoint".format(label)
+                        )
+                    return True
+
+                if stripped == MODE_LAUNCHER:
+                    if touch_seen:
+                        raise UserError(
+                            "{} emitted a launcher mode marker after the accepted "
+                            "touch log instead of completing the Fluid launch"
+                            .format(label)
+                        )
+                    return False
+
+                if stripped.startswith("@DEV MODE "):
+                    raise UserError(
+                        "{} emitted unexpected mode marker {!r}"
+                        .format(label, stripped)
+                    )
+
+                if "touch launch" not in stripped:
+                    return False
+
+                coordinates = parse_touch_launch(stripped)
+                if touch_seen:
+                    raise UserError(
+                        "{} emitted more than one fresh touch-launch log before "
+                        "completing the Fluid launch; one tap must produce one "
+                        "logical event".format(label)
+                    )
+                touch_seen = True
+                touch_coordinates = coordinates
+                return False
+
+            try:
+                fluid_sequence, _ = self.dev.wait_line(
+                    observe_touch_transition,
+                    checkpoint,
+                    self.args.touch_timeout,
+                    "an ordered touch-launch log followed by {!r} for {}"
+                    .format(MODE_FLUID, label),
+                )
+            except AcceptanceTimeout as exc:
+                if not touch_seen:
+                    raise UserError(
+                        "{} timed out after {:.1f}s without a fresh accepted "
+                        "touch-launch log followed by {!r}"
+                        .format(label, self.args.touch_timeout, MODE_FLUID)
+                    ) from exc
+                x, y = touch_coordinates
+                raise UserError(
+                    "{} logged x={} y={} but did not subsequently emit {!r} "
+                    "within {:.1f}s; the touch did not launch Fluid"
+                    .format(label, x, y, MODE_FLUID, self.args.touch_timeout)
+                ) from exc
+            except DeviceGone as exc:
+                raise UserError(
+                    "{} lost the serial transport before the ordered touch launch "
+                    "completed; disconnect/reconnect is not accepted".format(label)
+                ) from exc
+
+            x, y = touch_coordinates
+            self.mode = "fluid_box"
+            print(
+                "[accept] {} launch accepted at x={} y={}"
+                .format(label, x, y)
+            )
+            try:
+                fluid_frame = self._capture(
+                    "fluid-after-touch-{}".format(round_number)
+                )
+            except DeviceGone as exc:
+                raise UserError(
+                    "{} lost the serial transport during the Fluid capture; "
+                    "disconnect/reconnect is not accepted".format(label)
+                ) from exc
+
+            cleanup_checkpoint = self.dev.checkpoint()
+            pre_cleanup_description = "the Fluid capture before {} cleanup".format(
+                label
+            )
+            for sequence, line in self.dev.lines_since(fluid_sequence):
+                if sequence > cleanup_checkpoint:
+                    break
+                self.dev._raise_if_command_rejected(
+                    line,
+                    pre_cleanup_description,
+                )
+                stripped = line.strip()
+                if stripped == MODE_LAUNCHER:
+                    raise UserError(
+                        "{} returned to Launcher after the accepted launch and "
+                        "before the deliberate cleanup Home".format(label)
+                    )
+                if "touch launch" in stripped:
+                    raise UserError(
+                        "{} emitted another fresh touch-launch log after the "
+                        "accepted launch and before deliberate cleanup: {}"
+                        .format(label, stripped)
+                    )
+                if stripped.startswith("@DEV MODE ") and stripped != MODE_FLUID:
+                    raise UserError(
+                        "{} emitted unexpected mode marker {!r} before deliberate "
+                        "cleanup".format(label, stripped)
+                    )
+
+            self.dev.echo_send("input pwr 120")
+
+            def observe_cleanup_home(line: str) -> bool:
+                stripped = line.strip()
+                if stripped == MODE_LAUNCHER:
+                    return True
+                if "touch launch" in stripped:
+                    raise UserError(
+                        "{} emitted another fresh touch-launch log while waiting "
+                        "for deliberate cleanup Home: {}".format(label, stripped)
+                    )
+                if stripped == MODE_FLUID:
+                    raise UserError(
+                        "{} emitted fluid_box again while waiting for deliberate "
+                        "cleanup Home".format(label)
+                    )
+                if stripped.startswith("@DEV MODE "):
+                    raise UserError(
+                        "{} emitted unexpected mode marker {!r} while waiting for "
+                        "deliberate cleanup Home".format(label, stripped)
+                    )
+                return False
+
+            try:
+                home_sequence, _ = self.dev.wait_line(
+                    observe_cleanup_home,
+                    cleanup_checkpoint,
+                    self.args.timeout,
+                    "the exact cleanup Home marker {!r} for {}"
+                    .format(MODE_LAUNCHER, label),
+                )
+            except DeviceGone as exc:
+                raise UserError(
+                    "{} lost the serial transport during cleanup Home; "
+                    "disconnect/reconnect is not accepted".format(label)
+                ) from exc
+
+            self.mode = "launcher"
+
+            def reject_post_home_line(line: str):
+                stripped = line.strip()
+                if "touch launch" in stripped:
+                    raise UserError(
+                        "{} emitted a fresh touch-launch log after cleanup Home; "
+                        "the tap was not observably released: {}"
+                        .format(label, stripped)
+                    )
+                if stripped == MODE_FLUID:
+                    raise UserError(
+                        "{} re-entered fluid_box after cleanup Home; the tap was "
+                        "not observably released".format(label)
+                    )
+                if stripped.startswith("@DEV MODE ") and stripped != MODE_LAUNCHER:
+                    raise UserError(
+                        "{} emitted unexpected mode marker {!r} after cleanup Home"
+                        .format(label, stripped)
+                    )
+
+            try:
+                self.dev.wait_line(
+                    lambda line: (reject_post_home_line(line), False)[1],
+                    home_sequence,
+                    TOUCH_RELEASE_QUIET_SECONDS,
+                    "the bounded touch-release quiet window for {}".format(label),
+                )
+            except AcceptanceTimeout:
+                pass
+            except DeviceGone as exc:
+                raise UserError(
+                    "{} lost the serial transport during the post-Home "
+                    "touch-release window; disconnect/reconnect is not accepted"
+                    .format(label)
+                ) from exc
+
+            quiet_end = self.dev.checkpoint()
+            post_home_description = "the touch release window after {} cleanup".format(
+                label
+            )
+
+            def scan_post_home(through: int):
+                for sequence, line in self.dev.lines_since(home_sequence):
+                    if sequence > through:
+                        break
+                    self.dev._raise_if_command_rejected(
+                        line,
+                        post_home_description,
+                    )
+                    reject_post_home_line(line)
+
+            scan_post_home(quiet_end)
+            try:
+                status = self._request_status(
+                    "{} post-release cleanup".format(label),
+                    self.args.timeout,
+                )
+            except DeviceGone as exc:
+                raise UserError(
+                    "{} lost the serial transport before the final launcher "
+                    "STATUS; disconnect/reconnect is not accepted".format(label)
+                ) from exc
+
+            scan_post_home(self.dev.checkpoint())
+            if status.mode != "launcher":
+                raise UserError(
+                    "{} final STATUS reported mode={}; expected launcher"
+                    .format(label, status.mode)
+                )
+            self.mode = "launcher"
+            print(
+                "[accept] {} release stable in launcher for {:.2f}s with a fresh "
+                "strict STATUS".format(label, TOUCH_RELEASE_QUIET_SECONDS)
+            )
+            return fluid_frame
+
+        run_touch_round(1)
+        self.fluid_frame = run_touch_round(2)
+
+
     def check_once(self):
         self._ensure_launcher()
-        launcher = self.launcher_frame or self._capture("launcher-before-once")
+
+        self._transition("input plus", MODE_FLUID)
+        self._probe_mode("fluid_box", "launch/home health warm-up")
         health = self._health_baseline(
             self.dev.checkpoint(), "launch/home"
         )
+        self._transition("input pwr 120", MODE_LAUNCHER)
+        launcher = self.launcher_frame or self._capture("launcher-before-once")
+
         self._transition("input plus", MODE_FLUID)
         self._probe_mode("fluid_box", "launch")
         fluid = self._capture("fluid-after-launch")
         self._assert_distinct(launcher, fluid, "launch")
+        action_end = self.dev.checkpoint()
+        self._assert_health(health, action_end, "launch/home")
+
         self._transition("input pwr 120", MODE_LAUNCHER)
         returned = self._capture("launcher-after-home")
         self._assert_distinct(fluid, returned, "home")
         self._probe_mode("launcher", "home")
-        action_end = self.dev.checkpoint()
-        self._assert_health(health, action_end, "launch/home")
         self.launcher_frame = returned
         self.fluid_frame = fluid
 
     def check_cycles(self):
         self._ensure_launcher()
         baseline_epoch = None
+
+        self._transition("input plus", MODE_FLUID)
+        self._probe_mode("fluid_box", "transition-cycle health warm-up")
         health = self._health_baseline(
             self.dev.checkpoint(),
             "{} transition cycles".format(self.args.cycles),
         )
+        self._transition("input pwr 120", MODE_LAUNCHER)
+
         for cycle in range(1, self.args.cycles + 1):
             marker_sequence = self._transition("input plus", MODE_FLUID)
             if cycle == 1:
@@ -1027,12 +1342,11 @@ class FirmwareShellAcceptance:
                         "{} plain relaunch cycles changed reset_epoch from {} to {}"
                         .format(self.args.cycles, baseline_epoch.epoch, final_epoch.epoch)
                     )
+                action_end = self.dev.checkpoint()
+                self._assert_health(health, action_end, "transition cycles")
             self._transition("input pwr 120", MODE_LAUNCHER)
             if cycle == 1 or cycle % 10 == 0 or cycle == self.args.cycles:
                 print("[accept] transition cycle {}/{}".format(cycle, self.args.cycles))
-
-        action_end = self.dev.checkpoint()
-        self._assert_health(health, action_end, "transition cycles")
 
     def check_freeze(self):
         self._ensure_fluid()
@@ -1200,28 +1514,26 @@ class FirmwareShellAcceptance:
         checkpoint = self.dev.checkpoint()
         self.dev.echo_send("input pwr 3000")
         deadline = time.monotonic() + self.args.power_off_timeout
-        ping_sent = False
         poweroff_marker_seen = False
+        marker_seen_at = None
         absent_since = None
 
         def reject_protocol_activity(dev):
-            nonlocal poweroff_marker_seen
+            nonlocal poweroff_marker_seen, marker_seen_at
             for _, line in dev.lines_since(checkpoint):
                 dev._raise_if_command_rejected(
                     line,
-                    "device-generated transport loss after long PWR input",
+                    "battery-latch release after long PWR input",
                 )
                 stripped = line.strip()
                 if stripped == "@DEV POWEROFF":
                     poweroff_marker_seen = True
+                    if marker_seen_at is None:
+                        marker_seen_at = time.monotonic()
                 elif stripped == MODE_LAUNCHER:
                     raise UserError(
                         "long PWR input emitted launcher mode; the hold was also "
                         "misclassified as a short press"
-                    )
-                elif stripped == "@DEV PONG":
-                    raise UserError(
-                        "device still answered ping after long PWR power-off input"
                     )
 
         def close_and_scan_device():
@@ -1233,14 +1545,15 @@ class FirmwareShellAcceptance:
         while time.monotonic() < deadline:
             if self.dev is not None:
                 reject_protocol_activity(self.dev)
-                if not self.dev.reader.is_alive():
+                transport_lost = (
+                    not self.dev.reader.is_alive()
+                    or (
+                        self._identity_was_enumerated
+                        and not self.port_identity.present_devices()
+                    )
+                )
+                if transport_lost:
                     close_and_scan_device()
-                elif not ping_sent and time.monotonic() + 1.0 >= deadline:
-                    try:
-                        self.dev.echo_send("ping")
-                        ping_sent = True
-                    except DeviceGone:
-                        close_and_scan_device()
 
             if self.dev is None:
                 present = self.port_identity.present_devices()
@@ -1252,18 +1565,76 @@ class FirmwareShellAcceptance:
                     raise UserError(
                         "serial device re-enumerated as {} after {:.2f}s absent "
                         "following long PWR input; the hold rebooted the board "
-                        "instead of powering it off"
+                        "instead of releasing only the battery latch"
                         .format(", ".join(present), now - absent_since)
                     )
+            elif (
+                marker_seen_at is not None
+                and time.monotonic() - marker_seen_at
+                >= POWER_OFF_POST_MARKER_RELEASE_SECONDS
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    status = self._request_status(
+                        "post-release persistent-USB proof",
+                        min(STATUS_RETRY_SECONDS, remaining),
+                    )
+                except AcceptanceTimeout as exc:
+                    reject_protocol_activity(self.dev)
+                    raise UserError(
+                        "long PWR input kept USB connected but did not return one "
+                        "fresh STATUS after the synthetic release/debounce window"
+                    ) from exc
+                except DeviceGone:
+                    close_and_scan_device()
+                    continue
+
+                reject_protocol_activity(self.dev)
+                transport_lost = (
+                    not self.dev.reader.is_alive()
+                    or (
+                        self._identity_was_enumerated
+                        and not self.port_identity.present_devices()
+                    )
+                )
+                if transport_lost:
+                    close_and_scan_device()
+                    continue
+                if status.mode != "fluid_box":
+                    raise UserError(
+                        "long PWR post-release STATUS reported mode={}; expected "
+                        "fluid_box with no short-PWR home transition"
+                        .format(status.mode)
+                    )
+                if status.battery_hold != 0:
+                    raise UserError(
+                        "long PWR post-release STATUS reported battery_hold={}; "
+                        "expected 0 after releasing the battery latch"
+                        .format(status.battery_hold)
+                    )
+                self.mode = status.mode
+                print(
+                    "[accept] power-off released the battery latch "
+                    "(battery_hold=0) while USB remained connected in fluid_box"
+                )
+                return
+
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
         if self.dev is not None:
             reject_protocol_activity(self.dev)
             if self.dev.reader.is_alive():
+                if not poweroff_marker_seen:
+                    raise UserError(
+                        "long PWR input did not emit the required post-command "
+                        "@DEV POWEROFF marker"
+                    )
                 raise UserError(
-                    "device remained serially connected after {:.1f}s following "
-                    "long PWR input; an unanswered ping is not positive power-off "
-                    "evidence".format(self.args.power_off_timeout)
+                    "long PWR input kept USB connected but the timeout ended before "
+                    "a fresh post-release STATUS proved battery_hold=0 and "
+                    "mode=fluid_box"
                 )
             close_and_scan_device()
 
@@ -1274,7 +1645,7 @@ class FirmwareShellAcceptance:
                 raise UserError(
                     "serial device re-enumerated as {} after {:.2f}s absent "
                     "following long PWR input; the hold rebooted the board instead "
-                    "of powering it off"
+                    "of releasing only the battery latch"
                     .format(", ".join(present), observed_at - absent_since)
                 )
             raise UserError(
@@ -1298,8 +1669,9 @@ class FirmwareShellAcceptance:
                 "@DEV POWEROFF marker before sustained transport absence"
             )
         print(
-            "[accept] power-off kept the serial device continuously absent for "
-            "{:.2f}s without a short event or re-enumeration"
+            "[accept] power-off observed @DEV POWEROFF, then kept the USB serial "
+            "transport continuously absent for {:.2f}s without a short event or "
+            "re-enumeration; no persistent-USB STATUS proof was needed"
             .format(continuous_absence)
         )
 
@@ -1316,9 +1688,12 @@ def build_arg_parser():
     parser.add_argument(
         "checks",
         nargs="*",
-        choices=ALL_CHECKS + ("all",),
+        choices=CHECK_CHOICES + ("all",),
         metavar="CHECK",
-        help="subset: launcher once cycles freeze reboot soak all",
+        help=(
+            "subset: launcher once cycles freeze reboot soak touch all "
+            "(touch is interactive and excluded from all)"
+        ),
     )
     parser.add_argument("--port", default=None, metavar="DEV")
     parser.add_argument("--baud", type=positive_int, default=device_dev.DEFAULT_BAUD)
@@ -1342,6 +1717,18 @@ def build_arg_parser():
         type=positive_finite,
         default=DEFAULT_RECONNECT_TIMEOUT,
         metavar="SEC",
+    )
+    parser.add_argument(
+        "--touch-timeout",
+        type=positive_finite,
+        default=DEFAULT_TOUCH_TIMEOUT,
+        metavar="SEC",
+        help=(
+            "bounded operator tap-and-release observation window for each of two "
+            "opt-in touch rounds; each post-Home release quiet is fixed at "
+            "{:.2f}s (default %(default)s)"
+            .format(TOUCH_RELEASE_QUIET_SECONDS)
+        ),
     )
     parser.add_argument(
         "--freeze-seconds",
@@ -1372,13 +1759,20 @@ def build_arg_parser():
     parser.add_argument(
         "--power-off",
         action="store_true",
-        help="run the destructive long-PWR check last; the board must be powered back on manually",
+        help=(
+            "run the destructive long-PWR battery-latch release check last; "
+            "USB-powered targets may remain serially connected"
+        ),
     )
     parser.add_argument(
         "--power-off-timeout",
         type=positive_finite,
         default=10.0,
         metavar="SEC",
+        help=(
+            "bounded window for sustained USB disappearance or a fresh "
+            "post-release STATUS proof (default %(default)s)"
+        ),
     )
     parser.add_argument(
         "--power-off-min-absence",
@@ -1386,8 +1780,8 @@ def build_arg_parser():
         default=DEFAULT_POWER_OFF_MIN_ABSENCE,
         metavar="SEC",
         help=(
-            "minimum continuous target absence required before power-off passes "
-            "(default %(default)s)"
+            "minimum continuous target absence required by the USB-disappearance "
+            "branch (default %(default)s)"
         ),
     )
     return parser
@@ -1397,7 +1791,7 @@ def selected_checks(args) -> tuple[str, ...]:
     requested = tuple(args.checks) if args.checks else CORE_CHECKS
     if "all" in requested:
         requested = ALL_CHECKS
-    ordered = tuple(check for check in ALL_CHECKS if check in requested)
+    ordered = tuple(check for check in CHECK_CHOICES if check in requested)
     if not ordered:
         raise UserError("select at least one acceptance check")
     return ordered
