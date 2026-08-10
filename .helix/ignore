@@ -1,0 +1,6 @@
+# ESP-IDF generated build output
+build/
+sdkconfig.old
+
+# Downloaded component sources; open explicitly when needed
+managed_components/

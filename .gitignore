@@ -1,0 +1,13 @@
+# ESP-IDF generated state
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+
+# Host-tool caches
+__pycache__/
+*.py[cod]
+.cache/
+
+# Machine-local tool configuration
+eim_config.toml
