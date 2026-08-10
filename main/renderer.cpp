@@ -4,12 +4,8 @@
 #include <cstring>
 
 #include "esp_heap_caps.h"
-#include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 
 namespace fluid_demo {
 
@@ -17,11 +13,12 @@ namespace {
 
 constexpr const char *kTAG = "renderer";
 
-// Native square panel geometry.
-constexpr int kWidth = 240;
-constexpr int kHeight = 240;
-constexpr int kStripeRows = 16;
-constexpr int kStripeCount = kHeight / kStripeRows;  // 15 full stripes
+// Native square panel geometry is canonical on the shell's DisplayService;
+// these aliases keep the raster code below unchanged.
+constexpr int kWidth = DisplayService::kWidth;
+constexpr int kHeight = DisplayService::kHeight;
+constexpr int kStripeRows = DisplayService::kStripeRows;
+constexpr int kStripeCount = DisplayService::kStripeCount;
 constexpr int kSurfaceScale = 2;
 constexpr int kSurfaceWidth = kWidth / kSurfaceScale;
 constexpr int kSurfaceHeight = kHeight / kSurfaceScale;
@@ -46,10 +43,6 @@ constexpr float kDepthFxScale = 4096.0f;
 // Dim wireframe color for the 3D box edges (drawn before particles).
 constexpr uint16_t kEdgeColor = 0x1905;  // dark blue-gray RGB565
 
-// A 240x16 RGB565 stripe is 7680 bytes. At 40 MHz one-bit SPI it transfers in
-// roughly 1.5 ms; 200 ms is a generous hardware-fault margin.
-constexpr int kDmaWaitTimeoutMs = 200;
-
 // Velocity palette reference: speed >= kSpeedRef maps to the hottest color.
 constexpr float kSpeedRef = 2.5f;
 
@@ -65,72 +58,42 @@ Renderer::~Renderer()
     free_buffers();
 }
 
-esp_err_t Renderer::init(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t io)
+esp_err_t Renderer::init(DisplayService *display)
 {
-    if (panel == nullptr || io == nullptr) {
+    if (display == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     if (initialized_) {
         return ESP_OK;  // idempotent
     }
 
-    const size_t stripe_bytes = (size_t)kWidth * kStripeRows * sizeof(uint16_t);
     const size_t surface_bytes =
         (size_t)kSurfaceWidth * kSurfaceHeight * sizeof(uint16_t);
-    const size_t capture_bytes = kCaptureBytes;
-    uint16_t *a = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, stripe_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-    uint16_t *b = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, stripe_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     uint16_t *field = static_cast<uint16_t *>(
         heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     uint16_t *heat = static_cast<uint16_t *>(
         heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     uint16_t *depth = static_cast<uint16_t *>(
         heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    uint16_t *capture = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, capture_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     Projected *proj = static_cast<Projected *>(
         heap_caps_malloc(sizeof(Projected) * kMaxParticles, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    SemaphoreHandle_t sem = xSemaphoreCreateBinary();
 
-    if (a == nullptr || b == nullptr || field == nullptr || heat == nullptr ||
-        depth == nullptr || capture == nullptr || proj == nullptr || sem == nullptr) {
-        heap_caps_free(a);
-        heap_caps_free(b);
+    if (field == nullptr || heat == nullptr || depth == nullptr || proj == nullptr) {
         heap_caps_free(field);
         heap_caps_free(heat);
         heap_caps_free(depth);
-        heap_caps_free(capture);
         heap_caps_free(proj);
-        if (sem != nullptr) {
-            vSemaphoreDelete(sem);
-        }
         ESP_LOGE(kTAG, "surface renderer buffer allocation failed");
         return ESP_ERR_NO_MEM;
     }
 
-    stripe_[0] = a;
-    stripe_[1] = b;
     surface_field_ = field;
     surface_heat_ = heat;
     surface_depth_ = depth;
-    capture_ = capture;
     proj_ = proj;
-    sem_ = sem;
     build_luts();
 
-    esp_lcd_panel_io_callbacks_t cbs = {};
-    cbs.on_color_trans_done = &Renderer::on_color_trans_done;
-    esp_err_t ret = esp_lcd_panel_io_register_event_callbacks(io, &cbs, this);
-    if (ret != ESP_OK) {
-        ESP_LOGE(kTAG, "register on_color_trans_done failed: %s", esp_err_to_name(ret));
-        free_buffers();
-        return ret;
-    }
-
-    panel_ = panel;
-    io_ = io;
+    display_ = display;
     initialized_ = true;
     ESP_LOGI(kTAG, "init: 240x240x16bpp, %d stripes x %d rows, %dx%d connected surface",
              kStripeCount, kStripeRows, kSurfaceWidth, kSurfaceHeight);
@@ -139,24 +102,14 @@ esp_err_t Renderer::init(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t
 
 void Renderer::free_buffers()
 {
-    if (sem_ != nullptr) {
-        vSemaphoreDelete(static_cast<SemaphoreHandle_t>(sem_));
-        sem_ = nullptr;
-    }
-    heap_caps_free(stripe_[0]);
-    heap_caps_free(stripe_[1]);
     heap_caps_free(surface_field_);
     heap_caps_free(surface_heat_);
     heap_caps_free(surface_depth_);
-    heap_caps_free(capture_);
     heap_caps_free(proj_);
-    stripe_[0] = stripe_[1] = nullptr;
     surface_field_ = nullptr;
     surface_heat_ = nullptr;
     surface_depth_ = nullptr;
-    capture_ = nullptr;
     proj_ = nullptr;
-    transfer_in_flight_ = false;
     initialized_ = false;
 }
 
@@ -166,72 +119,23 @@ RenderStats Renderer::stats() const
     s.frame_us = frame_us_;
     s.raster_us = raster_us_;
     s.dma_wait_us = dma_wait_us_;
-    s.missed_transfers = missed_transfers_;
+    s.missed_transfers = (display_ != nullptr) ? display_->missed_transfers() : 0;
     return s;
 }
 
 esp_err_t Renderer::request_capture()
 {
-    if (!initialized_ || capture_ == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (capture_requested_.load(std::memory_order_acquire)) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    capture_ready_.store(false, std::memory_order_release);
-    bool expected = false;
-    if (!capture_requested_.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return ESP_OK;
+    return (display_ != nullptr) ? display_->request_capture() : ESP_ERR_INVALID_STATE;
 }
 
 bool Renderer::capture_ready() const
 {
-    return capture_ready_.load(std::memory_order_acquire);
+    return display_ != nullptr && display_->capture_ready();
 }
 
 const uint8_t *Renderer::capture_data() const
 {
-    return reinterpret_cast<const uint8_t *>(capture_);
-}
-
-bool Renderer::on_color_trans_done(esp_lcd_panel_io_handle_t io,
-                                             esp_lcd_panel_io_event_data_t *edata,
-                                             void *user_ctx)
-{
-    (void)io;
-    (void)edata;
-    Renderer *self = static_cast<Renderer *>(user_ctx);
-    return self->trans_done_isr();
-}
-
-bool Renderer::trans_done_isr()
-{
-    BaseType_t hpw = pdFALSE;
-    if (sem_ != nullptr) {
-        xSemaphoreGiveFromISR(static_cast<SemaphoreHandle_t>(sem_), &hpw);
-    }
-    return hpw == pdTRUE;
-}
-
-bool Renderer::wait_previous_transfer(uint32_t *wait_us)
-{
-    *wait_us = 0;
-    if (!transfer_in_flight_) {
-        return true;
-    }
-    SemaphoreHandle_t sem = static_cast<SemaphoreHandle_t>(sem_);
-    int64_t t0 = esp_timer_get_time();
-    const bool ok = xSemaphoreTake(sem, pdMS_TO_TICKS(kDmaWaitTimeoutMs)) == pdTRUE;
-    *wait_us = static_cast<uint32_t>(esp_timer_get_time() - t0);
-    if (!ok) {
-        missed_transfers_++;
-        return false;
-    }
-    transfer_in_flight_ = false;
-    return true;
+    return (display_ != nullptr) ? display_->capture_data() : nullptr;
 }
 
 void Renderer::build_luts()
@@ -576,22 +480,20 @@ void Renderer::shade_surface(uint16_t *buf, int y0, int rows)
 
 esp_err_t Renderer::render(const ParticleFrame &frame)
 {
-    if (!initialized_) {
+    if (!initialized_ || display_ == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
 
     const int64_t t_frame = esp_timer_get_time();
+    const uint32_t dma_wait_begin = display_->dma_wait_us();
     uint32_t raster_total = 0;
-    uint32_t dma_wait_total = 0;
 
     // The previous frame leaves its final stripe queued. Retire it before
     // touching either ping-pong buffer; after a timeout, retrying this wait on
     // the next frame remains safe because the in-flight flag stays set.
-    uint32_t carry_wait_us = 0;
-    if (!wait_previous_transfer(&carry_wait_us)) {
+    if (display_->wait_previous_transfer() != ESP_OK) {
         return ESP_ERR_TIMEOUT;
     }
-    dma_wait_total += carry_wait_us;
 
     const int count = (frame.count > kMaxParticles) ? kMaxParticles : frame.count;
     preproject(frame, count);
@@ -599,12 +501,16 @@ esp_err_t Renderer::render(const ParticleFrame &frame)
     const int64_t t_surface = esp_timer_get_time();
     build_surface();
     raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_surface);
-    const bool capture_frame = capture_requested_.exchange(false, std::memory_order_acq_rel);
+
+    // Frame-boundary capture latch (the old renderer.cpp:602 exchange point).
+    // The DisplayService mirrors when armed and re-arms on any mid-frame
+    // failure, so a request is never latched lazily mid-frame.
+    display_->latch_capture();
 
     for (int s = 0; s < kStripeCount; s++) {
         const int y0 = s * kStripeRows;
         const int rows = min_int(kStripeRows, kHeight - y0);
-        uint16_t *buf = stripe_[s & 1];
+        uint16_t *buf = display_->stripe_buffer(s);
 
         // Rasterize into the idle stripe buffer while the previous stripe's DMA
         // (stripe s-1, the other buffer) is still running.
@@ -612,40 +518,28 @@ esp_err_t Renderer::render(const ParticleFrame &frame)
         std::memset(buf, 0, static_cast<size_t>(kWidth) * rows * sizeof(uint16_t));
         draw_box_edges(buf, y0, rows);
         shade_surface(buf, y0, rows);
-        if (capture_frame) {
-            std::memcpy(capture_ + static_cast<size_t>(y0) * kWidth, buf,
-                        static_cast<size_t>(kWidth) * rows * sizeof(uint16_t));
-        }
         raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_raster);
 
-        // Explicitly wait for the previous transfer (including the one carried
-        // from the previous frame) before submitting the next stripe.
-        uint32_t wait_us = 0;
-        if (!wait_previous_transfer(&wait_us)) {
-            if (capture_frame) {
-                capture_requested_.store(true, std::memory_order_release);
-            }
-            return ESP_ERR_TIMEOUT;
-        }
-        dma_wait_total += wait_us;
-
-        esp_err_t ret = esp_lcd_panel_draw_bitmap(panel_, 0, y0, kWidth, y0 + rows, buf);
+        // Mirror (if armed) -> wait for the previous transfer (including the
+        // one carried from the previous frame) -> draw -> mark in flight.
+        esp_err_t ret = display_->submit_stripe(s, y0, rows, buf);
         if (ret != ESP_OK) {
-            if (capture_frame) {
-                capture_requested_.store(true, std::memory_order_release);
-            }
-            ESP_LOGE(kTAG, "draw_bitmap stripe %d failed: %s", s, esp_err_to_name(ret));
+            // The DisplayService handles re-arming a failed capture; frame
+            // telemetry keeps the last completed frame's values.
             return ret;
         }
-        transfer_in_flight_ = true;  // exactly one outstanding rectangle now
     }
-    if (capture_frame) {
-        capture_ready_.store(true, std::memory_order_release);
+
+    esp_err_t ret = display_->finish_frame();
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     frame_us_ = static_cast<uint32_t>(esp_timer_get_time() - t_frame);
-    raster_us_ = raster_total;
-    dma_wait_us_ = dma_wait_total;
+    raster_us_ = raster_total + display_->capture_copy_us();
+    // The display accumulates wall time cumulatively; the delta since this
+    // frame began is the per-frame DMA wait (carry + all stripe waits).
+    dma_wait_us_ = display_->dma_wait_us() - dma_wait_begin;
     return ESP_OK;
 }
 

@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "app_main.cpp"
          "board.cpp"
          "dev_console.cpp"
+         "display_service.cpp"
          "motion.cpp"
          "fluid.cpp"
          "snapshot_exchange.cpp"

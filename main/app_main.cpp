@@ -29,6 +29,7 @@
 #include "app_types.hpp"
 #include "board.hpp"
 #include "dev_console.hpp"
+#include "display_service.hpp"
 #include "fluid.hpp"
 #include "motion.hpp"
 #include "renderer.hpp"
@@ -36,6 +37,7 @@
 
 namespace {
 
+using fluid_demo::DisplayService;
 using fluid_demo::Fluid;
 using fluid_demo::FluidStats;
 using fluid_demo::MotionFilter;
@@ -91,6 +93,7 @@ fluid_demo::BoardHandles s_board;
 MotionFilter s_filter;
 Fluid s_fluid;
 SnapshotExchange s_snapshots;
+DisplayService s_display;
 Renderer s_renderer;
 
 // Motion state published by the sensor task to the physics task under a short
@@ -470,9 +473,16 @@ extern "C" void app_main(void) {
         fatal_startup("board init", err);
     }
 
-    // Renderer needs the panel handles produced by board_init.
+    // The shell's DisplayService owns the panel transport + PSRAM capture and
+    // must init first; the Renderer binds it for stripe streaming.
+    ESP_LOGI(kTag, "display init");
+    err = s_display.init(s_board.panel, s_board.io);
+    if (err != ESP_OK) {
+        fatal_startup("display init", err);
+    }
+
     ESP_LOGI(kTag, "renderer init");
-    err = s_renderer.init(s_board.panel, s_board.io);
+    err = s_renderer.init(&s_display);
     if (err != ESP_OK) {
         fatal_startup("renderer init", err);
     }
