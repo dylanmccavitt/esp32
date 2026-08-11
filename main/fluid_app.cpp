@@ -214,9 +214,6 @@ esp_err_t FluidBoxApp::update(float dt)
     // consumption point.
     if (reset_requested_.exchange(false)) {
         fluid_.reset();
-        frozen_ = false;
-        calm_frames_ = 0;
-        calm_frames_loose_ = 0;
         ESP_LOGI(kTag, "PLUS press - fluid reset (epoch %u)", fluid_.reset_epoch());
     }
 
@@ -228,29 +225,6 @@ esp_err_t FluidBoxApp::update(float dt)
     }
     portEXIT_CRITICAL(&motion_mux_);
 
-    // Calm freeze: while frozen, skip the solver but keep publishing the
-    // unchanged state so render cadence, captures and the exchange all keep
-    // working; identical input rasters byte-identical frames.
-    if (frozen_) {
-        const float dax = apparent.x - freeze_ref_.x;
-        const float day = apparent.y - freeze_ref_.y;
-        const float daz = apparent.z - freeze_ref_.z;
-        if (dax * dax + day * day + daz * daz >
-            kWakeAccelDelta * kWakeAccelDelta) {
-            frozen_ = false;
-            calm_frames_ = 0;
-            calm_frames_loose_ = 0;
-            ESP_LOGI(kTag, "fluid wake (accel delta)");
-        } else {
-            ParticleFrame *held = snapshots_.begin_write();
-            if (held != nullptr) {
-                fluid_.fill_frame(*held, ++sequence_);
-                snapshots_.publish(held);
-            }
-            return ESP_OK;
-        }
-    }
-
     // step() returns false only on a skip (never happens here: count is set at
     // boot and dt is fixed finite) or when nonfinite state forced a
     // deterministic reset — either way the frame below is still valid.
@@ -261,26 +235,6 @@ esp_err_t FluidBoxApp::update(float dt)
     epoch_.store(fluid_.reset_epoch());
     candidate_checks_.store(fluid_stats.candidate_checks);
     nonfinite_resets_.store(fluid_stats.nonfinite_resets);
-
-    // Calm detection, two tiers keyed on how many grains are still awake:
-    // tight (<= 2 awake for 1.5 s) or loose (<= 8 awake for 10 s). A couple
-    // of grains limit-cycling forever are exactly the "random jumpers" the
-    // freeze exists to stop, so they must not be able to hold the sim awake;
-    // the speed guard keeps a genuinely flying grain from being frozen
-    // mid-air. A pile frozen at its angle of repose is physical.
-    const float max_v = fluid_stats.last_max_speed;
-    const uint16_t awake = fluid_stats.awake_count;
-    const bool calm_tight = awake <= 2 && max_v < kCalmSpeedGuard;
-    const bool calm_loose = awake <= 8 && max_v < kCalmSpeedGuard;
-    calm_frames_ = calm_tight ? calm_frames_ + 1 : 0;
-    calm_frames_loose_ = calm_loose ? calm_frames_loose_ + 1 : 0;
-    if (!frozen_ &&
-        (calm_frames_ >= kCalmFrames || calm_frames_loose_ >= kCalmFramesLoose)) {
-        frozen_ = true;
-        freeze_ref_ = apparent;
-        ESP_LOGI(kTag, "fluid frozen (calm, awake=%u max_v=%.3f)",
-                 static_cast<unsigned>(awake), static_cast<double>(max_v));
-    }
 
     ParticleFrame *slot = snapshots_.begin_write();
     if (slot == nullptr) {
@@ -538,38 +492,18 @@ void FluidBoxApp::preproject(const ParticleFrame &frame, int count)
             (sp >= kSpeedRef) ? 255u
                               : static_cast<uint8_t>((sp / kSpeedRef) * 255.0f);
 
-        // Hysteresis: adopt fresh values only outside a small dead band so
-        // sub-pixel rest wobble never flips a rounded pixel or a color step.
-        DrawLatch &latch = latch_[i];
-        if (!latch.valid) {
-            latch.x = fx;
-            latch.y = fy;
-            latch.r = fr;
-            latch.speed_idx = fresh_speed;
-            latch.fade = fresh_fade;
-            latch.valid = 1;
-        } else {
-            if (std::fabs(fx - latch.x) >= 0.75f) latch.x = fx;
-            if (std::fabs(fy - latch.y) >= 0.75f) latch.y = fy;
-            if (std::fabs(fr - latch.r) >= 0.75f) latch.r = fr;
-            const int ds = static_cast<int>(fresh_speed) - static_cast<int>(latch.speed_idx);
-            if (ds >= 6 || ds <= -6) latch.speed_idx = fresh_speed;
-            const int df = static_cast<int>(fresh_fade) - static_cast<int>(latch.fade);
-            if (df >= 4 || df <= -4) latch.fade = fresh_fade;
-        }
-
-        int rad = static_cast<int>(std::lrintf(latch.r));
+        int rad = static_cast<int>(std::lrintf(fr));
         if (rad < 1) {
             rad = 1;
         }
         if (rad > kMaxSpriteRadius) {
             rad = kMaxSpriteRadius;
         }
-        p.x = static_cast<int16_t>(std::lrintf(latch.x));
-        p.y = static_cast<int16_t>(std::lrintf(latch.y));
+        p.x = static_cast<int16_t>(std::lrintf(fx));
+        p.y = static_cast<int16_t>(std::lrintf(fy));
         p.radius = static_cast<uint16_t>(rad);
-        p.fade = latch.fade;
-        p.speed_idx = latch.speed_idx;
+        p.fade = fresh_fade;
+        p.speed_idx = fresh_speed;
         p.active = 1;
     }
 }

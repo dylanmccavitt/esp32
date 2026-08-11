@@ -156,37 +156,7 @@ private:
     /// Indices of active particles sorted far-to-near for painter's rendering.
     uint16_t draw_order_[kMaxParticles] = {};
 
-    /// Screen-space hysteresis latch. A bead's drawn position, radius, color
-    /// and depth fade move only when the freshly projected value leaves a
-    /// small dead band around the latched one, so the solver's sub-pixel rest
-    /// wobble can never flip a rounded pixel; real motion (> ~1 px/frame)
-    /// passes straight through.
-    struct DrawLatch {
-        float x = 0.0f;
-        float y = 0.0f;
-        float r = 0.0f;
-        uint8_t speed_idx = 0;
-        uint8_t fade = 0;
-        uint8_t valid = 0;
-    };
-    DrawLatch latch_[kMaxParticles] = {};
-
     Edge edges_[12] = {};
-
-    /// Calm freeze (update-lane-only). When apparent gravity is steady and
-    /// every grain is nearly still for kCalmFrames, the lane stops stepping
-    /// the solver and republishes the unchanged state each frame: identical
-    /// input rasters byte-identical frames, so a resting pile cannot creep or
-    /// flicker at all. Any accel change past kWakeAccelDelta (or a reset)
-    /// resumes stepping on the next update.
-    static constexpr float kCalmSpeedGuard = 0.6f;   ///< no grain faster than a slow roll
-    static constexpr uint32_t kCalmFrames = 45;      ///< 1.5 s with <= 2 grains awake
-    static constexpr uint32_t kCalmFramesLoose = 300;  ///< 10 s with <= 8 grains awake
-    static constexpr float kWakeAccelDelta = 0.35f;  ///< ~3 deg tilt at |g|=6
-    bool frozen_ = false;
-    uint32_t calm_frames_ = 0;
-    uint32_t calm_frames_loose_ = 0;
-    Vec3 freeze_ref_{0.0f, 0.0f, 6.0f};
 
     // Update-lane-only producer sequence; sensor-lane/other plain state.
     uint32_t sequence_ = 0;

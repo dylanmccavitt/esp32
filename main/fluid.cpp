@@ -36,9 +36,9 @@ constexpr float kDeltaRelax = 0.5f;
 
 // Rest calm: recovered speeds below this fraction of h/dt (~0.31 units/s)
 // are zeroed. Sand carries almost no momentum at low speed, so a high floor
-// is physical: it collapses the solver's rest simmer within seconds and lets
-// the app's calm freeze engage. A free-falling particle gains g*dt ~ 0.2 per
-// step and stays above the floor after two steps of fall.
+// is physical: it collapses the solver's rest simmer within seconds so a
+// settled pile sits still on screen. A free-falling particle gains g*dt ~ 0.2
+// per step and stays above the floor after two steps of fall.
 constexpr float kSleepFrac = 0.05f;
 
 inline float clampf(float v, float lo, float hi) {
@@ -122,7 +122,10 @@ bool Fluid::init(uint16_t particle_count) {
     const float ratio = static_cast<float>(kInitialParticles) / static_cast<float>(count_);
     spacing_ = 0.14f * std::cbrt(ratio);
     h_ = spacing_ * (0.20f / 0.11f);
-    radius_ = 0.15f * spacing_;  // sand-grain beads for the sprite renderer
+    // Sand-grain beads for the sprite renderer: small enough that every grain
+    // stays a distinct bead at the rest pitch, large enough that a settled
+    // pile reads as a dense granular mass instead of scattered dots.
+    radius_ = 0.28f * spacing_;
 
     // Kernel and solve constants.
     const float h2 = h_ * h_;
@@ -346,8 +349,8 @@ bool Fluid::step(const Vec3& apparent_accel, float dt) {
     velocity_cap(vel_cap);
 
     // Jitter floor: zero the residual micro-velocities of settled particles.
-    // The post-floor maximum feeds the calm-freeze gate: sleeping particles
-    // report zero, so only genuinely rolling grains can hold the sim awake.
+    // Sleeping particles report zero speed, so the awake/max-speed telemetry
+    // reflects only genuinely rolling grains.
     const float sleep_v = kSleepFrac * h_ * inv_dt;
     const float sleep_v2 = sleep_v * sleep_v;
     float max_v2 = 0.0f;
