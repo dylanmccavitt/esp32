@@ -56,6 +56,28 @@ constexpr float kSpeedRef = 2.5f;
 inline int min_int(int a, int b) { return a < b ? a : b; }
 inline int max_int(int a, int b) { return a > b ? a : b; }
 
+// Speck cluster rendering: every solver grain draws kSpecksPerGrain sand
+// specks — its true center plus scattered copies at fixed offsets (signed
+// 1/64 units of the grain's spread radius). Offsets are picked per grain by
+// a fixed hash, so clusters are stable frame to frame and multiply the
+// apparent grain count without touching the solver.
+constexpr int kSpecksPerGrain = 9;
+struct SpeckOffset {
+    int8_t x;
+    int8_t y;
+};
+constexpr uint32_t kSpeckOffsetCount = 16;  // power of two for cheap masking
+constexpr SpeckOffset kSpeckOffsets[kSpeckOffsetCount] = {
+    {40, 10},   {-35, 25}, {5, -45},  {-20, -38},
+    {45, -20},  {-48, -5}, {15, 42},  {28, -40},
+    {-42, 30},  {50, 22},  {-8, 50},  {-30, -15},
+    {22, 18},   {-15, -50}, {36, 36}, {-50, -28},
+};
+
+// Speck scatter radius as a multiple of the projected grain radius:
+// 0.35 of the rest pitch, with spacing = radius_world / 0.088 (sand build).
+constexpr float kSpeckSpreadPerRadius = 0.35f / 0.088f;
+
 }  // namespace
 
 FluidBoxApp s_fluid_app;
@@ -499,9 +521,14 @@ void FluidBoxApp::preproject(const ParticleFrame &frame, int count)
         if (rad > kMaxSpriteRadius) {
             rad = kMaxSpriteRadius;
         }
+        int spread = static_cast<int>(std::lrintf(fr * kSpeckSpreadPerRadius));
+        if (spread > 255) {
+            spread = 255;
+        }
         p.x = static_cast<int16_t>(std::lrintf(fx));
         p.y = static_cast<int16_t>(std::lrintf(fy));
         p.radius = static_cast<uint16_t>(rad);
+        p.spread_px = static_cast<uint8_t>(spread);
         p.fade = fresh_fade;
         p.speed_idx = fresh_speed;
         p.active = 1;
@@ -617,21 +644,9 @@ void FluidBoxApp::draw_particles(uint16_t *buf, int y0, int rows)
     // a subtle dark rim where it overlaps a deeper ball.
     const int y1 = y0 + rows;
     for (int n = 0; n < active_count_; ++n) {
-        const Projected &p = proj_[draw_order_[n]];
+        const uint16_t gi = draw_order_[n];
+        const Projected &p = proj_[gi];
         const int r = static_cast<int>(p.radius);
-        const int top = p.y - r;
-        const int bottom = p.y + r;
-        if (bottom < y0 || top >= y1) {
-            continue;
-        }
-        const int row_a = max_int(top, y0);
-        const int row_b = min_int(bottom, y1 - 1);
-        const int x_a = max_int(p.x - r, 0);
-        const int x_b = min_int(p.x + r, kWidth - 1);
-        if (x_a > x_b) {
-            continue;
-        }
-
         const int side = 2 * r + 1;
         const uint8_t *sprite = sprite_lut_ + sprite_off_[r];
         const uint16_t pal = palette_[p.speed_idx];
@@ -639,22 +654,49 @@ void FluidBoxApp::draw_particles(uint16_t *buf, int y0, int rows)
         const uint32_t pg = (pal >> 5) & 0x3Fu;
         const uint32_t pb = pal & 0x1Fu;
         const uint32_t fade = p.fade;
+        const int spread = static_cast<int>(p.spread_px);
 
-        for (int y = row_a; y <= row_b; ++y) {
-            const uint8_t *srow =
-                sprite + static_cast<size_t>(y - top) * side + (x_a - (p.x - r));
-            uint16_t *out = buf + static_cast<size_t>(y - y0) * kWidth + x_a;
-            for (int x = x_a; x <= x_b; ++x, ++srow, ++out) {
-                const uint32_t shade = *srow;
-                if (shade == 0u) {
-                    continue;
+        // The cluster rides its parent rigidly, which is invisible at
+        // one-to-two-pixel grain scale; speck 0 is the true center.
+        for (int k = 0; k < kSpecksPerGrain; ++k) {
+            int cx = p.x;
+            int cy = p.y;
+            if (k != 0) {
+                const SpeckOffset &off = kSpeckOffsets[
+                    (static_cast<uint32_t>(gi) * 7u + static_cast<uint32_t>(k) * 5u) &
+                    (kSpeckOffsetCount - 1)];
+                cx += (static_cast<int>(off.x) * spread) >> 6;
+                cy += (static_cast<int>(off.y) * spread) >> 6;
+            }
+            const int top = cy - r;
+            const int bottom = cy + r;
+            if (bottom < y0 || top >= y1) {
+                continue;
+            }
+            const int row_a = max_int(top, y0);
+            const int row_b = min_int(bottom, y1 - 1);
+            const int x_a = max_int(cx - r, 0);
+            const int x_b = min_int(cx + r, kWidth - 1);
+            if (x_a > x_b) {
+                continue;
+            }
+
+            for (int y = row_a; y <= row_b; ++y) {
+                const uint8_t *srow =
+                    sprite + static_cast<size_t>(y - top) * side + (x_a - (cx - r));
+                uint16_t *out = buf + static_cast<size_t>(y - y0) * kWidth + x_a;
+                for (int x = x_a; x <= x_b; ++x, ++srow, ++out) {
+                    const uint32_t shade = *srow;
+                    if (shade == 0u) {
+                        continue;
+                    }
+                    const uint32_t bright = (shade * fade) >> 8;
+                    const uint32_t r5 = (pr * bright) >> 8;
+                    const uint32_t g6 = (pg * bright) >> 8;
+                    const uint32_t b5 = (pb * bright) >> 8;
+                    *out = __builtin_bswap16(
+                        static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5));
                 }
-                const uint32_t bright = (shade * fade) >> 8;
-                const uint32_t r5 = (pr * bright) >> 8;
-                const uint32_t g6 = (pg * bright) >> 8;
-                const uint32_t b5 = (pb * bright) >> 8;
-                *out = __builtin_bswap16(
-                    static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5));
             }
         }
     }

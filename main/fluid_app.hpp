@@ -25,15 +25,16 @@ namespace fluid_demo {
 /// setup_once() and the end of the process.
 class FluidBoxApp final : public App {
 public:
-    /// Startup count, capped by the measured physics budget: with the
-    /// half-stencil solver, one Jacobi iteration and the velocity sleep
-    /// floor, 400 sand-grain particles measure ~24 ms/step at rest on
-    /// hardware; the hardest shakes may briefly exceed the 33.3 ms step and
-    /// degrade to momentary slow motion, which is accepted for the finer
-    /// look. The namespace-level kInitialParticles (app_types.hpp) is the
-    /// geometry baseline; a different startup count rescales spacing, not
-    /// the occupied volume.
-    static constexpr uint16_t kInitialParticles = 400;
+    /// Startup count, set by measured worst-case hardware budget: with the
+    /// contact kernel (h = 1.35 * spacing), vigorous shaking compresses the
+    /// pile and roughly doubles step cost versus rest (400 grains: ~20 ms
+    /// rest but ~45 ms shaken = visible slow-motion chop; 768: ~49 ms even
+    /// at rest). 256 grains keep the hardest shake under the 33.3 ms step.
+    /// Apparent grain count is multiplied by the renderer's speck clusters
+    /// (kSpecksPerGrain in fluid_app.cpp). The namespace-level
+    /// kInitialParticles (app_types.hpp) is the geometry baseline; a
+    /// different startup count rescales spacing, not the occupied volume.
+    static constexpr uint16_t kInitialParticles = 256;
     static_assert(kInitialParticles >= kMinParticles &&
                       kInitialParticles <= kMaxParticles,
                   "startup count must stay within Fluid's supported range");
@@ -85,6 +86,7 @@ private:
         uint16_t radius;    ///< Sprite radius (px), in [1, kMaxSpriteRadius].
         uint8_t speed_idx;  ///< Palette index for the velocity color.
         uint8_t active;     ///< 0 = particle skipped (non-finite/out of range).
+        uint8_t spread_px;  ///< Speck cluster scatter radius (px).
         uint32_t z_fx;      ///< Center depth, fixed point, 1/4096 world unit (sort key).
         uint32_t fade;      ///< Depth brightness scale, 0..255 (far = dim).
     };

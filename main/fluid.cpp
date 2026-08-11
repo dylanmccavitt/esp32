@@ -34,12 +34,12 @@ constexpr int kJacobiIterations = 1;
 // the ring; the warm start recovers the lost convergence across frames.
 constexpr float kDeltaRelax = 0.5f;
 
-// Rest calm: recovered speeds below this fraction of h/dt (~0.31 units/s)
-// are zeroed. Sand carries almost no momentum at low speed, so a high floor
-// is physical: it collapses the solver's rest simmer within seconds so a
-// settled pile sits still on screen. A free-falling particle gains g*dt ~ 0.2
-// per step and stays above the floor after two steps of fall.
-constexpr float kSleepFrac = 0.05f;
+// Rest calm: recovered speeds below this fraction of h/dt (~0.07 units/s)
+// are zeroed, collapsing the solver's rest simmer so a settled pile sits
+// still. The floor is kept low so slow pours stay smooth instead of
+// quantizing into stop-start chop; a free-falling particle gains
+// g*dt ~ 0.3 per step and clears the floor after one step of fall.
+constexpr float kSleepFrac = 0.02f;
 
 inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -121,11 +121,13 @@ bool Fluid::init(uint16_t particle_count) {
     // active count changes. The 216-particle baseline forms a 6x6x6 volume.
     const float ratio = static_cast<float>(kInitialParticles) / static_cast<float>(count_);
     spacing_ = 0.14f * std::cbrt(ratio);
-    h_ = spacing_ * (0.20f / 0.11f);
-    // Sand-grain beads for the sprite renderer: small enough that every grain
-    // stays a distinct bead at the rest pitch, large enough that a settled
-    // pile reads as a dense granular mass instead of scattered dots.
-    radius_ = 0.28f * spacing_;
+    // Contact-scale kernel for sand: 1.35 * spacing reaches only the six
+    // face neighbors of the rest lattice (edge diagonals at 1.41 * spacing
+    // stay outside), cutting pair work to about a third of the smooth-fluid
+    // 1.82 ratio and making the medium behave granular instead of smeared.
+    h_ = spacing_ * 1.35f;
+    // A grain of sand on screen: about two pixels of sprite radius.
+    radius_ = 0.088f * spacing_;
 
     // Kernel and solve constants.
     const float h2 = h_ * h_;

@@ -98,7 +98,7 @@ private:
     uint32_t reset_epoch_ = 0;
     float spacing_ = 0.0f;
     float h_ = 0.0f;              // kernel support radius
-    float radius_ = 0.0f;         // rendered particle radius (0.30 * spacing)
+    float radius_ = 0.0f;         // rendered particle radius (0.11 * spacing)
     float rho0_ = 0.0f;
     float inv_rho0_ = 0.0f;
     float poly6_k_ = 0.0f;        // 315 / (64 * pi * h^9)
