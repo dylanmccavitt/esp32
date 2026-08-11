@@ -214,6 +214,9 @@ esp_err_t FluidBoxApp::update(float dt)
     // consumption point.
     if (reset_requested_.exchange(false)) {
         fluid_.reset();
+        frozen_ = false;
+        calm_frames_ = 0;
+        calm_frames_loose_ = 0;
         ESP_LOGI(kTag, "PLUS press - fluid reset (epoch %u)", fluid_.reset_epoch());
     }
 
@@ -225,6 +228,29 @@ esp_err_t FluidBoxApp::update(float dt)
     }
     portEXIT_CRITICAL(&motion_mux_);
 
+    // Calm freeze: while frozen, skip the solver but keep publishing the
+    // unchanged state so render cadence, captures and the exchange all keep
+    // working; identical input rasters byte-identical frames.
+    if (frozen_) {
+        const float dax = apparent.x - freeze_ref_.x;
+        const float day = apparent.y - freeze_ref_.y;
+        const float daz = apparent.z - freeze_ref_.z;
+        if (dax * dax + day * day + daz * daz >
+            kWakeAccelDelta * kWakeAccelDelta) {
+            frozen_ = false;
+            calm_frames_ = 0;
+            calm_frames_loose_ = 0;
+            ESP_LOGI(kTag, "fluid wake (accel delta)");
+        } else {
+            ParticleFrame *held = snapshots_.begin_write();
+            if (held != nullptr) {
+                fluid_.fill_frame(*held, ++sequence_);
+                snapshots_.publish(held);
+            }
+            return ESP_OK;
+        }
+    }
+
     // step() returns false only on a skip (never happens here: count is set at
     // boot and dt is fixed finite) or when nonfinite state forced a
     // deterministic reset — either way the frame below is still valid.
@@ -235,6 +261,26 @@ esp_err_t FluidBoxApp::update(float dt)
     epoch_.store(fluid_.reset_epoch());
     candidate_checks_.store(fluid_stats.candidate_checks);
     nonfinite_resets_.store(fluid_stats.nonfinite_resets);
+
+    // Calm detection, two tiers keyed on how many grains are still awake:
+    // tight (<= 2 awake for 1.5 s) or loose (<= 8 awake for 10 s). A couple
+    // of grains limit-cycling forever are exactly the "random jumpers" the
+    // freeze exists to stop, so they must not be able to hold the sim awake;
+    // the speed guard keeps a genuinely flying grain from being frozen
+    // mid-air. A pile frozen at its angle of repose is physical.
+    const float max_v = fluid_stats.last_max_speed;
+    const uint16_t awake = fluid_stats.awake_count;
+    const bool calm_tight = awake <= 2 && max_v < kCalmSpeedGuard;
+    const bool calm_loose = awake <= 8 && max_v < kCalmSpeedGuard;
+    calm_frames_ = calm_tight ? calm_frames_ + 1 : 0;
+    calm_frames_loose_ = calm_loose ? calm_frames_loose_ + 1 : 0;
+    if (!frozen_ &&
+        (calm_frames_ >= kCalmFrames || calm_frames_loose_ >= kCalmFramesLoose)) {
+        frozen_ = true;
+        freeze_ref_ = apparent;
+        ESP_LOGI(kTag, "fluid frozen (calm, awake=%u max_v=%.3f)",
+                 static_cast<unsigned>(awake), static_cast<double>(max_v));
+    }
 
     ParticleFrame *slot = snapshots_.begin_write();
     if (slot == nullptr) {
@@ -363,7 +409,7 @@ void FluidBoxApp::build_luts()
         const float u = static_cast<float>(i) / 255.0f;
         const float hue = (1.0f - u) * 230.0f;
         const float sat = 0.85f;
-        const float val = 0.45f + 0.55f * u;
+        const float val = 0.55f + 0.45f * u;  // floor keeps slow grains visible on black
         palette_[i] = hsv_to_rgb565(hue, sat, val);
     }
 }
@@ -472,19 +518,10 @@ void FluidBoxApp::preproject(const ParticleFrame &frame, int count)
             continue;
         }
         const float scale = kPxPerWorld * (kFocal / (kFocal + src.z));
-        const int sx = static_cast<int>(std::lrintf(kWidth * 0.5f + src.x * scale));
+        const float fx = kWidth * 0.5f + src.x * scale;
         // World +y is screen-up; particles rest at the bottom of the box.
-        const int sy = static_cast<int>(std::lrintf(kHeight * 0.5f - src.y * scale));
-        int rad = static_cast<int>(std::lrintf(radius_world * scale));
-        if (rad < 1) {
-            rad = 1;
-        }
-        if (rad > kMaxSpriteRadius) {
-            rad = kMaxSpriteRadius;
-        }
-        p.x = static_cast<int16_t>(sx);
-        p.y = static_cast<int16_t>(sy);
-        p.radius = static_cast<uint16_t>(rad);
+        const float fy = kHeight * 0.5f - src.y * scale;
+        const float fr = radius_world * scale;
 
         constexpr uint32_t kBoxDepthFx =
             static_cast<uint32_t>(kBoxDepthZ * kDepthFxScale + 0.5f);
@@ -494,11 +531,45 @@ void FluidBoxApp::preproject(const ParticleFrame &frame, int count)
         if (drop > kDepthFadeMax) {
             drop = kDepthFadeMax;
         }
-        p.fade = 255u - drop;
+        const uint8_t fresh_fade = static_cast<uint8_t>(255u - drop);
 
         const float sp = (src.speed < 0.0f) ? 0.0f : src.speed;
-        p.speed_idx = (sp >= kSpeedRef) ? 255u
-                                        : static_cast<uint8_t>((sp / kSpeedRef) * 255.0f);
+        const uint8_t fresh_speed =
+            (sp >= kSpeedRef) ? 255u
+                              : static_cast<uint8_t>((sp / kSpeedRef) * 255.0f);
+
+        // Hysteresis: adopt fresh values only outside a small dead band so
+        // sub-pixel rest wobble never flips a rounded pixel or a color step.
+        DrawLatch &latch = latch_[i];
+        if (!latch.valid) {
+            latch.x = fx;
+            latch.y = fy;
+            latch.r = fr;
+            latch.speed_idx = fresh_speed;
+            latch.fade = fresh_fade;
+            latch.valid = 1;
+        } else {
+            if (std::fabs(fx - latch.x) >= 0.75f) latch.x = fx;
+            if (std::fabs(fy - latch.y) >= 0.75f) latch.y = fy;
+            if (std::fabs(fr - latch.r) >= 0.75f) latch.r = fr;
+            const int ds = static_cast<int>(fresh_speed) - static_cast<int>(latch.speed_idx);
+            if (ds >= 6 || ds <= -6) latch.speed_idx = fresh_speed;
+            const int df = static_cast<int>(fresh_fade) - static_cast<int>(latch.fade);
+            if (df >= 4 || df <= -4) latch.fade = fresh_fade;
+        }
+
+        int rad = static_cast<int>(std::lrintf(latch.r));
+        if (rad < 1) {
+            rad = 1;
+        }
+        if (rad > kMaxSpriteRadius) {
+            rad = kMaxSpriteRadius;
+        }
+        p.x = static_cast<int16_t>(std::lrintf(latch.x));
+        p.y = static_cast<int16_t>(std::lrintf(latch.y));
+        p.radius = static_cast<uint16_t>(rad);
+        p.fade = latch.fade;
+        p.speed_idx = latch.speed_idx;
         p.active = 1;
     }
 }
@@ -515,8 +586,13 @@ void FluidBoxApp::sort_back_to_front()
         }
     }
     active_count_ = n;
+    // Quantized depth key (1/64 world unit) with an index tie-break: beads at
+    // near-identical depth keep a fixed overlap order, so the solver's rest
+    // wobble cannot flutter the painter's order frame to frame.
     std::sort(draw_order_, draw_order_ + n, [this](uint16_t a, uint16_t b) {
-        return proj_[a].z_fx > proj_[b].z_fx;
+        const uint32_t za = proj_[a].z_fx >> 6;
+        const uint32_t zb = proj_[b].z_fx >> 6;
+        return za != zb ? za > zb : a < b;
     });
 }
 

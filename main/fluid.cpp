@@ -22,24 +22,24 @@ constexpr float kSqrt3Inv = 0.5773502691896258f;  // 1 / sqrt(3), cube-diagonal 
 
 constexpr float kWallRestitution = 0.05f;   // normal reflection coefficient
 constexpr float kWallTangential = 0.98f;    // tangential friction coefficient
-constexpr float kVelocityDamping = 0.995f;  // light bulk damping at the fixed 30 Hz step
-// One warm-started iteration holds 30 Hz at 343 particles (~23-27 ms/step on
-// hardware; two iterations cost ~43 ms and overrun). The constraint solve
-// re-converges across frames, trading a slightly softer fluid under hard
-// shakes for the finer 343-particle look.
+constexpr float kVelocityDamping = 0.98f;   // sand-strength bulk damping at the fixed 30 Hz step
+// One warm-started iteration holds 30 Hz at 400 particles (~25 ms/step on
+// hardware; two iterations overrun). The constraint solve re-converges
+// across frames; kDeltaRelax below keeps the single iteration from ringing.
 constexpr int kJacobiIterations = 1;
 
 // Single-iteration Jacobi overshoots: both ends of a pair correct against the
 // same frozen state, so full-strength deltas ring and occasionally pop a
 // particle out of a settled pile. Under-relaxing the applied correction damps
 // the ring; the warm start recovers the lost convergence across frames.
-constexpr float kDeltaRelax = 0.6f;
+constexpr float kDeltaRelax = 0.5f;
 
-// Rest calm: recovered speeds below this fraction of h/dt are zeroed so a
-// settled pile stops micro-oscillating (and stops shimmering on screen). A
-// free-falling particle gains g*dt ~ 0.2 units/s in one step, far above the
-// floor, so real motion never sleeps.
-constexpr float kSleepFrac = 0.018f;
+// Rest calm: recovered speeds below this fraction of h/dt (~0.31 units/s)
+// are zeroed. Sand carries almost no momentum at low speed, so a high floor
+// is physical: it collapses the solver's rest simmer within seconds and lets
+// the app's calm freeze engage. A free-falling particle gains g*dt ~ 0.2 per
+// step and stays above the floor after two steps of fall.
+constexpr float kSleepFrac = 0.05f;
 
 inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -122,7 +122,7 @@ bool Fluid::init(uint16_t particle_count) {
     const float ratio = static_cast<float>(kInitialParticles) / static_cast<float>(count_);
     spacing_ = 0.14f * std::cbrt(ratio);
     h_ = spacing_ * (0.20f / 0.11f);
-    radius_ = 0.24f * spacing_;  // small distinct beads for the sprite renderer
+    radius_ = 0.15f * spacing_;  // sand-grain beads for the sprite renderer
 
     // Kernel and solve constants.
     const float h2 = h_ * h_;
@@ -133,7 +133,7 @@ bool Fluid::init(uint16_t particle_count) {
     spiky_center_mag_ = spiky_grad_k_ * h2;  // = 45 / (pi * h^4)
     epsilon_ = 0.2f / h2;
     lambda_cap_ = 0.5f * h2;
-    scorr_k_ = 0.03f * h2;
+    scorr_k_ = 0.015f * h2;  // halved: full-strength scorr keeps a settled pile simmering
     w_scorr_ref_ = poly6(0.09f * h2, h_, poly6_k_);  // W(0.3 * h)
     delta_cap_ = 0.25f * spacing_;
 
@@ -346,16 +346,27 @@ bool Fluid::step(const Vec3& apparent_accel, float dt) {
     velocity_cap(vel_cap);
 
     // Jitter floor: zero the residual micro-velocities of settled particles.
+    // The post-floor maximum feeds the calm-freeze gate: sleeping particles
+    // report zero, so only genuinely rolling grains can hold the sim awake.
     const float sleep_v = kSleepFrac * h_ * inv_dt;
     const float sleep_v2 = sleep_v * sleep_v;
+    float max_v2 = 0.0f;
+    uint16_t awake = 0;
     for (size_t i = 0; i < count_; ++i) {
         const float v2 = vx_[i] * vx_[i] + vy_[i] * vy_[i] + vz_[i] * vz_[i];
         if (v2 < sleep_v2) {
             vx_[i] = 0.0f;
             vy_[i] = 0.0f;
             vz_[i] = 0.0f;
+        } else {
+            ++awake;
+            if (v2 > max_v2) {
+                max_v2 = v2;
+            }
         }
     }
+    stats_.last_max_speed = std::sqrt(max_v2);
+    stats_.awake_count = awake;
 
     float max_err = 0.0f;
     for (size_t i = 0; i < count_; ++i) {

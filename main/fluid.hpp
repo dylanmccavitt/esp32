@@ -14,6 +14,8 @@ struct FluidStats {
     uint32_t nonfinite_resets = 0;    // deterministic resets forced by non-finite state (cumulative, survives reset())
     float last_density_error = 0.0f;  // max |rho/rho0 - 1| over the latest step
     float max_density_error = 0.0f;   // running max since the last reset
+    float last_max_speed = 0.0f;      // max post-floor |v| over the latest step (calm-freeze gate)
+    uint16_t awake_count = 0;         // particles above the sleep floor after the latest step
 };
 
 // True 3D Position Based Fluids (Macklin & Mueller, "Position Based Fluids",
