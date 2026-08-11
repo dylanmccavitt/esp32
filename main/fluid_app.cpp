@@ -23,10 +23,22 @@ constexpr const char *kTag = "fluid_demo";
 // Gravity / input. |apparent| = 9.0 sim units at full edge tilt.
 constexpr int kAccelQ8PerUnit = 28;      // raw px/frame^2 per sim unit
 constexpr int kAccelClampRaw = 512;      // +/-2 px/frame/axis per frame
-constexpr float kAccelDeadzone2 = 0.1225f;  // in-plane |a| < 0.35 -> no gravity
+// In-plane gravity hysteresis: arms at 0.75 (~5 deg, a deliberate hand
+// tilt), disarms below 0.6, so a resting desk (measured 0.40-0.51 on
+// this bench) can neither arm the pull nor hold it armed after play
+// (with the floor boost below, "on" is a 1/3 g yank).
+constexpr float kGravOn2 = 0.5625f;
+constexpr float kGravOff2 = 0.36f;
+// Below this magnitude (but above the deadzone) the acceleration is scaled
+// up to it, direction preserved: any visible tilt pulls airborne specks
+// down at >= 1/3 g instead of letting them drift like dust motes.
+constexpr float kAccelFloorUnits = 3.0f;
 
 // Motion.
 constexpr int kDragShift = 7;      // v -= v>>7 per frame (~0.992)
+// With gravity off (flat) strays brake hard so nothing ghost-drifts
+// through the air for seconds; they stop and rest on the glass.
+constexpr int kFlatDragShift = 4;  // v -= v>>4 per frame (~0.94)
 constexpr int kVmaxRaw = 2560;     // 10 px/frame per axis (300 px/s)
 constexpr int kMaxWalkSteps = 12;  // per particle per frame
 // 75% of the reachable walk-step ceiling (3000 particles * (12+4) guard);
@@ -61,8 +73,9 @@ constexpr int kSimmerCount = 64;        // wake attempts/frame while tilted
 constexpr int kSimmerMinRaw = 77;       // 0.3..0.6 px/frame simmer speed
 constexpr int kSimmerSpanRaw = 78;
 
-// Rest gate.
-constexpr float kRestGateMag = 0.5f;
+// Rest gate (also the simmer and wake-all threshold); above the gravity
+// arm point so desk-tilt noise cannot hold the gate open.
+constexpr float kRestGateMag = 0.6f;
 constexpr uint32_t kRestGateFrames = 15;
 
 // Speed -> palette level thresholds (Manhattan |vx|+|vy|, raw Q8.8).
@@ -299,14 +312,26 @@ uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
         ay = 0.0f;
     }
     const float m2 = ax * ax + ay * ay;
+    if (m2 >= kGravOn2) {
+        grav_on_ = true;
+    } else if (m2 < kGravOff2) {
+        grav_on_ = false;
+    }
     int32_t dvx = 0;
     int32_t dvy = 0;
-    if (m2 >= kAccelDeadzone2) {
-        dvx = clamp_i32(static_cast<int32_t>(lroundf(ax * kAccelQ8PerUnit)),
+    if (grav_on_) {
+        float s = static_cast<float>(kAccelQ8PerUnit);
+        const float m_in = std::sqrt(m2);
+        if (m_in < kAccelFloorUnits) {
+            s *= kAccelFloorUnits / m_in;  // gravity floor, direction kept
+        }
+        dvx = clamp_i32(static_cast<int32_t>(lroundf(ax * s)),
                         -kAccelClampRaw, kAccelClampRaw);
-        dvy = clamp_i32(static_cast<int32_t>(lroundf(ay * kAccelQ8PerUnit)),
+        dvy = clamp_i32(static_cast<int32_t>(lroundf(ay * s)),
                         -kAccelClampRaw, kAccelClampRaw);
     }
+    const bool grav_active = (dvx != 0 || dvy != 0);
+    const int drag_shift = grav_active ? kDragShift : kFlatDragShift;
 
     // Quantized gravity octant (each component -1/0/1) for leveling, kick
     // and simmer directions. tan(22.5 deg) ~ 0.414 splits the octants.
@@ -315,7 +340,7 @@ uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
     {
         const float axa = std::fabs(ax);
         const float aya = std::fabs(ay);
-        if (m2 >= kAccelDeadzone2) {
+        if (grav_on_) {
             if (axa > 0.414f * aya) {
                 gox = (ax >= 0.0f) ? 1 : -1;
             }
@@ -438,8 +463,8 @@ uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
         // Integrate: gravity, drag, per-axis clamp.
         int32_t vx = vx_[i] + dvx;
         int32_t vy = vy_[i] + dvy;
-        vx -= vx >> kDragShift;
-        vy -= vy >> kDragShift;
+        vx -= vx >> drag_shift;
+        vy -= vy >> drag_shift;
         vx = clamp_i32(vx, -kVmaxRaw, kVmaxRaw);
         vy = clamp_i32(vy, -kVmaxRaw, kVmaxRaw);
 
@@ -712,8 +737,12 @@ uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
             raw_level > prev_level - 1 ? raw_level : prev_level - 1;
 
         // -- Sleep: quiet, cooled, supported, not mid-drain, hysteresis.
+        // With gravity off (flat) support is waived: a stray that braked
+        // to a stop rests on the glass wherever it is, instead of hanging
+        // awake mid-air forever.
         bool slept = false;
-        if (speed < kSleepSpeedRaw && level == 0 && supported && !leveled) {
+        if (speed < kSleepSpeedRaw && level == 0 &&
+            (supported || !grav_active) && !leveled) {
             if (prest_[i] < 255u) {
                 ++prest_[i];
             }
