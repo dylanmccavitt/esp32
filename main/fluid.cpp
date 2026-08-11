@@ -29,6 +29,18 @@ constexpr float kVelocityDamping = 0.995f;  // light bulk damping at the fixed 3
 // shakes for the finer 343-particle look.
 constexpr int kJacobiIterations = 1;
 
+// Single-iteration Jacobi overshoots: both ends of a pair correct against the
+// same frozen state, so full-strength deltas ring and occasionally pop a
+// particle out of a settled pile. Under-relaxing the applied correction damps
+// the ring; the warm start recovers the lost convergence across frames.
+constexpr float kDeltaRelax = 0.6f;
+
+// Rest calm: recovered speeds below this fraction of h/dt are zeroed so a
+// settled pile stops micro-oscillating (and stops shimmering on screen). A
+// free-falling particle gains g*dt ~ 0.2 units/s in one step, far above the
+// floor, so real motion never sleeps.
+constexpr float kSleepFrac = 0.018f;
+
 inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -332,6 +344,18 @@ bool Fluid::step(const Vec3& apparent_accel, float dt) {
     // rho_ from the final Jacobi iteration is retained for a cheap density
     // diagnostic. Avoiding an extra full neighbor pass keeps the 30 Hz budget.
     velocity_cap(vel_cap);
+
+    // Jitter floor: zero the residual micro-velocities of settled particles.
+    const float sleep_v = kSleepFrac * h_ * inv_dt;
+    const float sleep_v2 = sleep_v * sleep_v;
+    for (size_t i = 0; i < count_; ++i) {
+        const float v2 = vx_[i] * vx_[i] + vy_[i] * vy_[i] + vz_[i] * vz_[i];
+        if (v2 < sleep_v2) {
+            vx_[i] = 0.0f;
+            vy_[i] = 0.0f;
+            vz_[i] = 0.0f;
+        }
+    }
 
     float max_err = 0.0f;
     for (size_t i = 0; i < count_; ++i) {
@@ -660,8 +684,11 @@ void Fluid::compute_and_apply_deltas() {
     }
     stats_.candidate_checks += cand_total;
 
-    // Cap each delta, apply to positions, clamp all six walls.
+    // Under-relax, cap each delta, apply to positions, clamp all six walls.
     for (size_t i = 0; i < count_; ++i) {
+        dx_[i] *= kDeltaRelax;
+        dy_[i] *= kDeltaRelax;
+        dz_[i] *= kDeltaRelax;
         const float d2 = dx_[i] * dx_[i] + dy_[i] * dy_[i] + dz_[i] * dz_[i];
         if (d2 > cap2) {
             const float scale = delta_cap_ / std::sqrt(d2);
