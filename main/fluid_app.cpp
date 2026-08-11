@@ -38,14 +38,6 @@ constexpr float kDepthFxScale = 4096.0f;
 // Depth-as-opacity: brightness loses up to this many /255 at the back wall.
 constexpr uint32_t kDepthFadeMax = 130;
 
-// Sprite shading: Lambert light direction (screen x right, y down, z toward
-// the viewer), normalized. Upper-left-front, matching the old rim light.
-constexpr float kLightX = -0.45f;
-constexpr float kLightY = -0.45f;
-constexpr float kLightZ = 0.77f;
-// Brightness ramp: dark rim floor to full highlight.
-constexpr int kShadeFloor = 70;
-constexpr int kShadeSpan = 185;
 
 // Dim wireframe color for the 3D box edges (drawn before particles).
 constexpr uint16_t kEdgeColor = 0x1905;  // dark blue-gray RGB565
@@ -56,27 +48,19 @@ constexpr float kSpeedRef = 2.5f;
 inline int min_int(int a, int b) { return a < b ? a : b; }
 inline int max_int(int a, int b) { return a > b ? a : b; }
 
-// Speck cluster rendering: every solver grain draws kSpecksPerGrain sand
-// specks — its true center plus scattered copies at fixed offsets (signed
-// 1/64 units of the grain's spread radius). Offsets are picked per grain by
-// a fixed hash, so clusters are stable frame to frame and multiply the
-// apparent grain count without touching the solver.
-constexpr int kSpecksPerGrain = 9;
-struct SpeckOffset {
-    int8_t x;
-    int8_t y;
-};
-constexpr uint32_t kSpeckOffsetCount = 16;  // power of two for cheap masking
-constexpr SpeckOffset kSpeckOffsets[kSpeckOffsetCount] = {
-    {40, 10},   {-35, 25}, {5, -45},  {-20, -38},
-    {45, -20},  {-48, -5}, {15, 42},  {28, -40},
-    {-42, 30},  {50, 22},  {-8, 50},  {-30, -15},
-    {22, 18},   {-15, -50}, {36, 36}, {-50, -28},
-};
+// Sand speck rendering: every solver grain is a parcel of sand drawn as
+// kSpecksPerGrain flat one-pixel specks (2x2 blocks near the front — no
+// sphere shading, so nothing can read as a ball). Offsets and per-speck
+// brightness come from a 256-entry jitter table built once at setup; the
+// per-grain index stride makes every grain's scatter pattern unique across
+// the whole population, and the spread (~0.55 of the rest pitch) makes
+// neighboring parcels overlap into one continuous bed of sand.
+constexpr int kSpecksPerGrain = 16;
+constexpr uint32_t kSpeckTableSize = 256;  // power of two for cheap masking
 
 // Speck scatter radius as a multiple of the projected grain radius:
-// 0.35 of the rest pitch, with spacing = radius_world / 0.088 (sand build).
-constexpr float kSpeckSpreadPerRadius = 0.35f / 0.088f;
+// 0.55 of the rest pitch, with spacing = radius_world / 0.088 (sand build).
+constexpr float kSpeckSpreadPerRadius = 0.55f / 0.088f;
 
 }  // namespace
 
@@ -111,7 +95,7 @@ esp_err_t FluidBoxApp::setup_once()
 
     proj_ = proj;
     build_luts();
-    build_sprites();
+    build_specks();
     // setup_once() initializes Fluid before the lanes start. Publish the same
     // initialized epoch/stats immediately so launcher-era telemetry cannot
     // expose the atomics' zero defaults while Fluid already holds epoch 1.
@@ -379,67 +363,44 @@ esp_err_t FluidBoxApp::render_frame(const ParticleFrame &frame, DisplayFrame &df
 
 void FluidBoxApp::build_luts()
 {
-    // Velocity palette: slow = blue/cyan, fast = orange/red (hue 230 -> 0 deg),
-    // ramping saturation/value so slow particles are dim and fast ones glow.
+    // Sand palette: dim warm tan for resting grains ramping to bright
+    // sun-lit amber for fast ones (hue 38 -> 28 deg, modest saturation),
+    // so the medium reads as sand rather than colored balls.
     for (int i = 0; i < 256; i++) {
         const float u = static_cast<float>(i) / 255.0f;
-        const float hue = (1.0f - u) * 230.0f;
-        const float sat = 0.85f;
-        const float val = 0.55f + 0.45f * u;  // floor keeps slow grains visible on black
+        const float hue = 38.0f - 10.0f * u;
+        const float sat = 0.50f + 0.25f * u;
+        const float val = 0.62f + 0.38f * u;  // floor keeps resting sand visible
         palette_[i] = hsv_to_rgb565(hue, sat, val);
     }
 }
 
-void FluidBoxApp::build_sprites()
+void FluidBoxApp::build_specks()
 {
-    // One pre-shaded sphere per integer radius. Per pixel: sphere normal
-    // n = (dx/r, dy/r, sqrt(1 - t)) with t = (d/r)^2 (unit length by
-    // construction), Lambert against the fixed light, brightness ramped
-    // [kShadeFloor, kShadeFloor + kShadeSpan], premultiplied by a ~1 px
-    // antialiased rim coverage. 0 marks a fully transparent texel.
-    size_t at = 0;
-    sprite_off_[0] = 0;
-    for (int r = 1; r <= kMaxSpriteRadius; ++r) {
-        sprite_off_[r] = static_cast<uint16_t>(at);
-        const float rf = static_cast<float>(r);
-        for (int dy = -r; dy <= r; ++dy) {
-            for (int dx = -r; dx <= r; ++dx) {
-                const float d = std::sqrt(static_cast<float>(dx * dx + dy * dy));
-                float alpha = rf + 0.5f - d;
-                if (alpha <= 0.0f) {
-                    sprite_lut_[at++] = 0;
-                    continue;
-                }
-                if (alpha > 1.0f) {
-                    alpha = 1.0f;
-                }
-                float t = (static_cast<float>(dx * dx + dy * dy)) / (rf * rf);
-                if (t > 1.0f) {
-                    t = 1.0f;
-                }
-                const float nx = static_cast<float>(dx) / rf;
-                const float ny = static_cast<float>(dy) / rf;
-                const float nz = std::sqrt(1.0f - t);
-                float diffuse = nx * kLightX + ny * kLightY + nz * kLightZ;
-                if (diffuse < 0.0f) {
-                    diffuse = 0.0f;
-                }
-                const float shade =
-                    (static_cast<float>(kShadeFloor) + static_cast<float>(kShadeSpan) * diffuse) *
-                    alpha;
-                uint32_t value = static_cast<uint32_t>(shade + 0.5f);
-                if (value > 255u) {
-                    value = 255u;
-                }
-                if (value == 0u) {
-                    value = 1u;  // keep covered texels distinct from transparent
-                }
-                sprite_lut_[at++] = static_cast<uint8_t>(value);
+    // Deterministic LCG fills the jitter table once at setup: offsets are
+    // rejection-sampled to the unit disc (1/128 fixed point) so parcels stay
+    // round, and the brightness jitter gives the bed its granular sparkle.
+    uint32_t state = 0x2545F491u;
+    const auto next = [&state]() {
+        state = state * 1664525u + 1013904223u;
+        return state;
+    };
+    for (uint32_t i = 0; i < kSpeckTableSize; ++i) {
+        int ox = 0;
+        int oy = 0;
+        for (;;) {
+            ox = static_cast<int>(next() >> 24) - 128;  // -128..127
+            oy = static_cast<int>(next() >> 24) - 128;
+            if (ox * ox + oy * oy <= 127 * 127) {
+                break;
             }
         }
+        speck_lut_[i].x = static_cast<int8_t>(ox == -128 ? -127 : ox);
+        speck_lut_[i].y = static_cast<int8_t>(oy == -128 ? -127 : oy);
+        speck_lut_[i].bright = static_cast<uint8_t>(150u + (next() % 106u));
     }
-    ESP_LOGI(kTag, "sprite LUT built: radii 1..%d, %u bytes",
-             kMaxSpriteRadius, static_cast<unsigned>(at));
+    ESP_LOGI(kTag, "speck jitter table built: %u entries, %d specks/grain",
+             static_cast<unsigned>(kSpeckTableSize), kSpecksPerGrain);
 }
 
 uint16_t FluidBoxApp::hsv_to_rgb565(float h, float s, float v)
@@ -514,12 +475,14 @@ void FluidBoxApp::preproject(const ParticleFrame &frame, int count)
             (sp >= kSpeedRef) ? 255u
                               : static_cast<uint8_t>((sp / kSpeedRef) * 255.0f);
 
+        // Grain radius only sizes the speck blocks: 2x2 px near the front
+        // (rad >= 2), a single pixel deeper in.
         int rad = static_cast<int>(std::lrintf(fr));
         if (rad < 1) {
             rad = 1;
         }
-        if (rad > kMaxSpriteRadius) {
-            rad = kMaxSpriteRadius;
+        if (rad > 3) {
+            rad = 3;
         }
         int spread = static_cast<int>(std::lrintf(fr * kSpeckSpreadPerRadius));
         if (spread > 255) {
@@ -646,56 +609,39 @@ void FluidBoxApp::draw_particles(uint16_t *buf, int y0, int rows)
     for (int n = 0; n < active_count_; ++n) {
         const uint16_t gi = draw_order_[n];
         const Projected &p = proj_[gi];
-        const int r = static_cast<int>(p.radius);
-        const int side = 2 * r + 1;
-        const uint8_t *sprite = sprite_lut_ + sprite_off_[r];
         const uint16_t pal = palette_[p.speed_idx];
         const uint32_t pr = (pal >> 11) & 0x1Fu;
         const uint32_t pg = (pal >> 5) & 0x3Fu;
         const uint32_t pb = pal & 0x1Fu;
         const uint32_t fade = p.fade;
         const int spread = static_cast<int>(p.spread_px);
+        const int block = (p.radius >= 2) ? 2 : 1;
 
-        // The cluster rides its parent rigidly, which is invisible at
-        // one-to-two-pixel grain scale; speck 0 is the true center.
+        // The index stride (odd constants mod the power-of-two table) gives
+        // every grain in the population a distinct scatter pattern.
         for (int k = 0; k < kSpecksPerGrain; ++k) {
-            int cx = p.x;
-            int cy = p.y;
-            if (k != 0) {
-                const SpeckOffset &off = kSpeckOffsets[
-                    (static_cast<uint32_t>(gi) * 7u + static_cast<uint32_t>(k) * 5u) &
-                    (kSpeckOffsetCount - 1)];
-                cx += (static_cast<int>(off.x) * spread) >> 6;
-                cy += (static_cast<int>(off.y) * spread) >> 6;
-            }
-            const int top = cy - r;
-            const int bottom = cy + r;
-            if (bottom < y0 || top >= y1) {
+            const Speck &s = speck_lut_[
+                (static_cast<uint32_t>(gi) * 61u + static_cast<uint32_t>(k) * 97u) &
+                (kSpeckTableSize - 1)];
+            const int cx = p.x + ((static_cast<int>(s.x) * spread) >> 7);
+            const int cy = p.y + ((static_cast<int>(s.y) * spread) >> 7);
+            const int ry0 = max_int(cy, y0);
+            const int ry1 = min_int(cy + block - 1, y1 - 1);
+            const int rx0 = max_int(cx, 0);
+            const int rx1 = min_int(cx + block - 1, kWidth - 1);
+            if (ry0 > ry1 || rx0 > rx1) {
                 continue;
             }
-            const int row_a = max_int(top, y0);
-            const int row_b = min_int(bottom, y1 - 1);
-            const int x_a = max_int(cx - r, 0);
-            const int x_b = min_int(cx + r, kWidth - 1);
-            if (x_a > x_b) {
-                continue;
-            }
-
-            for (int y = row_a; y <= row_b; ++y) {
-                const uint8_t *srow =
-                    sprite + static_cast<size_t>(y - top) * side + (x_a - (cx - r));
-                uint16_t *out = buf + static_cast<size_t>(y - y0) * kWidth + x_a;
-                for (int x = x_a; x <= x_b; ++x, ++srow, ++out) {
-                    const uint32_t shade = *srow;
-                    if (shade == 0u) {
-                        continue;
-                    }
-                    const uint32_t bright = (shade * fade) >> 8;
-                    const uint32_t r5 = (pr * bright) >> 8;
-                    const uint32_t g6 = (pg * bright) >> 8;
-                    const uint32_t b5 = (pb * bright) >> 8;
-                    *out = __builtin_bswap16(
-                        static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5));
+            const uint32_t bright = (fade * s.bright) >> 8;
+            const uint32_t r5 = (pr * bright) >> 8;
+            const uint32_t g6 = (pg * bright) >> 8;
+            const uint32_t b5 = (pb * bright) >> 8;
+            const uint16_t px = __builtin_bswap16(
+                static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5));
+            for (int y = ry0; y <= ry1; ++y) {
+                uint16_t *out = buf + static_cast<size_t>(y - y0) * kWidth;
+                for (int x = rx0; x <= rx1; ++x) {
+                    out[x] = px;
                 }
             }
         }

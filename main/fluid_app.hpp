@@ -83,7 +83,7 @@ private:
     struct Projected {
         int16_t x;          ///< Screen center x (px).
         int16_t y;          ///< Screen center y (px).
-        uint16_t radius;    ///< Sprite radius (px), in [1, kMaxSpriteRadius].
+        uint16_t radius;    ///< Projected grain radius (px), sizes speck blocks.
         uint8_t speed_idx;  ///< Palette index for the velocity color.
         uint8_t active;     ///< 0 = particle skipped (non-finite/out of range).
         uint8_t spread_px;  ///< Speck cluster scatter radius (px).
@@ -99,7 +99,7 @@ private:
     };
 
     void build_luts();
-    void build_sprites();
+    void build_specks();
     void preproject(const ParticleFrame &frame, int count);
     void sort_back_to_front();
     void project_box_edges();
@@ -146,14 +146,15 @@ private:
     // Velocity palette built at setup.
     uint16_t palette_[256] = {};
 
-    /// Pre-shaded sphere sprites, one per integer radius r in [1,
-    /// kMaxSpriteRadius]: (2r+1)^2 premultiplied brightness bytes (Lambert
-    /// shading from the upper-left with a ~1 px antialiased rim; 0 = fully
-    /// transparent). Painter's order needs no blending or depth buffer.
-    static constexpr int kMaxSpriteRadius = 14;
-    static constexpr size_t kSpriteLutBytes = 4494;  // sum of (2r+1)^2, r = 1..14
-    uint8_t sprite_lut_[kSpriteLutBytes] = {};
-    uint16_t sprite_off_[kMaxSpriteRadius + 1] = {};
+    /// Sand speck jitter table: fixed disc offsets (1/128 of the parcel
+    /// spread) plus per-speck brightness, built once at setup. Painter's
+    /// order over parents needs no blending or depth buffer.
+    struct Speck {
+        int8_t x;
+        int8_t y;
+        uint8_t bright;  ///< 150..255 granular sparkle multiplier.
+    };
+    Speck speck_lut_[256] = {};
 
     /// Indices of active particles sorted far-to-near for painter's rendering.
     uint16_t draw_order_[kMaxParticles] = {};
