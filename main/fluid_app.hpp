@@ -127,7 +127,8 @@ private:
     uint32_t frame_parity_ = 0;   ///< alternates sweep direction per frame
     uint32_t awake_count_ = 0;    ///< particles not ASLEEP after last step
     uint32_t rest_gate_frames_ = 0;
-    bool grav_on_ = false;        ///< in-plane gravity hysteresis latch
+    float dir_gx_ = 0.0f;         ///< remembered gravity direction (unit);
+    float dir_gy_ = 1.0f;         ///< down always exists, boot = screen-down
     float prev_gx_ = 0.0f;        ///< wake-reference in-plane accel anchor
     float prev_gy_ = 0.0f;
 
