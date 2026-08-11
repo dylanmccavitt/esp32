@@ -536,15 +536,32 @@ uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
                             rx = 0;
                         }
                     } else {
-                        if (abs_int(vx) >= kKickTriggerRaw) {
+                        // Pass-through blocking, not reflection: co-falling
+                        // neighbors must not ricochet off each other. The
+                        // follower keeps its direction (damped) and resumes
+                        // the moment the cell clears, so a cloud rains at
+                        // one rate. Kicks only fire into supported (bedded)
+                        // targets - a mid-air hit must not shove another
+                        // faller against the rain.
+                        const int sdx = ncx + gox;
+                        const int sdy = cy + goy;
+                        const bool bedded =
+                            sdx < 1 || sdx > kGridW - 2 || sdy < 1 ||
+                            sdy > kGridH - 2 ||
+                            g[static_cast<size_t>(sdy) * kGridW + sdx] != 0u;
+                        if (bedded && abs_int(vx) >= kKickTriggerRaw) {
                             uint8_t &tc =
                                 g[static_cast<size_t>(cy) * kGridW + ncx];
                             if ((tc >> 6) < 2u) {
                                 tc = static_cast<uint8_t>(tc + 0x40u);
                             }
                         }
-                        vx = -(vx >> 1);
-                        rx = -(rx >> 1);
+                        // Damped keep-sign block; the retry happens next
+                        // frame (rem zeroed), never as an in-frame storm.
+                        // Pressing into the bed sheds energy fast (>>2) so
+                        // pressed grains still level and settle.
+                        vx = vx >> (bedded ? 2 : 1);
+                        rx = 0;
                         vy = (vy * kPpTangNum) >> 8;
                     }
                     // Flush against the boundary of the current cell.
@@ -577,15 +594,21 @@ uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
                             ry = 0;
                         }
                     } else {
-                        if (abs_int(vy) >= kKickTriggerRaw) {
+                        const int sdx = ncx + gox;
+                        const int sdy = ncy + goy;
+                        const bool bedded =
+                            sdx < 1 || sdx > kGridW - 2 || sdy < 1 ||
+                            sdy > kGridH - 2 ||
+                            g[static_cast<size_t>(sdy) * kGridW + sdx] != 0u;
+                        if (bedded && abs_int(vy) >= kKickTriggerRaw) {
                             uint8_t &tc =
                                 g[static_cast<size_t>(ncy) * kGridW + ncx];
                             if ((tc >> 6) < 2u) {
                                 tc = static_cast<uint8_t>(tc + 0x40u);
                             }
                         }
-                        vy = -(vy >> 1);
-                        ry = -(ry >> 1);
+                        vy = vy >> (bedded ? 2 : 1);
+                        ry = 0;
                         vx = (vx * kPpTangNum) >> 8;
                     }
                     npy = (sy > 0) ? ((cy << 8) | 0xFF) : (cy << 8);
