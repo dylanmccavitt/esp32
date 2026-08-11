@@ -72,6 +72,14 @@ private:
     static constexpr int kPileRows = 60;  ///< reset pile depth (rows of sand)
     static constexpr int kShadeCount = 6; ///< per-grain fixed sand shades
 
+    // Cell byte layout: bits 0-2 shade (1..kShadeCount, 0 = empty cell),
+    // bits 3-5 movement heat (0..kHeatMax). A move writes full heat; the
+    // raster decays it one level per frame, driving the reactive palette.
+    static constexpr int kShadeBits = 3;
+    static constexpr uint8_t kShadeMask = 0x07;
+    static constexpr int kHeatMax = 7;
+    static constexpr uint8_t kHeatBits = kHeatMax << kShadeBits;
+
     void reset_grid();
     /// One automaton substep toward screen-space gravity (sgx right,
     /// sgy down). Returns the number of grains that moved.
@@ -99,16 +107,18 @@ private:
     std::atomic<uint64_t> moved_cells_{0};
     std::atomic<uint32_t> physics_us_{0};
 
-    /// Cell grid, kGridW * kGridH bytes: 0 = empty, 1..kShadeCount = grain
-    /// carrying its fixed shade index. Allocated once from internal heap.
+    /// Cell grid, kGridW * kGridH bytes: 0 = empty, otherwise a grain
+    /// carrying its fixed shade index plus movement heat (see the cell
+    /// byte layout above). Allocated once from internal heap.
     uint8_t *grid_ = nullptr;
 
     uint32_t rng_ = 0x2545F491u;      ///< xorshift32 state (render lane only)
     uint32_t grain_count_ = 0;        ///< population laid down by reset_grid()
     uint32_t frame_parity_ = 0;       ///< alternates scan direction per frame
 
-    /// Wire-order (pre-swapped) RGB565 shade table; index 0 unused.
-    uint16_t shade_wire_[kShadeCount + 1] = {};
+    /// Wire-order (pre-swapped) RGB565 palette indexed by the full cell
+    /// byte (heat << kShadeBits | shade); shade-0 slots unused.
+    uint16_t shade_wire_[(kHeatMax + 1) << kShadeBits] = {};
 
     // Render-lane-only telemetry for the last frame.
     uint32_t frame_us_ = 0;

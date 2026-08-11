@@ -16,27 +16,44 @@ constexpr const char *kTag = "fluid_demo";
 
 // In-plane gravity below this magnitude (sim units; |g| = 9 when tilted
 // fully on edge) leaves the sand at rest — the device is lying flat.
-constexpr float kRestGate = 1.2f;
+constexpr float kRestGate = 0.9f;
 
-// Substep thresholds: steeper tilt runs more automaton substeps per frame,
-// so sand falls visibly faster the harder you tilt.
-constexpr float kFastTilt = 4.5f;
-constexpr float kFullTilt = 7.5f;
+// Substep scaling: substeps = 1 + |g| * kSubstepGain, capped, and cut off
+// early once the loop has spent kStepBudgetUs — a full-bed avalanche costs
+// far more per substep than a surface trickle, and without the budget the
+// frame time balloons and the motion reads slower, not faster. Free-fall
+// hop chains (below) carry the rest of the speed at per-grain cost only.
+constexpr float kSubstepGain = 0.62f;
+constexpr int kMaxSubsteps = 6;
+constexpr int64_t kStepBudgetUs = 15000;
+
+// Airborne grains chain up to this many extra fall cells per substep, each
+// with probability 1/2 — grains in the same cloud fall 1 to 4 cells, so a
+// detached sheet shears apart instead of dropping as one slab.
+constexpr int kMaxExtraHops = 3;
 
 // Dim border ring marking the box walls (logical RGB565, swapped at setup).
 constexpr uint16_t kWallColor = 0x31A6;  // dark warm gray
 
-// Fixed per-grain sand shades, dark to light (logical RGB565). A grain
-// keeps its shade for life, which gives the bed its static granular
-// texture; motion reads from displacement alone.
-constexpr uint16_t kSandShades[6] = {
-    0x8B47,  // #8a6b3e deep tan
-    0xA3E9,  // #a37c48
-    0xBC6A,  // #b98f55
-    0xCD2D,  // #cfa668
-    0xE5CF,  // #e0b878
-    0xF671,  // #f0cd8e pale gold
+// Fixed per-grain sand shades, dark to light, as 8-bit RGB. A grain keeps
+// its shade for life; movement heat blends it toward kGlowRgb.
+constexpr uint8_t kSandRgb[6][3] = {
+    {0x8a, 0x6b, 0x3e},  // deep tan
+    {0xa3, 0x7c, 0x48},
+    {0xb9, 0x8f, 0x55},
+    {0xcf, 0xa6, 0x68},
+    {0xe0, 0xb8, 0x78},
+    {0xf0, 0xcd, 0x8e},  // pale gold
 };
+
+// Hot ember orange a moving grain flares toward — the sand answer to the
+// metaball build's fast-end velocity palette.
+constexpr uint8_t kGlowRgb[3] = {0xff, 0x7a, 0x1a};
+
+inline uint16_t pack565(int r, int g, int b)
+{
+    return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
 
 inline int min_int(int a, int b) { return a < b ? a : b; }
 
@@ -77,10 +94,23 @@ esp_err_t FluidBoxApp::setup_once()
     }
     grid_ = grid;
 
-    for (int i = 0; i < kShadeCount; ++i) {
-        shade_wire_[i + 1] = __builtin_bswap16(kSandShades[i]);
+    // Reactive palette, indexed by the full cell byte (heat << 3 | shade).
+    // Heat 0 is the grain's fixed sand shade; each heat level blends it
+    // toward ember glow with an ease-out so a fresh mover pops and the
+    // cool-down reads smooth.
+    for (int h = 0; h <= kHeatMax; ++h) {
+        const float u = static_cast<float>(h) / kHeatMax;
+        const float e = u * (2.0f - u);
+        for (int s = 0; s < kShadeCount; ++s) {
+            const int r = kSandRgb[s][0] +
+                          static_cast<int>(e * (kGlowRgb[0] - kSandRgb[s][0]));
+            const int gc = kSandRgb[s][1] +
+                           static_cast<int>(e * (kGlowRgb[1] - kSandRgb[s][1]));
+            const int b = kSandRgb[s][2] +
+                          static_cast<int>(e * (kGlowRgb[2] - kSandRgb[s][2]));
+            shade_wire_[(h << 3) | (s + 1)] = __builtin_bswap16(pack565(r, gc, b));
+        }
     }
-    shade_wire_[0] = 0;
 
     reset_grid();
     setup_done_ = true;
@@ -237,16 +267,49 @@ uint32_t FluidBoxApp::step_sand(float sgx, float sgy)
                 if (c == 0u) {
                     continue;
                 }
-                const int dxp = ((rnd() & 255u) < p_lat) ? lat : 0;
-                if (try_move(x, y, x + dxp, y + dy, c)) {
+                const uint8_t mc =
+                    static_cast<uint8_t>((c & kShadeMask) | kHeatBits);
+                // With axis-pure gravity neither lateral is preferred;
+                // per-grain random choice stops lockstep surface creep.
+                const uint32_t r0 = rnd();
+                const int lat_g =
+                    (p_lat != 0u) ? lat : (((r0 & 256u) != 0u) ? 1 : -1);
+                const int dxp = ((r0 & 255u) < p_lat) ? lat_g : 0;
+                if (try_move(x, y, x + dxp, y + dy, mc)) {
+                    // Free-fall hop chain: geometric extra fall distance
+                    // with occasional sideways shear (all target rows are
+                    // already scanned, so no grain is processed twice).
+                    int nx = x + dxp;
+                    int ny = y + dy;
+                    for (int hop = 0; hop < kMaxExtraHops; ++hop) {
+                        const uint32_t r = rnd();
+                        if ((r & 1u) == 0u) {
+                            break;
+                        }
+                        const int jx =
+                            ((r & 14u) == 0u) ? (((r & 16u) != 0u) ? 1 : -1) : 0;
+                        if (try_move(nx, ny, nx + jx, ny + dy, mc)) {
+                            nx += jx;
+                            ny += dy;
+                        } else if (jx != 0 && try_move(nx, ny, nx, ny + dy, mc)) {
+                            ny += dy;
+                        } else {
+                            break;
+                        }
+                    }
                     continue;
                 }
                 // Topple: the two remaining forward diagonals, biased order.
-                const int first = (dxp == 0) ? lat : -dxp;
-                if (try_move(x, y, x + first, y + dy, c)) {
+                // The fallback diagonal only fires half the time — always
+                // taking it makes slope faces creep in lockstep and grow
+                // regular filament combs under sustained tilt.
+                const int first = (dxp == 0) ? lat_g : -dxp;
+                if (try_move(x, y, x + first, y + dy, mc)) {
                     continue;
                 }
-                static_cast<void>(try_move(x, y, x - first, y + dy, c));
+                if ((r0 & 512u) != 0u) {
+                    static_cast<void>(try_move(x, y, x - first, y + dy, mc));
+                }
             }
         }
     } else {
@@ -268,15 +331,40 @@ uint32_t FluidBoxApp::step_sand(float sgx, float sgy)
                 if (c == 0u) {
                     continue;
                 }
-                const int dyp = ((rnd() & 255u) < p_lat) ? lat : 0;
-                if (try_move(x, y, x + dx, y + dyp, c)) {
+                const uint8_t mc =
+                    static_cast<uint8_t>((c & kShadeMask) | kHeatBits);
+                const uint32_t r0 = rnd();
+                const int lat_g =
+                    (p_lat != 0u) ? lat : (((r0 & 256u) != 0u) ? 1 : -1);
+                const int dyp = ((r0 & 255u) < p_lat) ? lat_g : 0;
+                if (try_move(x, y, x + dx, y + dyp, mc)) {
+                    int nx = x + dx;
+                    int ny = y + dyp;
+                    for (int hop = 0; hop < kMaxExtraHops; ++hop) {
+                        const uint32_t r = rnd();
+                        if ((r & 1u) == 0u) {
+                            break;
+                        }
+                        const int jy =
+                            ((r & 14u) == 0u) ? (((r & 16u) != 0u) ? 1 : -1) : 0;
+                        if (try_move(nx, ny, nx + dx, ny + jy, mc)) {
+                            nx += dx;
+                            ny += jy;
+                        } else if (jy != 0 && try_move(nx, ny, nx + dx, ny, mc)) {
+                            nx += dx;
+                        } else {
+                            break;
+                        }
+                    }
                     continue;
                 }
-                const int first = (dyp == 0) ? lat : -dyp;
-                if (try_move(x, y, x + dx, y + first, c)) {
+                const int first = (dyp == 0) ? lat_g : -dyp;
+                if (try_move(x, y, x + dx, y + first, mc)) {
                     continue;
                 }
-                static_cast<void>(try_move(x, y, x + dx, y - first, c));
+                if ((r0 & 512u) != 0u) {
+                    static_cast<void>(try_move(x, y, x + dx, y - first, mc));
+                }
             }
         }
     }
@@ -302,11 +390,16 @@ void FluidBoxApp::draw_sand(uint16_t *buf, int y0, int rows)
         }
         out[0] = wall;
         out[kGridW - 1] = wall;
-        const uint8_t *row = grid_ + static_cast<size_t>(y) * kGridW;
+        uint8_t *row = grid_ + static_cast<size_t>(y) * kGridW;
         for (int x = 1; x < kGridW - 1; ++x) {
             const uint8_t c = row[x];
             if (c != 0u) {
                 out[x] = shade_wire_[c];
+                // Cool one heat level per frame: a mover flares for
+                // kHeatMax frames (~1/4 s) then rests at its base shade.
+                if ((c & kHeatBits) != 0u) {
+                    row[x] = static_cast<uint8_t>(c - (1u << kShadeBits));
+                }
             }
         }
     }
@@ -343,11 +436,14 @@ bool FluidBoxApp::render(DisplayFrame &frame)
     const float m2 = sgx * sgx + sgy * sgy;
     if (m2 >= kRestGate * kRestGate) {
         const float m = std::sqrt(m2);
-        const int substeps = 1 + (m > kFastTilt ? 1 : 0) + (m > kFullTilt ? 1 : 0);
+        const int target =
+            min_int(1 + static_cast<int>(m * kSubstepGain), kMaxSubsteps);
         uint32_t moved = 0;
-        for (int s = 0; s < substeps; ++s) {
+        int s = 0;
+        do {
             moved += step_sand(sgx, sgy);
-        }
+            ++s;
+        } while (s < target && esp_timer_get_time() - t_step < kStepBudgetUs);
         moved_cells_.fetch_add(moved, std::memory_order_relaxed);
     }
     physics_us_.store(static_cast<uint32_t>(esp_timer_get_time() - t_step),
