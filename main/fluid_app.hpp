@@ -8,163 +8,113 @@
 #include "freertos/FreeRTOS.h"
 
 #include "app_shell.hpp"
-#include "fluid.hpp"
 #include "motion.hpp"
-#include "snapshot_exchange.hpp"
 
 namespace fluid_demo {
 
-/// Fluid Box app: owns the Fluid simulation (non-movable, in-place value), the
-/// MotionFilter, the SnapshotExchange, the reset atomic, the app motion mux,
-/// the telemetry atomics, and the whole Fluid raster half (Projected/Edge,
-/// surface maps, LUTs, edges, raster caller) that renderer.cpp used to own.
+/// Fluid Box app, sand edition: a tilt-driven falling-sand cellular
+/// automaton at native panel resolution. One grain occupies one screen
+/// pixel cell; ~14,000 independent grains fall and topple toward the
+/// current in-plane gravity direction, giving dense piles, real angles
+/// of repose and grain-by-grain avalanches with no rendering tricks.
 ///
-/// All heavy state lives inside this one namespace-scope object (s_fluid_app),
-/// never on a task stack. The sensor lane calls on_motion(), the physics lane
-/// update(), the render lane render(); the app allocates nothing between
-/// setup_once() and the end of the process.
+/// Threading: the sensor lane feeds on_motion() through the MotionFilter
+/// exactly as before. The automaton itself is single-threaded — it steps
+/// and rasterizes inside render() on the render lane, so the grid needs
+/// no cross-core snapshotting; update() (physics lane) is a no-op. All
+/// heavy state lives inside this one namespace-scope object.
 class FluidBoxApp final : public App {
 public:
-    /// Startup count, set by measured worst-case hardware budget: with the
-    /// contact kernel (h = 1.35 * spacing), vigorous shaking compresses the
-    /// pile and roughly doubles step cost versus rest (400 grains: ~20 ms
-    /// rest but ~45 ms shaken = visible slow-motion chop; 768: ~49 ms even
-    /// at rest). 256 grains keep the hardest shake under the 33.3 ms step.
-    /// Apparent grain count is multiplied by the renderer's speck clusters
-    /// (kSpecksPerGrain in fluid_app.cpp). The namespace-level
-    /// kInitialParticles (app_types.hpp) is the geometry baseline; a
-    /// different startup count rescales spacing, not the occupied volume.
-    static constexpr uint16_t kInitialParticles = 256;
-    static_assert(kInitialParticles >= kMinParticles &&
-                      kInitialParticles <= kMaxParticles,
-                  "startup count must stay within Fluid's supported range");
-
     FluidBoxApp() = default;
     ~FluidBoxApp() override;
     FluidBoxApp(const FluidBoxApp &) = delete;
     FluidBoxApp &operator=(const FluidBoxApp &) = delete;
 
-    /// Transactional one-time setup: fluid lattice + raster buffers + LUTs.
-    /// Rollback + ESP_ERR_NO_MEM on any allocation failure; idempotent.
+    /// One-time setup: allocate the cell grid, build the wire-order shade
+    /// table, lay down the deterministic starting pile. Rollback +
+    /// ESP_ERR_NO_MEM on allocation failure; idempotent.
     esp_err_t setup_once() override;
 
-    /// Post-barrier entry: drains stale snapshots, frame_seen_ = false, does
-    /// NOT clear a pending reset (honored by the first post-enter update()).
+    /// Post-barrier entry; no allocation. A pending reset set while
+    /// inactive stays set and is consumed by the first render() step.
     esp_err_t enter() override;
 
     /// Sensor lane: filter (or override bypass) + publish under the app mux.
-    /// Returns true iff the fresh physical sample was accepted by the filter.
     bool on_motion(const MotionTick &tick) override;
 
-    /// PlusPress sets the app's reset atomic; no event needs a shell action.
+    /// PlusPress sets the reset atomic; no event needs a shell action.
     ShellAction handle_event(AppEvent) override;
 
-    /// Physics lane at fixed dt: consume pending reset exactly once, step the
-    /// simulation, publish a frame.
+    /// Physics lane: no-op — the automaton steps in render() so the grid
+    /// never crosses cores.
     esp_err_t update(float dt = kPhysicsDt) override;
 
-    /// Render lane: acquire internally, raster + stream via DisplayFrame ops.
-    /// Returns true iff a frame was rendered to completion.
+    /// Render lane: consume a pending reset, step the automaton toward the
+    /// current gravity, rasterize the grid through DisplayFrame ops.
     bool render(DisplayFrame &frame) override;
 
-    /// Telemetry: atomics written by update/render lanes. Non-const because it
-    /// samples the motion state under the app's portMUX critical section.
+    /// Telemetry: count = grain population, candidate_checks = cumulative
+    /// grain moves, physics_us = last automaton step time.
     AppStats stats() override;
 
     /// No-allocation leave: quiesce motion validity.
     void leave() override;
 
-    /// Console/PLUS reset path: sets the app's reset atomic. Consumed by the
-    /// first post-enter update() via exchange(false) exactly once.
+    /// Console/PLUS reset path: rebuild the starting pile (render lane
+    /// consumes the atomic exactly once).
     void request_fluid_reset();
 
 private:
-    // ---- Fluid raster half: depth-sorted pre-shaded sphere sprites ----
-    struct Projected {
-        int16_t x;          ///< Screen center x (px).
-        int16_t y;          ///< Screen center y (px).
-        uint16_t radius;    ///< Projected grain radius (px), sizes speck blocks.
-        uint8_t speed_idx;  ///< Palette index for the velocity color.
-        uint8_t active;     ///< 0 = particle skipped (non-finite/out of range).
-        uint8_t spread_px;  ///< Speck cluster scatter radius (px).
-        uint32_t z_fx;      ///< Center depth, fixed point, 1/4096 world unit (sort key).
-        uint32_t fade;      ///< Depth brightness scale, 0..255 (far = dim).
-    };
+    // ---- automaton geometry ----
+    static constexpr int kGridW = 240;
+    static constexpr int kGridH = 240;
+    static constexpr int kMargin = 1;     ///< solid one-cell border walls
+    static constexpr int kPileRows = 60;  ///< reset pile depth (rows of sand)
+    static constexpr int kShadeCount = 6; ///< per-grain fixed sand shades
 
-    struct Edge {
-        int x0;
-        int y0;
-        int x1;
-        int y1;
-    };
+    void reset_grid();
+    /// One automaton substep toward screen-space gravity (sgx right,
+    /// sgy down). Returns the number of grains that moved.
+    uint32_t step_sand(float sgx, float sgy);
+    void draw_sand(uint16_t *buf, int y0, int rows);
+    inline uint32_t rnd();
 
-    void build_luts();
-    void build_specks();
-    void preproject(const ParticleFrame &frame, int count);
-    void sort_back_to_front();
-    void project_box_edges();
-    void draw_box_edges(uint16_t *buf, int y0, int rows);
-    void draw_particles(uint16_t *buf, int y0, int rows);
-    void free_buffers();
-    esp_err_t render_frame(const ParticleFrame &frame, DisplayFrame &df);
-
-    static uint16_t hsv_to_rgb565(float h, float s, float v);
-
-    // ---- app-owned simulation/motion state (absorbed from app_main) ----
-    Fluid fluid_;                // non-movable; in-place value, never moved
     MotionFilter filter_;
-    SnapshotExchange snapshots_;
 
-    /// Motion state published by the sensor lane to the update lane under a
-    /// short critical section (same portMUX pattern as legacy app_main).
+    /// Motion state published by the sensor lane to the render lane under a
+    /// short critical section (same portMUX pattern as the fluid build).
     struct SharedMotion {
-        Vec3 apparent_accel{0.0f, 0.0f, 6.0f};  // rest-gravity placeholder
+        Vec3 apparent_accel{0.0f, 0.0f, 9.0f};  // rest-gravity placeholder
         Vec3 raw_accel{0.0f, 0.0f, 0.0f};
         bool valid{false};
     };
     portMUX_TYPE motion_mux_ = portMUX_INITIALIZER_UNLOCKED;
     SharedMotion motion_;
 
-    /// Reset request: any task sets, the update lane consumes once.
+    /// Reset request: any task sets, the render lane consumes once.
     std::atomic<bool> reset_requested_{false};
 
-    // Fluid telemetry copied by the update lane into atomics (the render lane
-    // reads them for telemetry; reading FluidStats directly would race).
+    // Telemetry atomics (stats() may be called from another lane).
     std::atomic<uint32_t> epoch_{0};
-    std::atomic<uint64_t> candidate_checks_{0};
-    std::atomic<uint32_t> nonfinite_resets_{0};
+    std::atomic<uint64_t> moved_cells_{0};
     std::atomic<uint32_t> physics_us_{0};
 
-    // ---- raster state ----
-    Projected *proj_ = nullptr;
-    int active_count_ = 0;
+    /// Cell grid, kGridW * kGridH bytes: 0 = empty, 1..kShadeCount = grain
+    /// carrying its fixed shade index. Allocated once from internal heap.
+    uint8_t *grid_ = nullptr;
 
-    // Render-task-only telemetry for the last frame.
+    uint32_t rng_ = 0x2545F491u;      ///< xorshift32 state (render lane only)
+    uint32_t grain_count_ = 0;        ///< population laid down by reset_grid()
+    uint32_t frame_parity_ = 0;       ///< alternates scan direction per frame
+
+    /// Wire-order (pre-swapped) RGB565 shade table; index 0 unused.
+    uint16_t shade_wire_[kShadeCount + 1] = {};
+
+    // Render-lane-only telemetry for the last frame.
     uint32_t frame_us_ = 0;
     uint32_t raster_us_ = 0;
 
-    // Velocity palette built at setup.
-    uint16_t palette_[256] = {};
-
-    /// Sand speck jitter table: fixed disc offsets (1/128 of the parcel
-    /// spread) plus per-speck brightness, built once at setup. Painter's
-    /// order over parents needs no blending or depth buffer.
-    struct Speck {
-        int8_t x;
-        int8_t y;
-        uint8_t bright;  ///< 150..255 granular sparkle multiplier.
-    };
-    Speck speck_lut_[256] = {};
-
-    /// Indices of active particles sorted far-to-near for painter's rendering.
-    uint16_t draw_order_[kMaxParticles] = {};
-
-    Edge edges_[12] = {};
-
-    // Update-lane-only producer sequence; sensor-lane/other plain state.
-    uint32_t sequence_ = 0;
     bool setup_done_ = false;
-    bool frame_seen_ = false;  // first-frame gate, opened by enter()
 };
 
 /// One namespace-scope instance of the registered Fluid Box app (defined in
