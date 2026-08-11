@@ -27,7 +27,8 @@ struct FluidStats {
 // calibrated against that lattice (self term plus simple-cubic neighbor shells,
 // unit mass, exact 3D Poly6), so a perfect rest lattice has exactly C = 0.
 //
-// PBF solve: 2 Jacobi iterations at the caller's fixed dt; a 3D counting grid
+// PBF solve: kJacobiIterations warm-started Jacobi iterations (currently one;
+// see fluid.cpp) at the caller's fixed dt; a 3D counting grid
 // (cell size h) is rebuilt from the current predicted positions at the start of
 // each iteration. Unordered pairs are gathered by a 14-cell half-stencil
 // traversal (own cell with j > i plus the 13 lexicographically forward cells,

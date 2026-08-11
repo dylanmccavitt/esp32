@@ -25,12 +25,13 @@ namespace fluid_demo {
 /// setup_once() and the end of the process.
 class FluidBoxApp final : public App {
 public:
-    /// Startup count, capped by the measured physics budget: on hardware the
-    /// PBF step costs ~150 us per particle (32-33 ms at 216, 51-56 ms at 343
-    /// against the 33.3 ms step), so 216 is the 30 Hz ceiling. The namespace-
-    /// level kInitialParticles (app_types.hpp) is the geometry baseline; a
-    /// different startup count rescales spacing, not the occupied volume.
-    static constexpr uint16_t kInitialParticles = 216;
+    /// Startup count, capped by the measured physics budget: with the
+    /// half-stencil solver at one Jacobi iteration, 343 (7^3) measures
+    /// 23-27 ms/step on hardware under active shake — inside the 33.3 ms
+    /// budget with margin. The namespace-level kInitialParticles
+    /// (app_types.hpp) is the geometry baseline; a different startup count
+    /// rescales spacing, not the occupied volume.
+    static constexpr uint16_t kInitialParticles = 343;
     static_assert(kInitialParticles >= kMinParticles &&
                       kInitialParticles <= kMaxParticles,
                   "startup count must stay within Fluid's supported range");

@@ -23,7 +23,11 @@ constexpr float kSqrt3Inv = 0.5773502691896258f;  // 1 / sqrt(3), cube-diagonal 
 constexpr float kWallRestitution = 0.05f;   // normal reflection coefficient
 constexpr float kWallTangential = 0.98f;    // tangential friction coefficient
 constexpr float kVelocityDamping = 0.995f;  // light bulk damping at the fixed 30 Hz step
-constexpr int kJacobiIterations = 2;
+// One warm-started iteration holds 30 Hz at 343 particles (~23-27 ms/step on
+// hardware; two iterations cost ~43 ms and overrun). The constraint solve
+// re-converges across frames, trading a slightly softer fluid under hard
+// shakes for the finer 343-particle look.
+constexpr int kJacobiIterations = 1;
 
 inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
