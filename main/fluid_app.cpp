@@ -23,7 +23,16 @@ constexpr int kHeight = 240;
 constexpr int kSurfaceScale = 2;
 constexpr int kSurfaceWidth = kWidth / kSurfaceScale;
 constexpr int kSurfaceHeight = kHeight / kSurfaceScale;
-constexpr uint16_t kSurfaceThreshold = 40;
+
+// Splat support as a fraction of the full-resolution particle radius. The
+// unscaled radius spans 2x the drawn radius on the half-resolution surface
+// grid; 4/5 tightens support to 1.6x so only genuinely close particles merge.
+constexpr int kSplatSupportNum = 4;
+constexpr int kSplatSupportDen = 5;
+constexpr uint16_t kSurfaceThreshold = 56;
+// The tightened splat support steepens the field's edge gradient (~29 field
+// units per output pixel at the front face), so 28 units keep the silhouette
+// ramp at about one antialiased output pixel.
 constexpr uint16_t kSurfaceAaWidth = 28;
 
 // Physical volume: 27.72 mm square active LCD and 22.5 mm enclosure depth.
@@ -366,7 +375,7 @@ esp_err_t FluidBoxApp::render_frame(const ParticleFrame &frame, DisplayFrame &df
 }
 
 // ---------------------------------------------------------------------------
-// Raster helpers (moved verbatim from renderer.cpp)
+// Raster helpers (from renderer.cpp; splat support, iso-threshold, AA width and depth fade retuned)
 // ---------------------------------------------------------------------------
 
 void FluidBoxApp::build_luts()
@@ -552,10 +561,11 @@ void FluidBoxApp::build_surface()
     std::memset(surface_heat_, 0, kSurfacePixels * sizeof(uint16_t));
     std::memset(surface_depth_, 0xFF, kSurfacePixels * sizeof(uint16_t));
 
-    // Screen-space implicit surface. At half resolution, a support radius equal
-    // to the full-resolution particle radius is twice the drawn particle radius
-    // in screen space. Neighbor kernels therefore meet near the iso-threshold,
-    // turning the point cloud into one smooth liquid body.
+    // Screen-space implicit surface. The splat support is kSplatSupportNum /
+    // kSplatSupportDen of the full-resolution particle radius (1.6x the drawn
+    // radius in half-resolution space), so kernels bridge only between
+    // genuinely close particles: packed liquid merges into one body while
+    // spread particles read as distinct droplets.
     for (int i = 0; i < active_count_; ++i) {
         const Projected &p = proj_[i];
         if (!p.active) {
@@ -563,7 +573,8 @@ void FluidBoxApp::build_surface()
         }
         const int cx = p.x / kSurfaceScale;
         const int cy = p.y / kSurfaceScale;
-        const int radius = max_int(static_cast<int>(p.radius), 2);
+        const int radius = max_int(
+            (static_cast<int>(p.radius) * kSplatSupportNum) / kSplatSupportDen, 2);
         const uint32_t r2 = static_cast<uint32_t>(radius * radius);
         const uint32_t d2_mul =
             static_cast<uint32_t>((255.0f * 65536.0f) / static_cast<float>(r2) + 0.5f);
@@ -683,14 +694,14 @@ void FluidBoxApp::shade_surface(uint16_t *buf, int y0, int rows)
             if (z11 < z) z = z11;
             if (z != UINT16_MAX) {
                 const uint32_t fade =
-                    255u - min_int(static_cast<int>((static_cast<uint32_t>(z) * 65u) /
+                    255u - min_int(static_cast<int>((static_cast<uint32_t>(z) * 130u) /
                                                    kBoxDepthFx),
-                                   65);
+                                   130);
                 brightness = static_cast<int32_t>(
                     (static_cast<uint32_t>(brightness) * fade) >> 8);
             }
 
-            // Fade the first 28 field units above the iso-threshold for a
+            // Fade the first kSurfaceAaWidth field units above the iso-threshold for a
             // one-pixel antialiased silhouette after 2x bilinear upsampling.
             const uint32_t coverage =
                 min_int(static_cast<int>(((field - kSurfaceThreshold) * 255u) /

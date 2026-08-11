@@ -10,8 +10,9 @@ namespace fluid_demo {
 // renderer). All buffers are sized from these constants; nothing allocates at
 // runtime.
 constexpr size_t kMaxParticles = 768;
-// Tuned startup count for 30 Hz physics on the 240x240 board. Buffers retain
-// headroom for profiling, but steady-state allocation never changes.
+// Count-scaled geometry baseline: the 216-particle 6x6x6 lattice defines the
+// reference spacing in Fluid::init(). The actual startup count lives in
+// FluidBoxApp::kInitialParticles; buffers retain headroom up to kMaxParticles.
 constexpr size_t kInitialParticles = 216;
 constexpr size_t kMinParticles = 128;
 

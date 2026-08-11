@@ -25,8 +25,14 @@ namespace fluid_demo {
 /// setup_once() and the end of the process.
 class FluidBoxApp final : public App {
 public:
-    /// Tuned startup count for 30 Hz physics on the 240x240 panel.
-    static constexpr uint16_t kInitialParticles = 216;
+    /// Startup count. 343 (7^3) trades ~1.6x solver pair work for a finer
+    /// liquid; the count-scaled geometry baseline stays the namespace-level
+    /// kInitialParticles (216) in app_types.hpp, so spacing shrinks with the
+    /// count instead of inflating the occupied volume.
+    static constexpr uint16_t kInitialParticles = 343;
+    static_assert(kInitialParticles >= kMinParticles &&
+                      kInitialParticles <= kMaxParticles,
+                  "startup count must stay within Fluid's supported range");
 
     FluidBoxApp() = default;
     ~FluidBoxApp() override;
@@ -68,7 +74,7 @@ public:
     void request_fluid_reset();
 
 private:
-    // ---- Fluid raster half (moved from renderer.cpp, byte-for-byte) ----
+    // ---- Fluid raster half (moved from renderer.cpp; tuned since) ----
     struct Projected {
         int16_t x;          ///< Full-resolution screen center x (px).
         int16_t y;          ///< Full-resolution screen center y (px).
