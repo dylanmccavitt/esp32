@@ -5,12 +5,15 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
+#include "esp_attr.h"
 #include "esp_check.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "qmi8658.h"
 
 namespace fluid_demo {
@@ -44,8 +47,50 @@ constexpr gpio_num_t kPowerButton = GPIO_NUM_5;
 constexpr gpio_num_t kPlusButton = GPIO_NUM_4;
 constexpr gpio_num_t kBatteryEnable = GPIO_NUM_2;
 
+// CST816-family capacitive touch (official board evidence): 7-bit address
+// 0x15 on the shared I2C0 bus, RST active-low on GPIO47, INT falling edge on
+// GPIO48. One six-byte report transaction starts at register 0x01 and returns
+// {gesture id, finger count, X high nibble, X low, Y high nibble, Y low}
+// with 12-bit coordinates. The controller is read-only-on-INT: some parts
+// NACK a report read unless a touch interrupt just occurred, so reads are
+// IRQ-gated with immediate in-window retries and an idle NACK never resets
+// the shared bus.
+constexpr gpio_num_t kTouchReset = GPIO_NUM_47;
+constexpr gpio_num_t kTouchInt = GPIO_NUM_48;
+constexpr uint8_t kTouchI2cAddr = 0x15;
+constexpr uint8_t kTouchReportReg = 0x01;
+constexpr size_t kTouchReportLen = 6;          // registers 0x01..0x06
+constexpr uint8_t kTouchFingerMask = 0x0F;     // finger count lives in the low nibble
+constexpr uint8_t kTouchCoordHighMask = 0x0F;  // 12-bit coords: high byte low nibble
+constexpr uint16_t kTouchMaxCoord = 239;       // display-native 240x240 bound
+constexpr int kTouchResetLowMs = 200;
+constexpr int kTouchResetHighMs = 200;
+constexpr int kTouchReadAttempts = 3;          // initial + immediate retries
+
+/// Map the controller's raw gesture id to the shell's logical swipe. CST816-
+/// family ids: 0x03 = slide left, 0x04 = slide right; every other id (0 =
+/// none, click, long-press, double-click) is not a swipe. Pure and constant
+/// so the release report can be classified without any allocation.
+constexpr TouchGesture cst816_gesture(uint8_t id)
+{
+    switch (id) {
+        case 0x03:
+            return TouchGesture::SwipeLeft;
+        case 0x04:
+            return TouchGesture::SwipeRight;
+        default:
+            return TouchGesture::None;
+    }
+}
+
 static i2c_master_bus_handle_t s_i2c = nullptr;
 static qmi8658_dev_t s_imu{};
+static i2c_master_dev_handle_t s_touch_dev = nullptr;
+// Bounded ISR -> sensor-task latch: the ISR only sets the flag under the mux,
+// the sensor lane consumes it under the same mux. No allocation, no I2C, and
+// the ISR never touches the shared bus.
+static volatile bool s_touch_irq_pending = false;
+static portMUX_TYPE s_touch_irq_mux = portMUX_INITIALIZER_UNLOCKED;
 
 esp_err_t init_power_hold()
 {
@@ -86,6 +131,77 @@ esp_err_t init_i2c()
     cfg.trans_queue_depth = 0;
     cfg.flags.enable_internal_pullup = true;
     return i2c_new_master_bus(&cfg, &s_i2c);
+}
+
+static void IRAM_ATTR touch_intr_isr(void *arg)
+{
+    (void)arg;
+    // Only latch the bounded flag; any I2C/GPIO work stays in the task lane.
+    portENTER_CRITICAL_ISR(&s_touch_irq_mux);
+    s_touch_irq_pending = true;
+    portEXIT_CRITICAL_ISR(&s_touch_irq_mux);
+}
+
+static bool touch_irq_consume()
+{
+    bool pending = false;
+    portENTER_CRITICAL(&s_touch_irq_mux);
+    pending = s_touch_irq_pending;
+    s_touch_irq_pending = false;
+    portEXIT_CRITICAL(&s_touch_irq_mux);
+    return pending;
+}
+
+esp_err_t init_touch()
+{
+    // RST: active-low output. Pulse low 200 ms then high 200 ms. The chip is
+    // deliberately NOT probed or ID-read afterwards: the first touch arrives
+    // via INT, and an init probe would consume the event window.
+    gpio_config_t rst_cfg{};
+    rst_cfg.pin_bit_mask = 1ULL << kTouchReset;
+    rst_cfg.mode = GPIO_MODE_OUTPUT;
+    rst_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    rst_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    rst_cfg.intr_type = GPIO_INTR_DISABLE;
+    ESP_RETURN_ON_ERROR(gpio_config(&rst_cfg), kTag, "touch RST GPIO failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level(kTouchReset, 0), kTag, "touch RST low failed");
+    vTaskDelay(pdMS_TO_TICKS(kTouchResetLowMs));
+    ESP_RETURN_ON_ERROR(gpio_set_level(kTouchReset, 1), kTag, "touch RST high failed");
+    vTaskDelay(pdMS_TO_TICKS(kTouchResetHighMs));
+
+    // The controller can leave the shared lines mid-cycle as reset releases.
+    // Recover the idle bus once during board startup, before either device is
+    // configured; touch report failures never reset this shared bus at runtime.
+    ESP_RETURN_ON_ERROR(i2c_master_bus_reset(s_i2c), kTag,
+                        "I2C recovery after touch reset failed");
+
+    // INT: input, idle-high; a touch drives a falling edge that latches the
+    // flag. The GPIO ISR service is installed exactly once, here, on the
+    // board init path (no other component uses it in this firmware).
+    gpio_config_t int_cfg{};
+    int_cfg.pin_bit_mask = 1ULL << kTouchInt;
+    int_cfg.mode = GPIO_MODE_INPUT;
+    int_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    int_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    int_cfg.intr_type = GPIO_INTR_NEGEDGE;
+    ESP_RETURN_ON_ERROR(gpio_config(&int_cfg), kTag, "touch INT GPIO failed");
+    ESP_RETURN_ON_ERROR(gpio_install_isr_service(ESP_INTR_FLAG_IRAM), kTag,
+                        "touch ISR service install failed");
+    ESP_RETURN_ON_ERROR(gpio_isr_handler_add(kTouchInt, touch_intr_isr, nullptr),
+                        kTag, "touch INT handler add failed");
+
+    // Second device handle on the existing 100 kHz bus; no probe or ID read.
+    i2c_device_config_t dev_cfg{};
+    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dev_cfg.device_address = kTouchI2cAddr;
+    dev_cfg.scl_speed_hz = kMotionI2cHz;
+    dev_cfg.scl_wait_us = kMotionSclWaitUs;  // same stale-SCL guard as the IMU
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c, &dev_cfg, &s_touch_dev),
+                        kTag, "touch device add failed");
+
+    ESP_LOGI(kTag, "CST816 touch ready at 0x%02X (RST GPIO47, INT GPIO48)",
+             kTouchI2cAddr);
+    return ESP_OK;
 }
 
 esp_err_t init_imu()
@@ -201,6 +317,7 @@ esp_err_t board_init(BoardHandles *out)
     ESP_RETURN_ON_ERROR(init_power_hold(), kTag, "power hold failed");
     ESP_RETURN_ON_ERROR(init_buttons(), kTag, "button GPIO init failed");
     ESP_RETURN_ON_ERROR(init_i2c(), kTag, "sensor I2C init failed");
+    ESP_RETURN_ON_ERROR(init_touch(), kTag, "touch init failed");
     ESP_RETURN_ON_ERROR(init_imu(), kTag, "IMU init failed");
     ESP_RETURN_ON_ERROR(init_display(out), kTag, "display init failed");
     return ESP_OK;
@@ -252,6 +369,68 @@ esp_err_t board_read_motion(Vec3 *accel_mps2, Vec3 *gyro_rads, bool *fresh)
     return ESP_OK;
 }
 
+esp_err_t board_read_touch(TouchSample *out)
+{
+    if (out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->fresh = false;
+    out->pressed = false;
+    out->gesture = TouchGesture::None;
+
+    // Consume the falling-edge latch, with the active-low pin as a level
+    // fallback when a short scheduler/critical-section window hid the edge.
+    // A high idle line performs no I2C transaction.
+    const bool interrupt_pending = touch_irq_consume();
+    if (!interrupt_pending && gpio_get_level(kTouchInt) != 0) {
+        return ESP_OK;
+    }
+
+    // Report registers 0x01..0x06 = {gesture id, finger count, X high nibble,
+    // X low, Y high nibble, Y low}.
+    uint8_t reg = kTouchReportReg;
+    uint8_t raw[kTouchReportLen]{};
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 0; attempt < kTouchReadAttempts && ret != ESP_OK; ++attempt) {
+        // No delay between attempts: the part may NACK once the event window
+        // closes, so retry strictly immediately. The shared bus is never
+        // reset or recreated from the touch path.
+        ret = i2c_master_transmit_receive(s_touch_dev, &reg, 1, raw,
+                                          sizeof(raw), kMotionReadTimeoutMs);
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // The gesture id accompanies every report; the finger-up report carries
+    // the completed contact's swipe, which is what swipe classification uses.
+    out->gesture = cst816_gesture(raw[0]);
+
+    const uint8_t finger = raw[1] & kTouchFingerMask;
+    if (finger == 0) {
+        // Publish the release report (and its gesture) without coordinates so
+        // the shell can re-arm exactly once for the next physical contact.
+        out->fresh = true;
+        return ESP_OK;
+    }
+
+    const uint16_t x = (static_cast<uint16_t>(raw[2] & kTouchCoordHighMask) << 8) |
+                       static_cast<uint16_t>(raw[3]);
+    const uint16_t y = (static_cast<uint16_t>(raw[4] & kTouchCoordHighMask) << 8) |
+                       static_cast<uint16_t>(raw[5]);
+
+    // Never publish partial data: reject out-of-range reports outright.
+    if (x > kTouchMaxCoord || y > kTouchMaxCoord) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    out->x = x;
+    out->y = y;
+    out->pressed = true;
+    out->fresh = true;
+    return ESP_OK;
+}
+
 bool board_reset_pressed()
 {
     return gpio_get_level(kPlusButton) == 0;
@@ -267,6 +446,11 @@ esp_err_t board_power_off()
     ESP_LOGI(kTag, "PWR long press - releasing BAT_EN");
     ESP_RETURN_ON_ERROR(gpio_hold_dis(kBatteryEnable), kTag, "BAT_EN hold release failed");
     return gpio_set_level(kBatteryEnable, 0);
+}
+
+bool board_battery_hold_enabled()
+{
+    return gpio_get_level(kBatteryEnable) != 0;
 }
 
 bool board_boot_pressed()

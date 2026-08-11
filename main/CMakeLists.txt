@@ -1,11 +1,17 @@
 idf_component_register(
     SRCS "app_main.cpp"
          "board.cpp"
-         "dev_console.cpp"
+         "console_service.cpp"
+         "display_service.cpp"
+         "fluid_app.cpp"
+         "tilt_maze_app.cpp"
+         "input_service.cpp"
+         "launcher.cpp"
+         "motion_service.cpp"
+         "runtime.cpp"
          "motion.cpp"
          "fluid.cpp"
          "snapshot_exchange.cpp"
-         "renderer.cpp"
     INCLUDE_DIRS "."
     PRIV_REQUIRES console esp_lcd esp_driver_gpio esp_driver_i2c esp_driver_spi esp_timer esp_psram spi_flash heap
 )
