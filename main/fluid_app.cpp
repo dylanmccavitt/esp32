@@ -651,15 +651,22 @@ void FluidBoxApp::shade_surface(uint16_t *buf, int y0, int rows)
             const uint32_t wx0 = static_cast<uint32_t>(2 - fx);
             const uint32_t wx1 = static_cast<uint32_t>(fx);
 
+            const uint16_t f00 = surface_field_[row0 + sx];
+            const uint16_t f10 = surface_field_[row0 + sx1];
+            const uint16_t f01 = surface_field_[row1 + sx];
+            const uint16_t f11 = surface_field_[row1 + sx1];
+            // Bilinear output never exceeds its taps: reject empty pixels
+            // before spending the multiplies (exact, not an approximation).
+            if (f00 < kSurfaceThreshold && f10 < kSurfaceThreshold &&
+                f01 < kSurfaceThreshold && f11 < kSurfaceThreshold) {
+                continue;
+            }
             const uint32_t w00 = wx0 * wy0;
             const uint32_t w10 = wx1 * wy0;
             const uint32_t w01 = wx0 * wy1;
             const uint32_t w11 = wx1 * wy1;
             const uint32_t field =
-                (surface_field_[row0 + sx] * w00 +
-                 surface_field_[row0 + sx1] * w10 +
-                 surface_field_[row1 + sx] * w01 +
-                 surface_field_[row1 + sx1] * w11) >> 2;
+                (f00 * w00 + f10 * w10 + f01 * w01 + f11 * w11) >> 2;
             if (field < kSurfaceThreshold) {
                 continue;
             }

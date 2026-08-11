@@ -29,9 +29,11 @@ struct FluidStats {
 //
 // PBF solve: 2 Jacobi iterations at the caller's fixed dt; a 3D counting grid
 // (cell size h) is rebuilt from the current predicted positions at the start of
-// each iteration, neighbors are gathered by direct 27-cell traversal (no capped
-// lists). Poly6 density, exact Spiky gradient, scorr surface term, symmetric
-// lambda denominator (squared self-gradient + neighbor gradient squares).
+// each iteration. Unordered pairs are gathered by a 14-cell half-stencil
+// traversal (own cell with j > i plus the 13 lexicographically forward cells,
+// no capped lists), so backward cells are never scanned. Poly6 density, exact
+// Spiky gradient, scorr surface term, symmetric lambda denominator (squared
+// self-gradient + neighbor gradient squares).
 class Fluid {
 public:
     Fluid() = default;
