@@ -122,7 +122,7 @@ bool Fluid::init(uint16_t particle_count) {
     const float ratio = static_cast<float>(kInitialParticles) / static_cast<float>(count_);
     spacing_ = 0.14f * std::cbrt(ratio);
     h_ = spacing_ * (0.20f / 0.11f);
-    radius_ = 0.30f * spacing_;
+    radius_ = 0.24f * spacing_;  // small distinct beads for the sprite renderer
 
     // Kernel and solve constants.
     const float h2 = h_ * h_;
