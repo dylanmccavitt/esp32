@@ -32,6 +32,12 @@ constexpr int64_t kStepBudgetUs = 15000;
 // detached sheet shears apart instead of dropping as one slab.
 constexpr int kMaxExtraHops = 3;
 
+// A landing at heat >= this (a 2+ cell fall last substep) converts to a
+// bounce with 3/4 probability: the grain pops back against gravity by
+// heat - 4 cells (1..3) with a one-turn apex hang, so streams popcorn off
+// the floor and off pile surfaces instead of stacking dead.
+constexpr uint32_t kBounceHeat = 5;
+
 // Dim border ring marking the box walls (logical RGB565, swapped at setup).
 constexpr uint16_t kWallColor = 0x31A6;  // dark warm gray
 
@@ -269,6 +275,41 @@ uint32_t FluidBoxApp::step_sand(float sgx, float sgy)
             static_cast<uint32_t>(256.0f * ax / (ay + 1.0e-6f));
         const int y_from = (dy > 0) ? kHiY : kLo;
         const int y_to = (dy > 0) ? kLo : kHiY;
+        // Impact response for a grain whose forward moves all failed: a
+        // hard landing pops back against gravity (rise state, executed by
+        // the scan when it reaches the risen cell); softer hot landings
+        // skitter sideways and cool.
+        const auto impact = [&](int ix, int iy, uint8_t ic, uint32_t rr) {
+            const uint32_t heat = (ic >> kShadeBits) & 7u;
+            if (heat >= kBounceHeat && (rr & 3u) != 0u) {
+                const uint8_t rc = static_cast<uint8_t>(
+                    (ic & 0x3Fu) | ((heat - 4u) << kRiseShift));
+                const int jx = (((rr >> 2) & 3u) == 0u)
+                                   ? ((((rr >> 4) & 1u) != 0u) ? 1 : -1)
+                                   : 0;
+                // Two cells per rise step: 1 px pops read as fizz, so a
+                // hard landing launches 2 px immediately and each stored
+                // rise level adds 2 more (heat 7 = a 6 px pop).
+                if (try_move(ix, iy, ix + jx, iy - dy, rc)) {
+                    static_cast<void>(
+                        try_move(ix + jx, iy - dy, ix + jx, iy - 2 * dy, rc));
+                    return;
+                }
+                if (jx != 0 && try_move(ix, iy, ix, iy - dy, rc)) {
+                    static_cast<void>(
+                        try_move(ix, iy - dy, ix, iy - 2 * dy, rc));
+                    return;
+                }
+            }
+            if (((rr >> 10) & 15u) < heat) {
+                const uint8_t sc = static_cast<uint8_t>(
+                    (ic & kShadeMask) | ((heat - 1u) << kShadeBits));
+                const int sdir = ((rr & 16384u) != 0u) ? 1 : -1;
+                if (!try_move(ix, iy, ix + sdir, iy, sc)) {
+                    static_cast<void>(try_move(ix, iy, ix - sdir, iy, sc));
+                }
+            }
+        };
         for (int y = y_from; y != y_to - dy; y -= dy) {
             const bool ltr = ((frame_parity_ ^ static_cast<uint32_t>(y)) & 1u) != 0u;
             const int x_from = ltr ? kLo : kHiX;
@@ -281,21 +322,44 @@ uint32_t FluidBoxApp::step_sand(float sgx, float sgy)
                 if (c == 0u) {
                     continue;
                 }
+                if (c >= 0x40u) {
+                    // Bouncing: move against gravity, spending one rise
+                    // level per cell, with a one-turn hang at the apex so
+                    // the pop stays visible before the grain falls back.
+                    const uint32_t rise = static_cast<uint32_t>(c) >> kRiseShift;
+                    if (rise == 1u) {
+                        row[x] = static_cast<uint8_t>(c & 0x3Fu);
+                        continue;
+                    }
+                    const uint32_t rr = rnd();
+                    const uint8_t rc = static_cast<uint8_t>(
+                        (c & 0x3Fu) | ((rise - 1u) << kRiseShift));
+                    const int jx =
+                        ((rr & 6u) == 0u) ? (((rr & 8u) != 0u) ? 1 : -1) : 0;
+                    const int side = ((rr & 16u) != 0u) ? 1 : -1;
+                    int nx = kGridW;  // sentinel: no move
+                    if (try_move(x, y, x + jx, y - dy, rc)) {
+                        nx = x + jx;
+                    } else if (try_move(x, y, x + side, y - dy, rc)) {
+                        nx = x + side;
+                    } else if (try_move(x, y, x - side, y - dy, rc)) {
+                        nx = x - side;
+                    }
+                    if (nx != kGridW) {
+                        static_cast<void>(
+                            try_move(nx, y - dy, nx, y - 2 * dy, rc));
+                        continue;
+                    }
+                    row[x] = static_cast<uint8_t>(c & 0x3Fu);
+                    continue;
+                }
                 // Fast reject: all three forward cells solid. The bulk of
                 // a settled bed takes this path — skip the RNG and the
-                // move attempts; only a hot grain can still scatter.
+                // move attempts; only a hot grain can still bounce or
+                // scatter.
                 if (fwd[x] != 0u && fwd[x - 1] != 0u && fwd[x + 1] != 0u) {
-                    const uint32_t bheat = (c >> kShadeBits) & 7u;
-                    if (bheat != 0u) {
-                        const uint32_t rs = rnd();
-                        if (((rs >> 10) & 15u) < bheat) {
-                            const uint8_t sc = static_cast<uint8_t>(
-                                (c & kShadeMask) | ((bheat - 1u) << kShadeBits));
-                            const int sdir = ((rs & 16384u) != 0u) ? 1 : -1;
-                            if (!try_move(x, y, x + sdir, y, sc)) {
-                                static_cast<void>(try_move(x, y, x - sdir, y, sc));
-                            }
-                        }
+                    if ((c & kHeatBits) != 0u) {
+                        impact(x, y, c, rnd());
                     }
                     continue;
                 }
@@ -353,17 +417,8 @@ uint32_t FluidBoxApp::step_sand(float sgx, float sgy)
                     try_move(x, y, x - first, y + dy, mc_roll)) {
                     continue;
                 }
-                // Fully blocked: hot grains skitter sideways with chance
-                // heat/16 — impact splash and boiling pile surfaces that
-                // die out as the grains cool.
-                const uint32_t heat = (c >> kShadeBits) & 7u;
-                if (heat != 0u && ((r0 >> 10) & 15u) < heat) {
-                    const uint8_t sc = static_cast<uint8_t>(
-                        base | ((heat - 1u) << kShadeBits));
-                    const int sdir = ((r0 & 16384u) != 0u) ? 1 : -1;
-                    if (!try_move(x, y, x + sdir, y, sc)) {
-                        static_cast<void>(try_move(x, y, x - sdir, y, sc));
-                    }
+                if ((c & kHeatBits) != 0u) {
+                    impact(x, y, c, rnd());
                 }
             }
         }
@@ -376,16 +431,72 @@ uint32_t FluidBoxApp::step_sand(float sgx, float sgy)
             static_cast<uint32_t>(256.0f * ay / (ax + 1.0e-6f));
         const int x_from = (dx > 0) ? kHiX : kLo;
         const int x_to = (dx > 0) ? kLo : kHiX;
+        const auto impact = [&](int ix, int iy, uint8_t ic, uint32_t rr) {
+            const uint32_t heat = (ic >> kShadeBits) & 7u;
+            if (heat >= kBounceHeat && (rr & 3u) != 0u) {
+                const uint8_t rc = static_cast<uint8_t>(
+                    (ic & 0x3Fu) | ((heat - 4u) << kRiseShift));
+                const int jy = (((rr >> 2) & 3u) == 0u)
+                                   ? ((((rr >> 4) & 1u) != 0u) ? 1 : -1)
+                                   : 0;
+                if (try_move(ix, iy, ix - dx, iy + jy, rc)) {
+                    static_cast<void>(
+                        try_move(ix - dx, iy + jy, ix - 2 * dx, iy + jy, rc));
+                    return;
+                }
+                if (jy != 0 && try_move(ix, iy, ix - dx, iy, rc)) {
+                    static_cast<void>(
+                        try_move(ix - dx, iy, ix - 2 * dx, iy, rc));
+                    return;
+                }
+            }
+            if (((rr >> 10) & 15u) < heat) {
+                const uint8_t sc = static_cast<uint8_t>(
+                    (ic & kShadeMask) | ((heat - 1u) << kShadeBits));
+                const int sdir = ((rr & 16384u) != 0u) ? 1 : -1;
+                if (!try_move(ix, iy, ix, iy + sdir, sc)) {
+                    static_cast<void>(try_move(ix, iy, ix, iy - sdir, sc));
+                }
+            }
+        };
         for (int x = x_from; x != x_to - dx; x -= dx) {
             const bool ttb = ((frame_parity_ ^ static_cast<uint32_t>(x)) & 1u) != 0u;
             const int y_from = ttb ? kLo : kHiY;
             const int y_to = ttb ? kHiY : kLo;
             const int dy_scan = ttb ? 1 : -1;
             const int step = dy_scan * kGridW;
-            const uint8_t *cell = g + static_cast<size_t>(y_from) * kGridW + x;
+            uint8_t *cell = g + static_cast<size_t>(y_from) * kGridW + x;
             for (int y = y_from; y != y_to + dy_scan; y += dy_scan, cell += step) {
                 const uint8_t c = *cell;
                 if (c == 0u) {
+                    continue;
+                }
+                if (c >= 0x40u) {
+                    const uint32_t rise = static_cast<uint32_t>(c) >> kRiseShift;
+                    if (rise == 1u) {
+                        *cell = static_cast<uint8_t>(c & 0x3Fu);
+                        continue;
+                    }
+                    const uint32_t rr = rnd();
+                    const uint8_t rc = static_cast<uint8_t>(
+                        (c & 0x3Fu) | ((rise - 1u) << kRiseShift));
+                    const int jy =
+                        ((rr & 6u) == 0u) ? (((rr & 8u) != 0u) ? 1 : -1) : 0;
+                    const int side = ((rr & 16u) != 0u) ? 1 : -1;
+                    int ny = kGridH;  // sentinel: no move
+                    if (try_move(x, y, x - dx, y + jy, rc)) {
+                        ny = y + jy;
+                    } else if (try_move(x, y, x - dx, y + side, rc)) {
+                        ny = y + side;
+                    } else if (try_move(x, y, x - dx, y - side, rc)) {
+                        ny = y - side;
+                    }
+                    if (ny != kGridH) {
+                        static_cast<void>(
+                            try_move(x - dx, ny, x - 2 * dx, ny, rc));
+                        continue;
+                    }
+                    *cell = static_cast<uint8_t>(c & 0x3Fu);
                     continue;
                 }
                 // Fast reject: forward column solid at y-1..y+1 (row 0 and
@@ -393,17 +504,8 @@ uint32_t FluidBoxApp::step_sand(float sgx, float sgy)
                 // inside the allocation).
                 if (cell[dx] != 0u && cell[dx - kGridW] != 0u &&
                     cell[dx + kGridW] != 0u) {
-                    const uint32_t bheat = (c >> kShadeBits) & 7u;
-                    if (bheat != 0u) {
-                        const uint32_t rs = rnd();
-                        if (((rs >> 10) & 15u) < bheat) {
-                            const uint8_t sc = static_cast<uint8_t>(
-                                (c & kShadeMask) | ((bheat - 1u) << kShadeBits));
-                            const int sdir = ((rs & 16384u) != 0u) ? 1 : -1;
-                            if (!try_move(x, y, x, y + sdir, sc)) {
-                                static_cast<void>(try_move(x, y, x, y - sdir, sc));
-                            }
-                        }
+                    if ((c & kHeatBits) != 0u) {
+                        impact(x, y, c, rnd());
                     }
                     continue;
                 }
@@ -451,14 +553,8 @@ uint32_t FluidBoxApp::step_sand(float sgx, float sgy)
                     try_move(x, y, x + dx, y - first, mc_roll)) {
                     continue;
                 }
-                const uint32_t heat = (c >> kShadeBits) & 7u;
-                if (heat != 0u && ((r0 >> 10) & 15u) < heat) {
-                    const uint8_t sc = static_cast<uint8_t>(
-                        base | ((heat - 1u) << kShadeBits));
-                    const int sdir = ((r0 & 16384u) != 0u) ? 1 : -1;
-                    if (!try_move(x, y, x, y + sdir, sc)) {
-                        static_cast<void>(try_move(x, y, x, y - sdir, sc));
-                    }
+                if ((c & kHeatBits) != 0u) {
+                    impact(x, y, c, rnd());
                 }
             }
         }
@@ -489,9 +585,10 @@ void FluidBoxApp::draw_sand(uint16_t *buf, int y0, int rows)
         for (int x = 1; x < kGridW - 1; ++x) {
             const uint8_t c = row[x];
             if (c != 0u) {
-                out[x] = shade_wire_[c];
+                out[x] = shade_wire_[c & 0x3Fu];
                 // Cool one heat level per frame: a mover flares for
                 // kHeatMax frames (~1/4 s) then rests at its base shade.
+                // Rise bits (6-7) survive the decrement untouched.
                 if ((c & kHeatBits) != 0u) {
                     row[x] = static_cast<uint8_t>(c - (1u << kShadeBits));
                 }

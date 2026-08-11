@@ -73,14 +73,17 @@ private:
     static constexpr int kShadeCount = 6; ///< per-grain fixed sand shades
 
     // Cell byte layout: bits 0-2 shade (1..kShadeCount, 0 = empty cell),
-    // bits 3-5 movement heat (0..kHeatMax). Heat encodes per-substep
-    // speed (topple 3, fall 3 + cells moved) and doubles as kinetic
-    // energy for splash scatter; the raster decays it one level per
-    // frame, driving the velocity-ramp palette.
+    // bits 3-5 movement heat (0..kHeatMax), bits 6-7 bounce rise count.
+    // Heat encodes per-substep speed (topple 3, fall 3 + cells moved) and
+    // doubles as kinetic energy for bounce and splash; the raster decays
+    // it one level per frame, driving the velocity-ramp palette. A
+    // nonzero rise count moves the grain against gravity, one level per
+    // cell, with a one-turn hang at rise 1 (the apex).
     static constexpr int kShadeBits = 3;
     static constexpr uint8_t kShadeMask = 0x07;
     static constexpr int kHeatMax = 7;
     static constexpr uint8_t kHeatBits = kHeatMax << kShadeBits;
+    static constexpr int kRiseShift = 6;
 
     void reset_grid();
     /// One automaton substep toward screen-space gravity (sgx right,
