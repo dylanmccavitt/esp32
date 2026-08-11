@@ -3,6 +3,7 @@
 #include "esp_err.h"
 #include "esp_lcd_types.h"
 
+#include "app_shell.hpp"
 #include "app_types.hpp"
 
 namespace fluid_demo {
@@ -47,13 +48,16 @@ esp_err_t board_read_motion(Vec3 *accel_mps2, Vec3 *gyro_rads, bool *fresh);
  * The CST816-family controller reports 12-bit coordinates that natively
  * match the 240x240 ST7789: both x and y are in [0, 239]. `fresh` means this
  * call consumed a complete controller report; `pressed` carries its finger
- * count state. Coordinates are published only for a fresh pressed report.
+ * count state. Coordinates are published only for a fresh pressed report;
+ * `gesture` accompanies every report and is most meaningful on the finger-up
+ * report, where it carries the completed contact's controller-encoded swipe.
  */
 struct TouchSample {
-    uint16_t x = 0;       /*!< 0..239 column, matching the ST7789 */
-    uint16_t y = 0;       /*!< 0..239 row, matching the ST7789 */
-    bool pressed = false; /*!< true iff the fresh report has one finger */
-    bool fresh = false;   /*!< true iff this call consumed a report */
+    uint16_t x = 0;        /*!< 0..239 column, matching the ST7789 */
+    uint16_t y = 0;        /*!< 0..239 row, matching the ST7789 */
+    TouchGesture gesture = TouchGesture::None; /*!< controller swipe id */
+    bool pressed = false;  /*!< true iff the fresh report has one finger */
+    bool fresh = false;    /*!< true iff this call consumed a report */
 };
 
 /**
@@ -63,12 +67,15 @@ struct TouchSample {
  * only after the falling-edge INT interrupt latched a pending flag or while
  * the active-low line remains asserted; there is never an idle controller
  * read, and the shared I2C0 bus (QMI8658) is never reset or recreated from the
- * runtime touch path. A report whose finger count is zero returns ESP_OK with
- * `out->fresh` true and `out->pressed` false so InputService can re-arm only
- * after a physical release; no pending event returns both false. Transactions
- * retry immediately (no delay) inside the event window on transient failure —
- * some parts NACK a report read unless a touch interrupt just occurred — and
- * the final failure is returned without touching the bus.
+ * runtime touch path. One six-byte transaction starting at register 0x01
+ * returns {gesture, finger count, X, Y}; gesture ids 0x03 (slide left) and
+ * 0x04 (slide right) map to SwipeLeft/SwipeRight and every other id maps to
+ * None. A report whose finger count is zero returns ESP_OK with `out->fresh`
+ * true and `out->pressed` false so InputService can re-arm only after a
+ * physical release; no pending event returns both false. Transactions retry
+ * immediately (no delay) inside the event window on transient failure — some
+ * parts NACK a report read unless a touch interrupt just occurred — and the
+ * final failure is returned without touching the bus.
  *
  * @param[out] out Receives the report when a touch was observed.
  * @return ESP_OK (with `out->fresh` set per the event), ESP_ERR_INVALID_ARG

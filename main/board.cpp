@@ -49,22 +49,39 @@ constexpr gpio_num_t kBatteryEnable = GPIO_NUM_2;
 
 // CST816-family capacitive touch (official board evidence): 7-bit address
 // 0x15 on the shared I2C0 bus, RST active-low on GPIO47, INT falling edge on
-// GPIO48. A report read starts at register 0x02 and returns five bytes:
-// {finger count, X high nibble, X low, Y high nibble, Y low} with 12-bit
-// coordinates. The controller is read-only-on-INT: some parts NACK a report
-// read unless a touch interrupt just occurred, so reads are IRQ-gated with
-// immediate in-window retries and an idle NACK never resets the shared bus.
+// GPIO48. One six-byte report transaction starts at register 0x01 and returns
+// {gesture id, finger count, X high nibble, X low, Y high nibble, Y low}
+// with 12-bit coordinates. The controller is read-only-on-INT: some parts
+// NACK a report read unless a touch interrupt just occurred, so reads are
+// IRQ-gated with immediate in-window retries and an idle NACK never resets
+// the shared bus.
 constexpr gpio_num_t kTouchReset = GPIO_NUM_47;
 constexpr gpio_num_t kTouchInt = GPIO_NUM_48;
 constexpr uint8_t kTouchI2cAddr = 0x15;
-constexpr uint8_t kTouchReportReg = 0x02;
-constexpr size_t kTouchReportLen = 5;          // registers 0x02..0x06
+constexpr uint8_t kTouchReportReg = 0x01;
+constexpr size_t kTouchReportLen = 6;          // registers 0x01..0x06
 constexpr uint8_t kTouchFingerMask = 0x0F;     // finger count lives in the low nibble
 constexpr uint8_t kTouchCoordHighMask = 0x0F;  // 12-bit coords: high byte low nibble
 constexpr uint16_t kTouchMaxCoord = 239;       // display-native 240x240 bound
 constexpr int kTouchResetLowMs = 200;
 constexpr int kTouchResetHighMs = 200;
 constexpr int kTouchReadAttempts = 3;          // initial + immediate retries
+
+/// Map the controller's raw gesture id to the shell's logical swipe. CST816-
+/// family ids: 0x03 = slide left, 0x04 = slide right; every other id (0 =
+/// none, click, long-press, double-click) is not a swipe. Pure and constant
+/// so the release report can be classified without any allocation.
+constexpr TouchGesture cst816_gesture(uint8_t id)
+{
+    switch (id) {
+        case 0x03:
+            return TouchGesture::SwipeLeft;
+        case 0x04:
+            return TouchGesture::SwipeRight;
+        default:
+            return TouchGesture::None;
+    }
+}
 
 static i2c_master_bus_handle_t s_i2c = nullptr;
 static qmi8658_dev_t s_imu{};
@@ -359,6 +376,7 @@ esp_err_t board_read_touch(TouchSample *out)
     }
     out->fresh = false;
     out->pressed = false;
+    out->gesture = TouchGesture::None;
 
     // Consume the falling-edge latch, with the active-low pin as a level
     // fallback when a short scheduler/critical-section window hid the edge.
@@ -368,8 +386,8 @@ esp_err_t board_read_touch(TouchSample *out)
         return ESP_OK;
     }
 
-    // Report registers 0x02..0x06 = {finger count, X high nibble, X low,
-    // Y high nibble, Y low}.
+    // Report registers 0x01..0x06 = {gesture id, finger count, X high nibble,
+    // X low, Y high nibble, Y low}.
     uint8_t reg = kTouchReportReg;
     uint8_t raw[kTouchReportLen]{};
     esp_err_t ret = ESP_FAIL;
@@ -384,18 +402,22 @@ esp_err_t board_read_touch(TouchSample *out)
         return ret;
     }
 
-    const uint8_t finger = raw[0] & kTouchFingerMask;
+    // The gesture id accompanies every report; the finger-up report carries
+    // the completed contact's swipe, which is what swipe classification uses.
+    out->gesture = cst816_gesture(raw[0]);
+
+    const uint8_t finger = raw[1] & kTouchFingerMask;
     if (finger == 0) {
-        // Publish the release report without coordinates so the shell can
-        // re-arm exactly once for the next physical contact.
+        // Publish the release report (and its gesture) without coordinates so
+        // the shell can re-arm exactly once for the next physical contact.
         out->fresh = true;
         return ESP_OK;
     }
 
-    const uint16_t x = (static_cast<uint16_t>(raw[1] & kTouchCoordHighMask) << 8) |
-                       static_cast<uint16_t>(raw[2]);
-    const uint16_t y = (static_cast<uint16_t>(raw[3] & kTouchCoordHighMask) << 8) |
-                       static_cast<uint16_t>(raw[4]);
+    const uint16_t x = (static_cast<uint16_t>(raw[2] & kTouchCoordHighMask) << 8) |
+                       static_cast<uint16_t>(raw[3]);
+    const uint16_t y = (static_cast<uint16_t>(raw[4] & kTouchCoordHighMask) << 8) |
+                       static_cast<uint16_t>(raw[5]);
 
     // Never publish partial data: reject out-of-range reports outright.
     if (x > kTouchMaxCoord || y > kTouchMaxCoord) {

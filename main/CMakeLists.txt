@@ -4,6 +4,7 @@ idf_component_register(
          "console_service.cpp"
          "display_service.cpp"
          "fluid_app.cpp"
+         "tilt_maze_app.cpp"
          "input_service.cpp"
          "launcher.cpp"
          "motion_service.cpp"

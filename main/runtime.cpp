@@ -1,12 +1,13 @@
 // runtime.cpp — persistent app dispatch and generation-barrier coordinator.
 //
-// Ownership moved out of app_main: this file owns the compile-time registry
-// (exactly {fluid_box, "Fluid Box"}), the shell service instances, the packed
-// dispatch word, the per-lane acknowledgement bits, the three pinned lanes
-// (created exactly once) and the coordinator loop that runs on the ESP main
-// task. app_main is startup wiring only: it calls runtime_run(), which boots
-// (board -> display -> console -> Fluid setup_once; the launcher stable mode
-// boots WITHOUT calling the Fluid app's enter()), spawns the lanes, then
+// Ownership moved out of app_main: this file owns the compile-time app
+// registry, the shell
+// service instances, the packed dispatch word, the per-lane acknowledgement
+// bits, the launcher selection, the three pinned lanes (created exactly once)
+// and the coordinator loop that runs on the ESP main task. app_main is
+// startup wiring only: it calls runtime_run(), which boots (board -> display
+// -> console -> setup_once for every registered app; the launcher stable
+// mode boots WITHOUT calling any app's enter()), spawns the lanes, then
 // never returns.
 //
 // Packed dispatch word (one std::atomic<uint32_t>, one acquire load per lane
@@ -16,7 +17,7 @@
 // generation. A lane can never observe a torn (app, mode, generation) triple.
 //
 // Transition protocol (Launch/Home, both directions, committed mode change
-// emitted as "@DEV MODE fluid_box|launcher"):
+// emitted as "@DEV MODE <registry-id>|launcher"):
 //   1. Quiesce: clear the per-lane ack mask, set mode=Transition, bump the
 //      generation and publish the packed (kNoAppIndex, Transition, gen) word
 //      (one release store).
@@ -43,13 +44,16 @@
 //      publish the stable-mode name for status telemetry.
 //
 // While the launcher is committed, the sensor lane keeps polling the shell
-// InputService so BOOT-reboot/PWR-off/PLUS stay live and routes PLUS ->
-// Launch / short PWR -> Home through the request queue; motion/on_motion
-// stop; the render lane draws the launcher frame at the 30 Hz render cadence
-// through the same bound DisplayFrame transport, and vanishes entirely during
-// a Transition (only the coordinator's mandatory drain touches the display
-// then). No task is recreated and no hardware is re-initialized after boot;
-// enter/leave allocate nothing.
+// InputService so BOOT-reboot/PWR-off/PLUS stay live: PLUS and a non-swipe
+// release inside the selected entry request Launch, a swipe moves the
+// selection once at release (left -> next, right -> previous, wrapping the
+// registry), and short PWR is a no-op (while an app runs it still routes
+// Home through the request queue); motion/on_motion stop; the render lane
+// draws the selected entry's launcher frame at the 30 Hz render cadence
+// through the same bound DisplayFrame transport, and vanishes entirely
+// during a Transition (only the coordinator's mandatory drain touches the
+// display then). No task is recreated and no hardware is re-initialized
+// after boot; enter/leave allocate nothing.
 //
 // Constants here (cores, priorities, stacks, 100/30/30 cadences, dump gate,
 // telemetry line, motion acceptance ack, capture sequencing, reset trampoline
@@ -81,6 +85,7 @@
 #include "input_service.hpp"
 #include "launcher.hpp"
 #include "motion_service.hpp"
+#include "tilt_maze_app.hpp"
 
 namespace fluid_demo {
 
@@ -89,11 +94,13 @@ namespace {
 constexpr char kTag[] = "fluid_demo";
 
 // ---------------------------------------------------------------------------
-// Compile-time registry — exactly one entry: Fluid Box.
+// Compile-time registry — Fluid Box remains first as the boot-selected
+// default; additional bundled apps follow it in launcher order.
 // ---------------------------------------------------------------------------
 
 constexpr RegistryEntry kRegistry[] = {
     {"fluid_box", "Fluid Box", &s_fluid_app},
+    {"tilt_maze", "Task Maze", &s_tilt_maze_app},
 };
 constexpr size_t kRegistryCount = sizeof(kRegistry) / sizeof(kRegistry[0]);
 
@@ -109,6 +116,15 @@ uint32_t pack_selection(uint32_t index, uint32_t mode, uint32_t generation)
     return ((generation << kAppGenShift) & kAppGenMask) |
            ((mode << kAppModeShift) & kAppModeMask) |
            (index & kAppIndexMask);
+}
+
+/// Bounded registry lookup: map the app index carried in a lane's one
+/// dispatched word to its app instance. The word only carries a real registry
+/// index while Running; kNoAppIndex (parked/launcher/transition) and any
+/// out-of-range value resolve to nullptr, never out of bounds.
+App *app_at_index(uint32_t index)
+{
+    return index < kRegistryCount ? kRegistry[index].app : nullptr;
 }
 
 /// AppMode published in the packed word. Entering is coordinator-side only
@@ -137,6 +153,12 @@ std::atomic<uint32_t> s_active_selection{
 /// telemetry; updated once per committed transition and at boot.
 std::atomic<const char *> s_mode_name{"launcher"};
 
+/// Launcher selection shown by the render lane and changed by the sensor lane
+/// once per released swipe. A Launch intent copies this index before it enters
+/// the coordinator queue, so later swipes cannot retarget an already-requested
+/// launch. Defaults to 0 (Fluid Box).
+std::atomic<uint32_t> s_launcher_index{0};
+
 /// Per-lane quiesce acknowledgement bits (never an ambiguous counter): each
 /// lane sets its own bit exactly once per transition, after its last old-
 /// generation app callback returned. The coordinator clears the mask before
@@ -154,8 +176,40 @@ uint32_t s_generation = 0;
 
 constexpr uint32_t kBarrierTimeoutMs = 500;  // fail-closed quiesce deadline
 
+enum class RuntimeRequestKind : uint8_t {
+    Launch = 0,
+    Home = 1,
+};
+
+/// Queue payload binds a Launch to the page selected when the input was
+/// classified. `app_index` is ignored for Home.
+struct RuntimeRequest {
+    RuntimeRequestKind kind;
+    uint32_t app_index;
+};
+
 /// Small bounded request queue; consumed exclusively on the ESP main task.
 QueueHandle_t s_request_queue = nullptr;
+
+RuntimeRequest selected_launch_request()
+{
+    return {RuntimeRequestKind::Launch,
+            s_launcher_index.load(std::memory_order_acquire)};
+}
+
+constexpr RuntimeRequest home_request()
+{
+    return {RuntimeRequestKind::Home, kNoAppIndex};
+}
+
+esp_err_t enqueue_request(const RuntimeRequest &request)
+{
+    const QueueHandle_t queue = s_request_queue;
+    if (queue == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return xQueueSend(queue, &request, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
+}
 
 // ---------------------------------------------------------------------------
 // Shell service instances + transport binding (moved out of app_main).
@@ -232,6 +286,82 @@ void emit_reboot_marker()
 // Per-frame display DMA wait (render task only): cumulative counter delta
 // measured around the app's render(), printed by the telemetry line.
 uint32_t s_last_frame_dma_us = 0;
+
+// ---------------------------------------------------------------------------
+// Live system telemetry — cached persistent handles + <=1 Hz render-lane
+// sampling. No new task and no allocation: each sample performs the exact
+// ESP-IDF heap inventory required for largest-allocatable-block metrics, then
+// reaches the running app through App::on_system_telemetry().
+// ---------------------------------------------------------------------------
+
+/// Persistent task handles, cached exactly once at boot. Each slot is written
+/// by its owner (or resolved by name right after console startup) before the
+/// first 1 Hz sample; a null slot marks that task invalid/unresolved.
+std::atomic<TaskHandle_t> s_coordinator_task{nullptr};  ///< ESP main task (runtime_run).
+std::atomic<TaskHandle_t> s_sensor_task{nullptr};       ///< sensor lane.
+std::atomic<TaskHandle_t> s_update_task{nullptr};       ///< physics/update lane.
+std::atomic<TaskHandle_t> s_render_task{nullptr};       ///< render lane.
+std::atomic<TaskHandle_t> s_console_task{nullptr};      ///< USB dev REPL ("console_repl").
+
+/// Fill one fixed-roster slot from its cached persistent handle. A null
+/// handle leaves the slot invalid-marked. The uxTaskGetStackHighWaterMark2
+/// result is in words (the kernel divides by sizeof(StackType_t)).
+void fill_task_telemetry(SystemTaskTelemetry &out, SystemTaskKind kind,
+                         std::atomic<TaskHandle_t> &handle)
+{
+    out.kind = kind;
+    const TaskHandle_t task = handle.load(std::memory_order_acquire);
+    if (task == nullptr) {
+        out.state = SystemTaskState::Unknown;
+        out.core_id = -1;
+        out.stack_high_water_words = 0;
+        out.valid = false;
+        return;
+    }
+    out.valid = true;
+    // Conservative FreeRTOS state mapping; eDeleted/eInvalid -> Unknown.
+    switch (eTaskGetState(task)) {
+        case eRunning: out.state = SystemTaskState::Running; break;
+        case eReady: out.state = SystemTaskState::Ready; break;
+        case eBlocked: out.state = SystemTaskState::Blocked; break;
+        case eSuspended: out.state = SystemTaskState::Suspended; break;
+        default: out.state = SystemTaskState::Unknown; break;
+    }
+    const BaseType_t core = xTaskGetCoreID(task);
+    out.core_id = core == tskNO_AFFINITY ? -1 : static_cast<int8_t>(core);
+    out.stack_high_water_words =
+        static_cast<uint32_t>(uxTaskGetStackHighWaterMark2(task));
+}
+
+/// Sample the aggregate INTERNAL|8BIT heap exactly (including the largest
+/// currently allocatable block), read the constant-time SPIRAM|8BIT free
+/// counter, and map the fixed 5-slot task roster into one stack-local
+/// SystemTelemetry. Render lane only, at the 1 Hz telemetry gate, after the
+/// frame callback and outside console dumps.
+void sample_system_telemetry(App *app, uint32_t generation)
+{
+    SystemTelemetry telemetry{};
+    telemetry.generation = generation;
+
+    multi_heap_info_t info{};
+    heap_caps_get_info(&info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    telemetry.internal_free_bytes = static_cast<uint32_t>(info.total_free_bytes);
+    telemetry.internal_largest_free_block =
+        static_cast<uint32_t>(info.largest_free_block);
+
+    telemetry.psram_free_bytes = static_cast<uint32_t>(
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
+    // Fixed roster order: Coordinator, Sensor, Update, Render, Console.
+    fill_task_telemetry(telemetry.tasks[0], SystemTaskKind::Coordinator,
+                        s_coordinator_task);
+    fill_task_telemetry(telemetry.tasks[1], SystemTaskKind::Sensor, s_sensor_task);
+    fill_task_telemetry(telemetry.tasks[2], SystemTaskKind::Update, s_update_task);
+    fill_task_telemetry(telemetry.tasks[3], SystemTaskKind::Render, s_render_task);
+    fill_task_telemetry(telemetry.tasks[4], SystemTaskKind::Console, s_console_task);
+
+    app->on_system_telemetry(telemetry);
+}
 
 // ---------------------------------------------------------------------------
 // Utilities.
@@ -329,14 +459,19 @@ uint32_t dispatch_step(uint32_t *seen_gen, TickType_t *last_wake, uint32_t ack_b
 // dev-console synthetic gesture FIFO plus physical button and IRQ-latched
 // touch polling in every mode. Motion ticks and app callbacks stop when the
 // committed mode is Launcher or a transition is parked. PLUS routes to the
-// app while Running or to Launch from launcher; a touch on the selected
-// launcher entry also requests Launch. Short PWR routes Home while Running
-// and no-ops at launcher.
+// app while Running or to Launch from the launcher. At the launcher one
+// contact is tracked Begin -> End: a swipe changes the selection exactly
+// once, after release, and a non-swipe release inside the selected entry
+// requests Launch; short PWR routes Home while Running and is a no-op at the
+// launcher. Running apps receive exactly one Begin per contact.
 // ---------------------------------------------------------------------------
 
 void sensor_task(void *arg)
 {
     static_cast<void>(arg);
+
+    // Cache this lane's persistent handle for the live telemetry sampler.
+    s_sensor_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
 
     // Sentinel forces the first observed generation through dispatch_step:
     // a boot-time queued transition cannot make this lane miss its quiesce ack.
@@ -345,32 +480,44 @@ void sensor_task(void *arg)
     uint32_t last_err_log_s = 0;
     uint32_t last_touch_err_log_s = UINT32_MAX;
     // Sensor-originated target requests are never dropped on coordinator
-    // queue backpressure. Launch/Home are idempotent target intents, so one
-    // retained slot is sufficient while the committed mode is unchanged.
-    RuntimeRequest pending_request = RuntimeRequest::Launch;
+    // queue backpressure. The retained payload includes the selected launcher
+    // index, so a later swipe cannot retarget an older Launch intent.
+    RuntimeRequest pending_request{RuntimeRequestKind::Launch, 0};
     bool request_pending = false;
     auto enqueue_or_retain = [&](RuntimeRequest request) {
         if (request_pending) {
             pending_request = request;
             return;
         }
-        if (runtime_enqueue_request(request) != ESP_OK) {
+        if (enqueue_request(request) != ESP_OK) {
             pending_request = request;
             request_pending = true;
         }
     };
+    // Launcher swipe/tap tracking: one contact from its Begin to its End, so
+    // a swipe changes the selection exactly once and only after the release.
+    // Any non-Launcher generation clears it before that generation's touch
+    // report is consumed, so contacts can never cross a lifecycle boundary.
+    bool launcher_contact_ = false;
+    uint16_t launcher_contact_x_ = 0;
+    uint16_t launcher_contact_y_ = 0;
     TickType_t last_wake = xTaskGetTickCount();
     for (;;) {
         vTaskDelayUntil(&last_wake, kSensorPeriodTicks);
         const uint32_t word = dispatch_step(&seen_gen, &last_wake, kAckSensor);
         const AppMode mode = word_mode(word);
+        if (mode != AppMode::Launcher) {
+            launcher_contact_ = false;
+        }
         const bool app_active = mode == AppMode::Running;
-        if (request_pending &&
-            runtime_enqueue_request(pending_request) == ESP_OK) {
+        // Decode the running app from this lane's one acquired dispatch word;
+        // valid whenever the word mode is Running.
+        App *app = app_at_index(word & kAppIndexMask);
+        if (request_pending && enqueue_request(pending_request) == ESP_OK) {
             request_pending = false;
         }
 
-        if (app_active) {
+        if (app_active && app != nullptr) {
             // --- raw motion via MotionService: poll + dt clamp + override ---
             const MotionTick tick = s_motion.motion_tick();
             const esp_err_t motion_err = s_motion.last_read_error();
@@ -385,49 +532,77 @@ void sensor_task(void *arg)
             // its IMU time anchor only when the app accepts a fresh physical
             // sample; a rejected sample re-clamps against the previous
             // accepted anchor. An active override still publishes verbatim.
-            s_motion.acknowledge(s_fluid_app.on_motion(tick));
+            s_motion.acknowledge(app->on_motion(tick));
         }
 
-        // --- shell input: buttons preserve their existing launch/reset/home
-        // --- behavior. Touch reports are consumed in every mode, but only the
-        // --- visible selected launcher target has touch semantics; no app
-        // --- callback or lifecycle work runs directly from this lane.
-        const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
-        ButtonEvent event;
-        const bool button_emitted = s_input.poll(now_ms, &event);
-        if (button_emitted) {
-            if (event == ButtonEvent::PlusPress) {
-                if (mode == AppMode::Running) {
-                    // PLUS while Fluid runs resets the simulation.
-                    static_cast<void>(s_fluid_app.handle_event(AppEvent::PlusPress));
-                } else if (mode == AppMode::Launcher) {
-                    // PLUS from the launcher launches Fluid. During a
-                    // Transition the event is dropped (no lifecycle work).
-                    enqueue_or_retain(RuntimeRequest::Launch);
-                }
-            } else if (event == ButtonEvent::PwrShort) {
-                if (mode == AppMode::Running) {
-                    // Short PWR while Fluid runs returns to the launcher;
-                    // InputService guarantees this is never a leftover of a
-                    // long hold (poweroff_sent suppression).
-                    enqueue_or_retain(RuntimeRequest::Home);
-                }
-                // Short PWR at the launcher: nothing to return to — no-op.
-            }
-        }
 
         TouchEvent touch;
         if (s_input.poll_touch(&touch)) {
-            if (!button_emitted && mode == AppMode::Launcher &&
-                launcher_accepts_launch_touch(touch.x, touch.y)) {
-                ESP_LOGI(kTag, "touch launch x=%u y=%u",
-                         static_cast<unsigned>(touch.x),
-                         static_cast<unsigned>(touch.y));
-                enqueue_or_retain(RuntimeRequest::Launch);
+            // Every contact-qualified report is forwarded independently of
+            // simultaneous button emission: while Running the decoded app
+            // receives exactly one Begin per physical contact (Move/End are
+            // shell-internal), even when the same poll also fired a button.
+            // At the launcher, one contact is tracked from its Begin to its
+            // End so a swipe changes the selection exactly once, after
+            // release; only a non-swipe release inside the selected entry
+            // requests Launch. Duplicate Launch intents (button + touch in
+            // one poll) are harmless: the retained-slot coalescing plus the
+            // same-target no-op in commit_transition make them idempotent.
+            if (mode == AppMode::Running && app != nullptr) {
+                if (touch.phase == TouchPhase::Begin) {
+                    app->on_touch(touch);
+                }
+            } else if (mode == AppMode::Launcher) {
+                if (touch.phase == TouchPhase::Begin) {
+                    launcher_contact_ = true;
+                    launcher_contact_x_ = touch.x;
+                    launcher_contact_y_ = touch.y;
+                } else if (touch.phase == TouchPhase::End) {
+                    if (launcher_contact_) {
+                        launcher_contact_ = false;
+                        // Controller gesture wins; dominant horizontal travel
+                        // >= kLauncherSwipeMinPx is the software fallback.
+                        // Swipe maps: left -> next, right -> previous,
+                        // wrapping around the registry.
+                        const TouchGesture gesture = launcher_swipe_gesture(
+                            touch.gesture, launcher_contact_x_,
+                            launcher_contact_y_, touch.x, touch.y);
+                        if (gesture == TouchGesture::SwipeLeft) {
+                            const uint32_t next =
+                                (s_launcher_index.load(std::memory_order_relaxed) + 1) %
+                                static_cast<uint32_t>(kRegistryCount);
+                            s_launcher_index.store(next, std::memory_order_release);
+                            ESP_LOGI(kTag, "swipe left - launcher selection %u: %s",
+                                     static_cast<unsigned>(next),
+                                     kRegistry[next].label);
+                        } else if (gesture == TouchGesture::SwipeRight) {
+                            const uint32_t prev =
+                                (s_launcher_index.load(std::memory_order_relaxed) +
+                                 static_cast<uint32_t>(kRegistryCount) - 1u) %
+                                static_cast<uint32_t>(kRegistryCount);
+                            s_launcher_index.store(prev, std::memory_order_release);
+                            ESP_LOGI(kTag, "swipe right - launcher selection %u: %s",
+                                     static_cast<unsigned>(prev),
+                                     kRegistry[prev].label);
+                        } else if (launcher_accepts_launch_touch(touch.x, touch.y)) {
+                            ESP_LOGI(kTag, "touch launch x=%u y=%u",
+                                     static_cast<unsigned>(touch.x),
+                                     static_cast<unsigned>(touch.y));
+                            enqueue_or_retain(selected_launch_request());
+                        }
+                    }
+                }
+                // Move: only exercises the contact; End classifies the whole
+                // contact, so selection never moves mid-drag.
             }
         } else {
             const esp_err_t touch_err = s_input.last_touch_error();
             if (touch_err != ESP_OK) {
+                // InputService quarantines its retained contact until a
+                // confirmed release after a lost report. Cancel the
+                // independent launcher classifier in the same iteration so
+                // neither state machine can act on an uncertain fragment.
+                launcher_contact_ = false;
                 const uint32_t now_s =
                     static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
                 if (now_s != last_touch_err_log_s && !s_console.dump_active()) {
@@ -435,6 +610,41 @@ void sensor_task(void *arg)
                     ESP_LOGW(kTag, "board_read_touch failed: %s",
                              esp_err_to_name(touch_err));
                 }
+            }
+        }
+        // --- shell input: buttons preserve their existing launch/reset/home
+        // --- behavior. PlusPress while Running resets the decoded app; short
+        // --- PWR at the launcher is a no-op. Touch reports are consumed in
+        // --- every mode: while Running only the Begin of each contact reaches
+        // --- the decoded app (on_touch, a default no-op); at the launcher one
+        // --- contact is tracked to its End, where a swipe moves the selection
+        // --- once and a non-swipe release inside the selected entry requests
+        // --- Launch. No lifecycle/transition work runs directly from this
+        // --- lane.
+        const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+        ButtonEvent event;
+        const bool button_emitted = s_input.poll(now_ms, &event);
+        if (button_emitted) {
+            if (event == ButtonEvent::PlusPress) {
+                if (mode == AppMode::Running && app != nullptr) {
+                    // PLUS while an app runs requests its app-defined reset.
+                    static_cast<void>(app->handle_event(AppEvent::PlusPress));
+                } else if (mode == AppMode::Launcher) {
+                    // Touch is classified before buttons in this iteration,
+                    // so a simultaneous swipe deterministically selects the
+                    // page copied into this Launch intent. During Transition
+                    // the event is dropped (no lifecycle work).
+                    enqueue_or_retain(selected_launch_request());
+                }
+            } else if (event == ButtonEvent::PwrShort) {
+                if (mode == AppMode::Running) {
+                    // Short PWR while an app runs returns to the launcher;
+                    // InputService guarantees this is never a leftover of a
+                    // long hold (poweroff_sent suppression).
+                    enqueue_or_retain(home_request());
+                }
+                // Short PWR at the launcher is a deliberate no-op: selection
+                // is moved by swipes only; a long hold still powers off.
             }
         }
         // Always give the watched idle task a scheduling window, even if an
@@ -453,6 +663,9 @@ void physics_task(void *arg)
 {
     static_cast<void>(arg);
 
+    // Cache this lane's persistent handle for the live telemetry sampler.
+    s_update_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+
     // Sentinel forces the first observed generation through dispatch_step.
     uint32_t seen_gen = UINT32_MAX;
 
@@ -465,10 +678,17 @@ void physics_task(void *arg)
             vTaskDelay(1);
             continue;
         }
+        // Decode the running app from this lane's one acquired dispatch word;
+        // a Running word always carries a valid registry index.
+        App *app = app_at_index(word & kAppIndexMask);
+        if (app == nullptr) {
+            vTaskDelay(1);
+            continue;
+        }
 
         // Pending reset consumption, motion read, PBF step and snapshot
         // publish all live inside the app (update lane).
-        static_cast<void>(s_fluid_app.update(fluid_demo::App::kPhysicsDt));
+        static_cast<void>(app->update(fluid_demo::App::kPhysicsDt));
 
         // vTaskDelayUntil() does not block after an overrun. One tick here
         // guarantees idle/watchdog service without changing on-time cadence.
@@ -482,17 +702,17 @@ void physics_task(void *arg)
 // feeding the task watchdog, exactly like the dump gate.
 // ---------------------------------------------------------------------------
 
-void log_telemetry()
+void log_telemetry(App *app, size_t app_index)
 {
-    const AppStats st = s_fluid_app.stats();
+    const AppStats st = app->stats();
     const uint64_t current_checks = st.candidate_checks;
-    static uint64_t last_candidate_checks = 0;
+    static uint64_t last_candidate_checks[kRegistryCount] = {};
+    uint64_t &last_checks = last_candidate_checks[app_index];
     const uint64_t candidate_delta =
-        current_checks >= last_candidate_checks
-            ? current_checks - last_candidate_checks
+        current_checks >= last_checks
+            ? current_checks - last_checks
             : current_checks;  // reset() clears the per-run counter
-    last_candidate_checks = current_checks;
-
+    last_checks = current_checks;
     ESP_LOGI(kTag,
              "count=%u epoch=%u phys=%uus raster=%uus dma=%uus frame=%uus "
              "cand/s=%llu raw=(%.2f,%.2f,%.2f) sim=(%.2f,%.2f,%.2f) "
@@ -520,6 +740,10 @@ void render_task(void *arg)
 {
     static_cast<void>(arg);
 
+    // Cache this lane's persistent handle for the live telemetry sampler
+    // (written before the 1 Hz gate, so it is always valid when sampled).
+    s_render_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+
     // Sentinel forces the first observed generation through dispatch_step.
     uint32_t seen_gen = UINT32_MAX;
 
@@ -543,10 +767,19 @@ void render_task(void *arg)
                 last_wake = xTaskGetTickCount();
                 continue;
             }
-            // Launcher stable mode: draw the full launcher frame through the
-            // same bound DisplayFrame transport at the 30 Hz render cadence.
-            // No app telemetry exists here.
-            static_cast<void>(render_launcher(s_display_frame));
+            // Launcher stable mode: draw the selected entry's launcher frame
+            // through the same bound DisplayFrame transport at the 30 Hz
+            // render cadence. Load the selection exactly once, bounds-resolve
+            // its App, and pass that app's launcher visual descriptor with
+            // the selection and registry count for the page-dot highlight;
+            // null (the default, or an out-of-range selection) renders the
+            // exact built-in Fluid launcher. No app telemetry exists here.
+            const uint32_t selected =
+                s_launcher_index.load(std::memory_order_acquire);
+            App *const app = app_at_index(selected);
+            static_cast<void>(render_launcher(
+                s_display_frame, app != nullptr ? app->launcher_visual() : nullptr,
+                selected, static_cast<uint32_t>(kRegistryCount)));
             vTaskDelay(1);
             continue;
         }
@@ -558,6 +791,15 @@ void render_task(void *arg)
             continue;
         }
 
+        // Decode the running app from this lane's one acquired dispatch word;
+        // a Running word always carries a valid registry index.
+        const uint32_t app_index = word & kAppIndexMask;
+        App *app = app_at_index(app_index);
+        if (app == nullptr) {
+            vTaskDelay(1);
+            continue;
+        }
+
         // Per-frame display DMA wait: cumulative counter delta across the
         // app's render call. The delta is stored only when a frame was
         // actually rendered — a blank pass (no new snapshot) or a failed
@@ -565,16 +807,21 @@ void render_task(void *arg)
         // frame's coherent timing tuple is preserved. Kept in sync with the
         // app's own last-frame raster/frame telemetry for the composed line.
         const uint32_t dma_wait_begin = s_display.dma_wait_us();
-        if (s_fluid_app.render(s_display_frame)) {
+        if (app->render(s_display_frame)) {
             s_last_frame_dma_us = s_display.dma_wait_us() - dma_wait_begin;
         }
 
         // Once-a-second telemetry (only while an app runs; the line itself is
-        // byte-identical to the pre-split output).
+        // byte-identical to the pre-split output, sourced from the decoded
+        // running app's stats). The live system snapshot shares this exact
+        // <=1 Hz gate: sampled into stack storage here, after the frame
+        // callback above and never during console dumps, and delivered to the
+        // running app with the render generation before the log line.
         const uint32_t now_s = static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
         if (now_s != last_log_s && !s_console.dump_active()) {
             last_log_s = now_s;
-            log_telemetry();
+            sample_system_telemetry(app, word >> kAppGenShift);
+            log_telemetry(app, app_index);
         }
         // Same overrun guard as physics: harmless while on schedule.
         vTaskDelay(1);
@@ -601,17 +848,25 @@ void commit_transition(RuntimeRequest request)
     const RegistryEntry *old_app = s_active_app;
     // nullptr target means the launcher stable mode.
     const RegistryEntry *next_app = nullptr;
-    switch (request) {
-        case RuntimeRequest::Launch:
-            // PLUS from the launcher: Fluid Box is selected but not running.
+    uint32_t next_index = kNoAppIndex;
+    switch (request.kind) {
+        case RuntimeRequestKind::Launch:
+            // PLUS/touch from the launcher: launch the page bound into this
+            // intent before it entered the queue. Bounded: an out-of-range
+            // payload can never launch outside the registry.
             if (s_mode != AppMode::Launcher) {
                 return;
             }
-            next_app = &kRegistry[0];
+            next_index = request.app_index;
+            if (next_index >= kRegistryCount) {
+                next_index = 0;
+            }
+            next_app = &kRegistry[next_index];
             break;
-        case RuntimeRequest::Home:
-            // Short PWR while Fluid runs: return to the launcher. A short
-            // PWR at the launcher is a no-op by design.
+        case RuntimeRequestKind::Home:
+            // Short PWR while an app runs: return to the launcher (generic;
+            // the selection is preserved across Home). A short PWR at the
+            // launcher is a no-op and never enqueues Home.
             if (s_mode != AppMode::Running) {
                 return;
             }
@@ -619,9 +874,6 @@ void commit_transition(RuntimeRequest request)
         default:
             return;  // defensive; the queue only ever carries the above
     }
-    const uint32_t next_index = next_app != nullptr
-                                    ? static_cast<uint32_t>(next_app - kRegistry)
-                                    : kNoAppIndex;
 
     // 1. Publish Quiesce: clear per-lane ack bits, mode=Transition, bump the
     //    generation, store the packed (kNoAppIndex, Transition, gen) word
@@ -697,16 +949,6 @@ const RegistryEntry *registry()
     return kRegistry;
 }
 
-esp_err_t runtime_enqueue_request(RuntimeRequest request)
-{
-    // Thread-safe (console REPL -> coordinator); never blocks and never runs
-    // the transition inline.
-    const QueueHandle_t queue = s_request_queue;
-    if (queue == nullptr) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return xQueueSend(queue, &request, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
-}
 
 const char *runtime_mode_name()
 {
@@ -720,6 +962,10 @@ const char *runtime_mode_name()
     if (s_request_queue == nullptr) {
         fatal_startup("request queue create", ESP_ERR_NO_MEM);
     }
+
+    // Cache this task's persistent handle for the live telemetry sampler:
+    // the coordinator runs forever on the ESP main task.
+    s_coordinator_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
 
     log_startup_info();
 
@@ -739,10 +985,16 @@ const char *runtime_mode_name()
     }
     bind_display_frame();
 
-    ESP_LOGI(kTag, "fluid app init");
-    err = s_fluid_app.setup_once();
-    if (err != ESP_OK) {
-        fatal_startup("fluid app init", err);
+    // Setup every registered app exactly once, in registry order, before the
+    // lanes start.
+    // No app's enter() runs here; the first Launch performs it inside the
+    // full barrier.
+    for (size_t i = 0; i < kRegistryCount; ++i) {
+        ESP_LOGI(kTag, "app init: %s", kRegistry[i].id);
+        err = kRegistry[i].app->setup_once();
+        if (err != ESP_OK) {
+            fatal_startup("app init", err);
+        }
     }
 
     // The console binds the shell's DisplayService (capture), MotionService
@@ -753,6 +1005,11 @@ const char *runtime_mode_name()
     if (err != ESP_OK) {
         fatal_startup("console service init", err);
     }
+    // Resolve the dev REPL's task handle exactly once, right after console
+    // startup (the USB Serial/JTAG REPL task exists as soon as start()
+    // returns). A nullptr lookup marks the Console slot invalid for the
+    // telemetry sampler — it is never retried.
+    s_console_task.store(xTaskGetHandle("console_repl"), std::memory_order_release);
 
     // InputService terminal-action markers: emit and flush the console's wire
     // marker immediately before restart/power-off from the sensor lane. Each
@@ -760,12 +1017,13 @@ const char *runtime_mode_name()
     s_input.set_reboot_marker(&emit_reboot_marker);
     s_input.set_power_off_marker(&emit_poweroff_marker);
 
-    // Boot stable mode is Launcher: the Fluid app's setup_once() above ran
-    // exactly once, but enter() is deliberately deferred — the first Launch
-    // (PLUS from the launcher) performs it inside the full barrier. Publishing
-    // the (Launcher, gen 0) word before the lanes start means each lane's
-    // first acquire load sees the stable mode: sensor polls buttons, render
-    // draws the launcher, physics parks. No lifecycle work runs at boot.
+    // Boot stable mode is Launcher: every registered app's setup_once() above
+    // ran exactly once, but enter() is deliberately deferred — the first
+    // Launch (PLUS or accepted launcher touch) performs it inside the full
+    // barrier. Publishing the (Launcher, gen 0) word before the lanes start
+    // means each lane's first acquire load sees the stable mode: sensor polls
+    // buttons, render draws the selected launcher, physics parks. No
+    // lifecycle work runs at boot.
     s_active_app = nullptr;
     s_mode = AppMode::Launcher;
     s_generation = 0;
@@ -794,7 +1052,7 @@ const char *runtime_mode_name()
 
     ESP_LOGI(kTag,
              "coordinator live: %u registered app(s), launcher boot stable, "
-             "PLUS/touch launch / short PWR home",
+             "PLUS/tap launch selected, swipe cycle, short PWR home",
              static_cast<unsigned>(kRegistryCount));
 
     // Coordinator loop on the ESP main task; transitions run synchronously,

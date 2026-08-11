@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "app_shell.hpp"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 
@@ -15,11 +16,8 @@ enum class ButtonEvent : uint8_t {
     PwrShort = 1,   ///< Validated PWR release < kPowerOffHoldMs, never after a long hold.
 };
 
-/// One fresh, native-orientation touch report from the shell-owned controller.
-struct TouchEvent {
-    uint16_t x = 0;
-    uint16_t y = 0;
-};
+// TouchEvent is defined in app_shell.hpp (shared with the app dispatch path)
+// and consumed here without a duplicate definition.
 
 /// Synthetic button id for the dev-console `input <plus|pwr|boot>` command.
 enum class ButtonId : uint8_t {
@@ -86,9 +84,16 @@ public:
     /// the first event in that order wins the single out slot.
     bool poll(uint32_t now_ms, ButtonEvent *out);
 
-    /// Consume controller reports and emit one event per physical contact.
-    /// Repeated pressed reports are suppressed until an explicit zero-finger
-    /// release report re-arms the shell. Board owns all GPIO/I2C access.
+    /// Consume controller reports and emit events in touch phase order: the
+    /// first fresh pressed report of a contact emits Begin, every following
+    /// fresh pressed report emits Move, and the zero-finger release report
+    /// emits exactly one End carrying the last pressed coordinates retained
+    /// here plus the controller-encoded gesture. Exactly one Begin is emitted
+    /// per uninterrupted physical contact. A terminal report-read error drops
+    /// the retained contact and ignores pressed reports until a confirmed
+    /// finger-up report re-arms input, preventing both cross-contact motion
+    /// and a second Begin from the same still-down finger. Board owns all
+    /// GPIO/I2C access.
     bool poll_touch(TouchEvent *out);
 
     esp_err_t last_touch_error() const { return last_touch_error_; }
@@ -159,7 +164,16 @@ private:
     BootButton boot_;
     ResetButton reset_button_;
     PowerButton power_button_;
+
+    /// Per-contact touch state: active while the contact is down (gates Begin
+    /// to once per contact); the last pressed coordinates feed the End event
+    /// because the controller drops coordinates on the finger-up report.
     bool touch_contact_active_ = false;
+    // Fail-closed quarantine after an uncertain report: pressed reports are
+    // ignored until a zero-finger release proves the contact boundary.
+    bool touch_contact_cancelled_ = false;
+    uint16_t touch_last_x_ = 0;
+    uint16_t touch_last_y_ = 0;
     esp_err_t last_touch_error_ = ESP_OK;
 };
 

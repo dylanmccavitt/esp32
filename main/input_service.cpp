@@ -47,20 +47,69 @@ bool InputService::poll_touch(TouchEvent *out)
 {
     TouchSample sample{};
     last_touch_error_ = fluid_demo::board_read_touch(&sample);
-    if (last_touch_error_ != ESP_OK || !sample.fresh) {
+    if (last_touch_error_ != ESP_OK) {
+        // Fail closed when the controller's short report window is lost.
+        // The missing report could be any phase. Drop the retained contact
+        // and quarantine pressed reports until an explicit finger-up report;
+        // otherwise a later report from the same finger could become a second
+        // Begin, or a new contact could complete the old one.
+        touch_contact_active_ = false;
+        touch_contact_cancelled_ = true;
+        return false;
+    }
+    if (!sample.fresh) {
+        return false;
+    }
+    if (touch_contact_cancelled_) {
+        // Consume the remainder of the uncertain physical contact without
+        // emitting Begin/Move/End. If the lost report was already End, this
+        // deliberately drops the next complete contact and uses its release
+        // only to re-arm; false launcher/app actions are worse than one
+        // ignored touch after a transport failure.
+        if (!sample.pressed) {
+            touch_contact_cancelled_ = false;
+        }
         return false;
     }
     if (!sample.pressed) {
+        // Release report: coordinates are dropped by the board, so the End
+        // event carries the last pressed coordinates retained above, plus the
+        // controller-encoded gesture from the release report. Re-arms the
+        // contact so the next physical contact emits a fresh Begin.
+        const bool was_active = touch_contact_active_;
         touch_contact_active_ = false;
-        return false;
+        if (was_active && out != nullptr) {
+            out->x = touch_last_x_;
+            out->y = touch_last_y_;
+            out->phase = TouchPhase::End;
+            out->gesture = sample.gesture;
+        }
+        return was_active;
     }
     if (touch_contact_active_) {
-        return false;
+        // Continuing contact: forward a Move with the fresh pressed
+        // coordinates and remember them for the eventual End event.
+        touch_last_x_ = sample.x;
+        touch_last_y_ = sample.y;
+        if (out != nullptr) {
+            out->x = sample.x;
+            out->y = sample.y;
+            out->phase = TouchPhase::Move;
+            out->gesture = TouchGesture::None;
+        }
+        return true;
     }
+    // First pressed report of a new contact: Begin arms the contact. The
+    // gesture field is None on Begin/Move because the controller's gesture
+    // register only carries the just-completed contact's swipe.
     touch_contact_active_ = true;
+    touch_last_x_ = sample.x;
+    touch_last_y_ = sample.y;
     if (out != nullptr) {
         out->x = sample.x;
         out->y = sample.y;
+        out->phase = TouchPhase::Begin;
+        out->gesture = TouchGesture::None;
     }
     return true;
 }
