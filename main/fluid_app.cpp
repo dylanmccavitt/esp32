@@ -21,27 +21,27 @@ constexpr const char *kTag = "fluid_demo";
 // ---------------------------------------------------------------------------
 
 // Gravity / input. |apparent| = 9.0 sim units at full edge tilt.
-constexpr int kAccelQ8PerUnit = 28;      // raw px/frame^2 per sim unit
-constexpr int kAccelClampRaw = 512;      // +/-2 px/frame/axis per frame
+constexpr int kAccelQ8PerUnit = 64;      // raw px/frame^2 per sim unit
+constexpr int kAccelClampRaw = 1024;     // +/-4 px/frame/axis per frame
 // In-plane gravity hysteresis: arms at 0.75 (~5 deg, a deliberate hand
 // tilt), disarms below 0.6, so a resting desk (measured 0.40-0.51 on
 // this bench) can neither arm the pull nor hold it armed after play
 // (with the floor boost below, "on" is a 1/3 g yank).
 constexpr float kGravOn2 = 0.5625f;
 constexpr float kGravOff2 = 0.36f;
-// Below this magnitude (but above the deadzone) the acceleration is scaled
-// up to it, direction preserved: any visible tilt pulls airborne specks
-// down at >= 1/3 g instead of letting them drift like dust motes.
-constexpr float kAccelFloorUnits = 3.0f;
+// Below this magnitude (but above the disarm point) the acceleration is
+// scaled up to it, direction preserved: any armed tilt pulls airborne
+// specks down hard instead of letting them drift like dust motes.
+constexpr float kAccelFloorUnits = 4.0f;
 
 // Motion.
 constexpr int kDragShift = 7;      // v -= v>>7 per frame (~0.992)
 // With gravity off (flat) strays brake hard so nothing ghost-drifts
 // through the air for seconds; they stop and rest on the glass.
 constexpr int kFlatDragShift = 4;  // v -= v>>4 per frame (~0.94)
-constexpr int kVmaxRaw = 2560;     // 10 px/frame per axis (300 px/s)
-constexpr int kMaxWalkSteps = 12;  // per particle per frame
-// 75% of the reachable walk-step ceiling (3000 particles * (12+4) guard);
+constexpr int kVmaxRaw = 4096;     // 16 px/frame per axis (480 px/s)
+constexpr int kMaxWalkSteps = 18;  // per particle per frame (covers vmax)
+// 75% of the reachable walk-step ceiling (3000 particles * (18+4) guard);
 // past this the frame is under genuine overload and the brake engages.
 constexpr uint32_t kStepGovernor = (3000u * (kMaxWalkSteps + 4) * 3u) / 4u;
 constexpr int kGovernorDispRaw = 1024;  // 4 px displacement clamp when hit
@@ -60,8 +60,8 @@ constexpr int kPpTangNum = 230;     // particle hit: v_t *= 0.9; v_n = -(v_n>>1)
 // support-loss, so a vacated-support particle wakes and falls under
 // gravity instead of being launched upward (which self-pumps).
 constexpr int kKickTriggerRaw = 512;  // pre-impact |v_n| >= 2 px/frame
-constexpr int kKickUpRaw = 205;       // 0.8 px/frame anti-gravity per count
-constexpr int kKickLatRaw = 77;       // 0.3 px/frame random-sign lateral
+constexpr int kKickUpRaw = 307;       // 1.2 px/frame anti-gravity per count
+constexpr int kKickLatRaw = 115;      // 0.45 px/frame random-sign lateral
 
 // Leveling / sleep / wake.
 constexpr int kSlideMaxRaw = 205;   // water rule below 0.8 px/frame
@@ -79,7 +79,7 @@ constexpr float kRestGateMag = 0.6f;
 constexpr uint32_t kRestGateFrames = 15;
 
 // Speed -> palette level thresholds (Manhattan |vx|+|vy|, raw Q8.8).
-constexpr int kLevelThreshRaw[7] = {90, 205, 384, 640, 1024, 1536, 2304};
+constexpr int kLevelThreshRaw[7] = {90, 205, 448, 832, 1408, 2304, 3584};
 
 // Dim border ring marking the box walls (logical RGB565, swapped at setup).
 constexpr uint16_t kWallColor = 0x31A6;  // dark warm gray
