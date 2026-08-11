@@ -25,11 +25,12 @@ namespace fluid_demo {
 /// setup_once() and the end of the process.
 class FluidBoxApp final : public App {
 public:
-    /// Startup count. 343 (7^3) trades ~1.6x solver pair work for a finer
-    /// liquid; the count-scaled geometry baseline stays the namespace-level
-    /// kInitialParticles (216) in app_types.hpp, so spacing shrinks with the
-    /// count instead of inflating the occupied volume.
-    static constexpr uint16_t kInitialParticles = 343;
+    /// Startup count, capped by the measured physics budget: on hardware the
+    /// PBF step costs ~150 us per particle (32-33 ms at 216, 51-56 ms at 343
+    /// against the 33.3 ms step), so 216 is the 30 Hz ceiling. The namespace-
+    /// level kInitialParticles (app_types.hpp) is the geometry baseline; a
+    /// different startup count rescales spacing, not the occupied volume.
+    static constexpr uint16_t kInitialParticles = 216;
     static_assert(kInitialParticles >= kMinParticles &&
                       kInitialParticles <= kMaxParticles,
                   "startup count must stay within Fluid's supported range");
