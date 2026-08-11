@@ -1,5 +1,6 @@
 #include "fluid_app.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -16,15 +17,9 @@ namespace {
 constexpr const char *kTag = "fluid_demo";
 
 // Native square panel geometry (mirrors DisplayService constants; the app
-// drives sequencing through DisplayFrame ops, but the raster row strides here
-// are canonical and byte-identical to the pre-split renderer).
+// drives sequencing through DisplayFrame ops).
 constexpr int kWidth = 240;
 constexpr int kHeight = 240;
-constexpr int kSurfaceScale = 2;
-constexpr int kSurfaceWidth = kWidth / kSurfaceScale;
-constexpr int kSurfaceHeight = kHeight / kSurfaceScale;
-constexpr uint16_t kSurfaceThreshold = 40;
-constexpr uint16_t kSurfaceAaWidth = 28;
 
 // Physical volume: 27.72 mm square active LCD and 22.5 mm enclosure depth.
 // The front display is z=0; +z enters the case.
@@ -37,9 +32,20 @@ constexpr float kBoxDepthZ = 0.812f;
 constexpr float kFocal = 1.3f;
 constexpr float kPxPerWorld = 210.0f;
 
-// Depth buffer fixed point: 1/4096 world unit. All particle surfaces stay far
-// below 65535, so 0xFFFF (bytes 0xFF) is a valid "empty" marker.
+// Depth fixed point: 1/4096 world unit (Projected::z_fx sort key + fade).
 constexpr float kDepthFxScale = 4096.0f;
+
+// Depth-as-opacity: brightness loses up to this many /255 at the back wall.
+constexpr uint32_t kDepthFadeMax = 130;
+
+// Sprite shading: Lambert light direction (screen x right, y down, z toward
+// the viewer), normalized. Upper-left-front, matching the old rim light.
+constexpr float kLightX = -0.45f;
+constexpr float kLightY = -0.45f;
+constexpr float kLightZ = 0.77f;
+// Brightness ramp: dark rim floor to full highlight.
+constexpr int kShadeFloor = 70;
+constexpr int kShadeSpan = 185;
 
 // Dim wireframe color for the 3D box edges (drawn before particles).
 constexpr uint16_t kEdgeColor = 0x1905;  // dark blue-gray RGB565
@@ -73,31 +79,17 @@ esp_err_t FluidBoxApp::setup_once()
         return ESP_ERR_INVALID_ARG;
     }
 
-    const size_t surface_bytes =
-        (size_t)kSurfaceWidth * kSurfaceHeight * sizeof(uint16_t);
-    uint16_t *field = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    uint16_t *heat = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    uint16_t *depth = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     Projected *proj = static_cast<Projected *>(
         heap_caps_malloc(sizeof(Projected) * kMaxParticles, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
-    if (field == nullptr || heat == nullptr || depth == nullptr || proj == nullptr) {
-        heap_caps_free(field);
-        heap_caps_free(heat);
-        heap_caps_free(depth);
-        heap_caps_free(proj);
+    if (proj == nullptr) {
         ESP_LOGE(kTag, "fluid app buffer allocation failed");
         return ESP_ERR_NO_MEM;
     }
 
-    surface_field_ = field;
-    surface_heat_ = heat;
-    surface_depth_ = depth;
     proj_ = proj;
     build_luts();
+    build_sprites();
     // setup_once() initializes Fluid before the lanes start. Publish the same
     // initialized epoch/stats immediately so launcher-era telemetry cannot
     // expose the atomics' zero defaults while Fluid already holds epoch 1.
@@ -114,13 +106,7 @@ esp_err_t FluidBoxApp::setup_once()
 
 void FluidBoxApp::free_buffers()
 {
-    heap_caps_free(surface_field_);
-    heap_caps_free(surface_heat_);
-    heap_caps_free(surface_depth_);
     heap_caps_free(proj_);
-    surface_field_ = nullptr;
-    surface_heat_ = nullptr;
-    surface_depth_ = nullptr;
     proj_ = nullptr;
     setup_done_ = false;
 }
@@ -228,6 +214,9 @@ esp_err_t FluidBoxApp::update(float dt)
     // consumption point.
     if (reset_requested_.exchange(false)) {
         fluid_.reset();
+        frozen_ = false;
+        calm_frames_ = 0;
+        calm_frames_loose_ = 0;
         ESP_LOGI(kTag, "PLUS press - fluid reset (epoch %u)", fluid_.reset_epoch());
     }
 
@@ -239,6 +228,29 @@ esp_err_t FluidBoxApp::update(float dt)
     }
     portEXIT_CRITICAL(&motion_mux_);
 
+    // Calm freeze: while frozen, skip the solver but keep publishing the
+    // unchanged state so render cadence, captures and the exchange all keep
+    // working; identical input rasters byte-identical frames.
+    if (frozen_) {
+        const float dax = apparent.x - freeze_ref_.x;
+        const float day = apparent.y - freeze_ref_.y;
+        const float daz = apparent.z - freeze_ref_.z;
+        if (dax * dax + day * day + daz * daz >
+            kWakeAccelDelta * kWakeAccelDelta) {
+            frozen_ = false;
+            calm_frames_ = 0;
+            calm_frames_loose_ = 0;
+            ESP_LOGI(kTag, "fluid wake (accel delta)");
+        } else {
+            ParticleFrame *held = snapshots_.begin_write();
+            if (held != nullptr) {
+                fluid_.fill_frame(*held, ++sequence_);
+                snapshots_.publish(held);
+            }
+            return ESP_OK;
+        }
+    }
+
     // step() returns false only on a skip (never happens here: count is set at
     // boot and dt is fixed finite) or when nonfinite state forced a
     // deterministic reset — either way the frame below is still valid.
@@ -249,6 +261,26 @@ esp_err_t FluidBoxApp::update(float dt)
     epoch_.store(fluid_.reset_epoch());
     candidate_checks_.store(fluid_stats.candidate_checks);
     nonfinite_resets_.store(fluid_stats.nonfinite_resets);
+
+    // Calm detection, two tiers keyed on how many grains are still awake:
+    // tight (<= 2 awake for 1.5 s) or loose (<= 8 awake for 10 s). A couple
+    // of grains limit-cycling forever are exactly the "random jumpers" the
+    // freeze exists to stop, so they must not be able to hold the sim awake;
+    // the speed guard keeps a genuinely flying grain from being frozen
+    // mid-air. A pile frozen at its angle of repose is physical.
+    const float max_v = fluid_stats.last_max_speed;
+    const uint16_t awake = fluid_stats.awake_count;
+    const bool calm_tight = awake <= 2 && max_v < kCalmSpeedGuard;
+    const bool calm_loose = awake <= 8 && max_v < kCalmSpeedGuard;
+    calm_frames_ = calm_tight ? calm_frames_ + 1 : 0;
+    calm_frames_loose_ = calm_loose ? calm_frames_loose_ + 1 : 0;
+    if (!frozen_ &&
+        (calm_frames_ >= kCalmFrames || calm_frames_loose_ >= kCalmFramesLoose)) {
+        frozen_ = true;
+        freeze_ref_ = apparent;
+        ESP_LOGI(kTag, "fluid frozen (calm, awake=%u max_v=%.3f)",
+                 static_cast<unsigned>(awake), static_cast<double>(max_v));
+    }
 
     ParticleFrame *slot = snapshots_.begin_write();
     if (slot == nullptr) {
@@ -318,9 +350,9 @@ esp_err_t FluidBoxApp::render_frame(const ParticleFrame &frame, DisplayFrame &df
     const int count = (frame.count > kMaxParticles) ? kMaxParticles : frame.count;
     preproject(frame, count);
     project_box_edges();
-    const int64_t t_surface = esp_timer_get_time();
-    build_surface();
-    raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_surface);
+    const int64_t t_sort = esp_timer_get_time();
+    sort_back_to_front();
+    raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_sort);
 
     // Frame-boundary capture latch (the old renderer.cpp:602 exchange point).
     // The DisplayService mirrors when armed and re-arms on any mid-frame
@@ -337,7 +369,7 @@ esp_err_t FluidBoxApp::render_frame(const ParticleFrame &frame, DisplayFrame &df
         const int64_t t_raster = esp_timer_get_time();
         std::memset(buf, 0, static_cast<size_t>(df.width) * rows * sizeof(uint16_t));
         draw_box_edges(buf, y0, rows);
-        shade_surface(buf, y0, rows);
+        draw_particles(buf, y0, rows);
         raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_raster);
 
         // Mirror (if armed) -> wait for the previous transfer (including the
@@ -366,29 +398,72 @@ esp_err_t FluidBoxApp::render_frame(const ParticleFrame &frame, DisplayFrame &df
 }
 
 // ---------------------------------------------------------------------------
-// Raster helpers (moved verbatim from renderer.cpp)
+// Raster helpers (from renderer.cpp; splat support, iso-threshold, AA width and depth fade retuned)
 // ---------------------------------------------------------------------------
 
 void FluidBoxApp::build_luts()
 {
-    // sqrt/shade LUT: nz = sqrt(1 - t), t = (d/r)^2, in [0, 1].
-    // Used both for the front-surface depth reduction and the radial shade.
-    // Fixed point 0.16.
-    for (int i = 0; i < 256; i++) {
-        const float t = static_cast<float>(i) / 255.0f;
-        const float nz = std::sqrt(1.0f - t);
-        nz_lut_[i] = static_cast<uint16_t>(nz * 65535.0f + 0.5f);
-    }
-
     // Velocity palette: slow = blue/cyan, fast = orange/red (hue 230 -> 0 deg),
     // ramping saturation/value so slow particles are dim and fast ones glow.
     for (int i = 0; i < 256; i++) {
         const float u = static_cast<float>(i) / 255.0f;
         const float hue = (1.0f - u) * 230.0f;
         const float sat = 0.85f;
-        const float val = 0.45f + 0.55f * u;
+        const float val = 0.55f + 0.45f * u;  // floor keeps slow grains visible on black
         palette_[i] = hsv_to_rgb565(hue, sat, val);
     }
+}
+
+void FluidBoxApp::build_sprites()
+{
+    // One pre-shaded sphere per integer radius. Per pixel: sphere normal
+    // n = (dx/r, dy/r, sqrt(1 - t)) with t = (d/r)^2 (unit length by
+    // construction), Lambert against the fixed light, brightness ramped
+    // [kShadeFloor, kShadeFloor + kShadeSpan], premultiplied by a ~1 px
+    // antialiased rim coverage. 0 marks a fully transparent texel.
+    size_t at = 0;
+    sprite_off_[0] = 0;
+    for (int r = 1; r <= kMaxSpriteRadius; ++r) {
+        sprite_off_[r] = static_cast<uint16_t>(at);
+        const float rf = static_cast<float>(r);
+        for (int dy = -r; dy <= r; ++dy) {
+            for (int dx = -r; dx <= r; ++dx) {
+                const float d = std::sqrt(static_cast<float>(dx * dx + dy * dy));
+                float alpha = rf + 0.5f - d;
+                if (alpha <= 0.0f) {
+                    sprite_lut_[at++] = 0;
+                    continue;
+                }
+                if (alpha > 1.0f) {
+                    alpha = 1.0f;
+                }
+                float t = (static_cast<float>(dx * dx + dy * dy)) / (rf * rf);
+                if (t > 1.0f) {
+                    t = 1.0f;
+                }
+                const float nx = static_cast<float>(dx) / rf;
+                const float ny = static_cast<float>(dy) / rf;
+                const float nz = std::sqrt(1.0f - t);
+                float diffuse = nx * kLightX + ny * kLightY + nz * kLightZ;
+                if (diffuse < 0.0f) {
+                    diffuse = 0.0f;
+                }
+                const float shade =
+                    (static_cast<float>(kShadeFloor) + static_cast<float>(kShadeSpan) * diffuse) *
+                    alpha;
+                uint32_t value = static_cast<uint32_t>(shade + 0.5f);
+                if (value > 255u) {
+                    value = 255u;
+                }
+                if (value == 0u) {
+                    value = 1u;  // keep covered texels distinct from transparent
+                }
+                sprite_lut_[at++] = static_cast<uint8_t>(value);
+            }
+        }
+    }
+    ESP_LOGI(kTag, "sprite LUT built: radii 1..%d, %u bytes",
+             kMaxSpriteRadius, static_cast<unsigned>(at));
 }
 
 uint16_t FluidBoxApp::hsv_to_rgb565(float h, float s, float v)
@@ -443,26 +518,82 @@ void FluidBoxApp::preproject(const ParticleFrame &frame, int count)
             continue;
         }
         const float scale = kPxPerWorld * (kFocal / (kFocal + src.z));
-        const int sx = static_cast<int>(std::lrintf(kWidth * 0.5f + src.x * scale));
+        const float fx = kWidth * 0.5f + src.x * scale;
         // World +y is screen-up; particles rest at the bottom of the box.
-        const int sy = static_cast<int>(std::lrintf(kHeight * 0.5f - src.y * scale));
-        int rad = static_cast<int>(std::lrintf(radius_world * scale));
+        const float fy = kHeight * 0.5f - src.y * scale;
+        const float fr = radius_world * scale;
+
+        constexpr uint32_t kBoxDepthFx =
+            static_cast<uint32_t>(kBoxDepthZ * kDepthFxScale + 0.5f);
+        float zc = (src.z < 0.0f) ? 0.0f : src.z;
+        p.z_fx = static_cast<uint32_t>(zc * kDepthFxScale + 0.5f);
+        uint32_t drop = (p.z_fx * kDepthFadeMax) / kBoxDepthFx;
+        if (drop > kDepthFadeMax) {
+            drop = kDepthFadeMax;
+        }
+        const uint8_t fresh_fade = static_cast<uint8_t>(255u - drop);
+
+        const float sp = (src.speed < 0.0f) ? 0.0f : src.speed;
+        const uint8_t fresh_speed =
+            (sp >= kSpeedRef) ? 255u
+                              : static_cast<uint8_t>((sp / kSpeedRef) * 255.0f);
+
+        // Hysteresis: adopt fresh values only outside a small dead band so
+        // sub-pixel rest wobble never flips a rounded pixel or a color step.
+        DrawLatch &latch = latch_[i];
+        if (!latch.valid) {
+            latch.x = fx;
+            latch.y = fy;
+            latch.r = fr;
+            latch.speed_idx = fresh_speed;
+            latch.fade = fresh_fade;
+            latch.valid = 1;
+        } else {
+            if (std::fabs(fx - latch.x) >= 0.75f) latch.x = fx;
+            if (std::fabs(fy - latch.y) >= 0.75f) latch.y = fy;
+            if (std::fabs(fr - latch.r) >= 0.75f) latch.r = fr;
+            const int ds = static_cast<int>(fresh_speed) - static_cast<int>(latch.speed_idx);
+            if (ds >= 6 || ds <= -6) latch.speed_idx = fresh_speed;
+            const int df = static_cast<int>(fresh_fade) - static_cast<int>(latch.fade);
+            if (df >= 4 || df <= -4) latch.fade = fresh_fade;
+        }
+
+        int rad = static_cast<int>(std::lrintf(latch.r));
         if (rad < 1) {
             rad = 1;
         }
-        p.x = static_cast<int16_t>(sx);
-        p.y = static_cast<int16_t>(sy);
+        if (rad > kMaxSpriteRadius) {
+            rad = kMaxSpriteRadius;
+        }
+        p.x = static_cast<int16_t>(std::lrintf(latch.x));
+        p.y = static_cast<int16_t>(std::lrintf(latch.y));
         p.radius = static_cast<uint16_t>(rad);
-
-        float zc = (src.z < 0.0f) ? 0.0f : src.z;
-        p.z_fx = static_cast<uint32_t>(zc * kDepthFxScale + 0.5f);
-        p.rw_fx = static_cast<uint32_t>(radius_world * kDepthFxScale + 0.5f);
-
-        const float sp = (src.speed < 0.0f) ? 0.0f : src.speed;
-        p.speed_idx = (sp >= kSpeedRef) ? 255u
-                                        : static_cast<uint8_t>((sp / kSpeedRef) * 255.0f);
+        p.fade = latch.fade;
+        p.speed_idx = latch.speed_idx;
         p.active = 1;
     }
+}
+
+void FluidBoxApp::sort_back_to_front()
+{
+    // Painter's order: far particles first, near ones drawn over them. With
+    // temporal coherence std::sort on ~343 u16 indices costs tens of
+    // microseconds; no depth buffer or per-pixel blend is needed.
+    int n = 0;
+    for (int i = 0; i < active_count_; ++i) {
+        if (proj_[i].active) {
+            draw_order_[n++] = static_cast<uint16_t>(i);
+        }
+    }
+    active_count_ = n;
+    // Quantized depth key (1/64 world unit) with an index tie-break: beads at
+    // near-identical depth keep a fixed overlap order, so the solver's rest
+    // wobble cannot flutter the painter's order frame to frame.
+    std::sort(draw_order_, draw_order_ + n, [this](uint16_t a, uint16_t b) {
+        const uint32_t za = proj_[a].z_fx >> 6;
+        const uint32_t zb = proj_[b].z_fx >> 6;
+        return za != zb ? za > zb : a < b;
+    });
 }
 
 void FluidBoxApp::project_box_edges()
@@ -544,167 +675,53 @@ void FluidBoxApp::draw_box_edges(uint16_t *buf, int y0, int rows)
     }
 }
 
-void FluidBoxApp::build_surface()
+void FluidBoxApp::draw_particles(uint16_t *buf, int y0, int rows)
 {
-    constexpr size_t kSurfacePixels =
-        static_cast<size_t>(kSurfaceWidth) * kSurfaceHeight;
-    std::memset(surface_field_, 0, kSurfacePixels * sizeof(uint16_t));
-    std::memset(surface_heat_, 0, kSurfacePixels * sizeof(uint16_t));
-    std::memset(surface_depth_, 0xFF, kSurfacePixels * sizeof(uint16_t));
-
-    // Screen-space implicit surface. At half resolution, a support radius equal
-    // to the full-resolution particle radius is twice the drawn particle radius
-    // in screen space. Neighbor kernels therefore meet near the iso-threshold,
-    // turning the point cloud into one smooth liquid body.
-    for (int i = 0; i < active_count_; ++i) {
-        const Projected &p = proj_[i];
-        if (!p.active) {
+    // Painter's blit of pre-shaded sphere sprites, clipped to this stripe.
+    // Premultiplied sprite brightness scales the particle's velocity color;
+    // texel 0 is transparent, so each ball keeps a crisp antialiased edge and
+    // a subtle dark rim where it overlaps a deeper ball.
+    const int y1 = y0 + rows;
+    for (int n = 0; n < active_count_; ++n) {
+        const Projected &p = proj_[draw_order_[n]];
+        const int r = static_cast<int>(p.radius);
+        const int top = p.y - r;
+        const int bottom = p.y + r;
+        if (bottom < y0 || top >= y1) {
             continue;
         }
-        const int cx = p.x / kSurfaceScale;
-        const int cy = p.y / kSurfaceScale;
-        const int radius = max_int(static_cast<int>(p.radius), 2);
-        const uint32_t r2 = static_cast<uint32_t>(radius * radius);
-        const uint32_t d2_mul =
-            static_cast<uint32_t>((255.0f * 65536.0f) / static_cast<float>(r2) + 0.5f);
-        const int x0 = max_int(cx - radius, 0);
-        const int x1 = min_int(cx + radius, kSurfaceWidth - 1);
-        const int y0 = max_int(cy - radius, 0);
-        const int y1 = min_int(cy + radius, kSurfaceHeight - 1);
-
-        for (int y = y0; y <= y1; ++y) {
-            const int dy = y - cy;
-            const uint32_t dy2 = static_cast<uint32_t>(dy * dy);
-            const size_t row = static_cast<size_t>(y) * kSurfaceWidth;
-            for (int x = x0; x <= x1; ++x) {
-                const int dx = x - cx;
-                const uint32_t d2 = static_cast<uint32_t>(dx * dx) + dy2;
-                const uint32_t lut_idx = (d2 * d2_mul) >> 16;
-                if (lut_idx >= 256u) {
-                    continue;
-                }
-
-                const uint32_t falloff = 255u - lut_idx;
-                const uint32_t weight = (falloff * falloff) >> 8;
-                if (weight == 0u) {
-                    continue;
-                }
-                const size_t at = row + static_cast<size_t>(x);
-                const uint32_t field = surface_field_[at] + weight;
-                surface_field_[at] =
-                    static_cast<uint16_t>(field > UINT16_MAX ? UINT16_MAX : field);
-
-                // Store heat in field-weight units. Dividing heat by field when
-                // shading gives a smooth weighted velocity palette index.
-                const uint32_t heat_add = (weight * p.speed_idx + 127u) / 255u;
-                const uint32_t heat = surface_heat_[at] + heat_add;
-                surface_heat_[at] =
-                    static_cast<uint16_t>(heat > UINT16_MAX ? UINT16_MAX : heat);
-
-                const uint32_t nz = nz_lut_[lut_idx];
-                int32_t surf = static_cast<int32_t>(p.z_fx) -
-                               static_cast<int32_t>((p.rw_fx * nz) >> 16);
-                if (surf < 0) {
-                    surf = 0;
-                }
-                if (static_cast<uint32_t>(surf) < surface_depth_[at]) {
-                    surface_depth_[at] = static_cast<uint16_t>(surf);
-                }
-            }
+        const int row_a = max_int(top, y0);
+        const int row_b = min_int(bottom, y1 - 1);
+        const int x_a = max_int(p.x - r, 0);
+        const int x_b = min_int(p.x + r, kWidth - 1);
+        if (x_a > x_b) {
+            continue;
         }
-    }
-}
 
-void FluidBoxApp::shade_surface(uint16_t *buf, int y0, int rows)
-{
-    constexpr uint32_t kBoxDepthFx =
-        static_cast<uint32_t>(kBoxDepthZ * kDepthFxScale + 0.5f);
-    const int y1 = y0 + rows;
-    for (int y = y0; y < y1; ++y) {
-        const int sy = y / kSurfaceScale;
-        const int sy1 = min_int(sy + 1, kSurfaceHeight - 1);
-        const int sym = max_int(sy - 1, 0);
-        const int fy = y & 1;
-        const uint32_t wy0 = static_cast<uint32_t>(2 - fy);
-        const uint32_t wy1 = static_cast<uint32_t>(fy);
-        const size_t row0 = static_cast<size_t>(sy) * kSurfaceWidth;
-        const size_t row1 = static_cast<size_t>(sy1) * kSurfaceWidth;
-        const size_t rowm = static_cast<size_t>(sym) * kSurfaceWidth;
-        uint16_t *out = buf + static_cast<size_t>(y - y0) * kWidth;
+        const int side = 2 * r + 1;
+        const uint8_t *sprite = sprite_lut_ + sprite_off_[r];
+        const uint16_t pal = palette_[p.speed_idx];
+        const uint32_t pr = (pal >> 11) & 0x1Fu;
+        const uint32_t pg = (pal >> 5) & 0x3Fu;
+        const uint32_t pb = pal & 0x1Fu;
+        const uint32_t fade = p.fade;
 
-        for (int x = 0; x < kWidth; ++x) {
-            const int sx = x / kSurfaceScale;
-            const int sx1 = min_int(sx + 1, kSurfaceWidth - 1);
-            const int sxm = max_int(sx - 1, 0);
-            const int fx = x & 1;
-            const uint32_t wx0 = static_cast<uint32_t>(2 - fx);
-            const uint32_t wx1 = static_cast<uint32_t>(fx);
-
-            const uint32_t w00 = wx0 * wy0;
-            const uint32_t w10 = wx1 * wy0;
-            const uint32_t w01 = wx0 * wy1;
-            const uint32_t w11 = wx1 * wy1;
-            const uint32_t field =
-                (surface_field_[row0 + sx] * w00 +
-                 surface_field_[row0 + sx1] * w10 +
-                 surface_field_[row1 + sx] * w01 +
-                 surface_field_[row1 + sx1] * w11) >> 2;
-            if (field < kSurfaceThreshold) {
-                continue;
+        for (int y = row_a; y <= row_b; ++y) {
+            const uint8_t *srow =
+                sprite + static_cast<size_t>(y - top) * side + (x_a - (p.x - r));
+            uint16_t *out = buf + static_cast<size_t>(y - y0) * kWidth + x_a;
+            for (int x = x_a; x <= x_b; ++x, ++srow, ++out) {
+                const uint32_t shade = *srow;
+                if (shade == 0u) {
+                    continue;
+                }
+                const uint32_t bright = (shade * fade) >> 8;
+                const uint32_t r5 = (pr * bright) >> 8;
+                const uint32_t g6 = (pg * bright) >> 8;
+                const uint32_t b5 = (pb * bright) >> 8;
+                *out = __builtin_bswap16(
+                    static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5));
             }
-            const uint32_t heat =
-                (surface_heat_[row0 + sx] * w00 +
-                 surface_heat_[row0 + sx1] * w10 +
-                 surface_heat_[row1 + sx] * w01 +
-                 surface_heat_[row1 + sx1] * w11) >> 2;
-            uint32_t speed_idx = (heat * 255u + field / 2u) / field;
-            if (speed_idx > 255u) {
-                speed_idx = 255u;
-            }
-
-            // The scalar-field gradient supplies a continuous surface normal,
-            // eliminating per-particle circular highlights. Light comes from
-            // upper-left; accumulated field adds a modest body highlight.
-            const int32_t gx = static_cast<int32_t>(surface_field_[row0 + sx1]) -
-                               static_cast<int32_t>(surface_field_[row0 + sxm]);
-            const int32_t gy = static_cast<int32_t>(surface_field_[row1 + sx]) -
-                               static_cast<int32_t>(surface_field_[rowm + sx]);
-            int32_t brightness =
-                188 + min_int(static_cast<int>((field - kSurfaceThreshold) >> 2), 42) +
-                (gx + gy) / 8;
-            brightness = max_int(72, min_int(brightness, 255));
-
-            uint16_t z = surface_depth_[row0 + sx];
-            const uint16_t z10 = surface_depth_[row0 + sx1];
-            const uint16_t z01 = surface_depth_[row1 + sx];
-            const uint16_t z11 = surface_depth_[row1 + sx1];
-            if (z10 < z) z = z10;
-            if (z01 < z) z = z01;
-            if (z11 < z) z = z11;
-            if (z != UINT16_MAX) {
-                const uint32_t fade =
-                    255u - min_int(static_cast<int>((static_cast<uint32_t>(z) * 65u) /
-                                                   kBoxDepthFx),
-                                   65);
-                brightness = static_cast<int32_t>(
-                    (static_cast<uint32_t>(brightness) * fade) >> 8);
-            }
-
-            // Fade the first 28 field units above the iso-threshold for a
-            // one-pixel antialiased silhouette after 2x bilinear upsampling.
-            const uint32_t coverage =
-                min_int(static_cast<int>(((field - kSurfaceThreshold) * 255u) /
-                                         kSurfaceAaWidth),
-                        255);
-            brightness = static_cast<int32_t>(
-                (static_cast<uint32_t>(brightness) * coverage) >> 8);
-
-            const uint16_t pal = palette_[speed_idx];
-            const uint32_t r5 = ((pal >> 11) & 0x1Fu) * brightness >> 8;
-            const uint32_t g6 = ((pal >> 5) & 0x3Fu) * brightness >> 8;
-            const uint32_t b5 = (pal & 0x1Fu) * brightness >> 8;
-            out[x] = __builtin_bswap16(
-                static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5));
         }
     }
 }

@@ -14,6 +14,8 @@ struct FluidStats {
     uint32_t nonfinite_resets = 0;    // deterministic resets forced by non-finite state (cumulative, survives reset())
     float last_density_error = 0.0f;  // max |rho/rho0 - 1| over the latest step
     float max_density_error = 0.0f;   // running max since the last reset
+    float last_max_speed = 0.0f;      // max post-floor |v| over the latest step (calm-freeze gate)
+    uint16_t awake_count = 0;         // particles above the sleep floor after the latest step
 };
 
 // True 3D Position Based Fluids (Macklin & Mueller, "Position Based Fluids",
@@ -27,11 +29,14 @@ struct FluidStats {
 // calibrated against that lattice (self term plus simple-cubic neighbor shells,
 // unit mass, exact 3D Poly6), so a perfect rest lattice has exactly C = 0.
 //
-// PBF solve: 2 Jacobi iterations at the caller's fixed dt; a 3D counting grid
+// PBF solve: kJacobiIterations warm-started Jacobi iterations (currently one;
+// see fluid.cpp) at the caller's fixed dt; a 3D counting grid
 // (cell size h) is rebuilt from the current predicted positions at the start of
-// each iteration, neighbors are gathered by direct 27-cell traversal (no capped
-// lists). Poly6 density, exact Spiky gradient, scorr surface term, symmetric
-// lambda denominator (squared self-gradient + neighbor gradient squares).
+// each iteration. Unordered pairs are gathered by a 14-cell half-stencil
+// traversal (own cell with j > i plus the 13 lexicographically forward cells,
+// no capped lists), so backward cells are never scanned. Poly6 density, exact
+// Spiky gradient, scorr surface term, symmetric lambda denominator (squared
+// self-gradient + neighbor gradient squares).
 class Fluid {
 public:
     Fluid() = default;

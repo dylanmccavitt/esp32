@@ -22,8 +22,24 @@ constexpr float kSqrt3Inv = 0.5773502691896258f;  // 1 / sqrt(3), cube-diagonal 
 
 constexpr float kWallRestitution = 0.05f;   // normal reflection coefficient
 constexpr float kWallTangential = 0.98f;    // tangential friction coefficient
-constexpr float kVelocityDamping = 0.995f;  // light bulk damping at the fixed 30 Hz step
-constexpr int kJacobiIterations = 2;
+constexpr float kVelocityDamping = 0.98f;   // sand-strength bulk damping at the fixed 30 Hz step
+// One warm-started iteration holds 30 Hz at 400 particles (~25 ms/step on
+// hardware; two iterations overrun). The constraint solve re-converges
+// across frames; kDeltaRelax below keeps the single iteration from ringing.
+constexpr int kJacobiIterations = 1;
+
+// Single-iteration Jacobi overshoots: both ends of a pair correct against the
+// same frozen state, so full-strength deltas ring and occasionally pop a
+// particle out of a settled pile. Under-relaxing the applied correction damps
+// the ring; the warm start recovers the lost convergence across frames.
+constexpr float kDeltaRelax = 0.5f;
+
+// Rest calm: recovered speeds below this fraction of h/dt (~0.31 units/s)
+// are zeroed. Sand carries almost no momentum at low speed, so a high floor
+// is physical: it collapses the solver's rest simmer within seconds and lets
+// the app's calm freeze engage. A free-falling particle gains g*dt ~ 0.2 per
+// step and stays above the floor after two steps of fall.
+constexpr float kSleepFrac = 0.05f;
 
 inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -69,6 +85,20 @@ void zero_dir(uint32_t a, uint32_t b, float& ox, float& oy, float& oz) {
     oz = (h & 4u) ? kSqrt3Inv : -kSqrt3Inv;
 }
 
+// Half stencil for unordered pair traversal: the 13 lexicographically forward
+// (dz, dy, dx) cell offsets. A pair in the same cell is taken with j > i; a
+// pair in distinct adjacent cells is taken from the cell whose offset to the
+// other is in this list, so every unordered pair is visited exactly once
+// without scanning the 13 backward cells at all.
+constexpr int8_t kForwardCells[13][3] = {
+    // {dx, dy, dz}
+    {1, 0, 0},
+    {-1, 1, 0}, {0, 1, 0}, {1, 1, 0},
+    {-1, -1, 1}, {0, -1, 1}, {1, -1, 1},
+    {-1, 0, 1}, {0, 0, 1}, {1, 0, 1},
+    {-1, 1, 1}, {0, 1, 1}, {1, 1, 1},
+};
+
 // Largest integer lattice dimension n such that (n - 1) * s fits inside `span`
 // (the whole lattice stays within the wall bounds on that axis).
 int lattice_max_dim(float s, float span) {
@@ -92,7 +122,7 @@ bool Fluid::init(uint16_t particle_count) {
     const float ratio = static_cast<float>(kInitialParticles) / static_cast<float>(count_);
     spacing_ = 0.14f * std::cbrt(ratio);
     h_ = spacing_ * (0.20f / 0.11f);
-    radius_ = 0.30f * spacing_;
+    radius_ = 0.15f * spacing_;  // sand-grain beads for the sprite renderer
 
     // Kernel and solve constants.
     const float h2 = h_ * h_;
@@ -103,7 +133,7 @@ bool Fluid::init(uint16_t particle_count) {
     spiky_center_mag_ = spiky_grad_k_ * h2;  // = 45 / (pi * h^4)
     epsilon_ = 0.2f / h2;
     lambda_cap_ = 0.5f * h2;
-    scorr_k_ = 0.03f * h2;
+    scorr_k_ = 0.015f * h2;  // halved: full-strength scorr keeps a settled pile simmering
     w_scorr_ref_ = poly6(0.09f * h2, h_, poly6_k_);  // W(0.3 * h)
     delta_cap_ = 0.25f * spacing_;
 
@@ -315,6 +345,29 @@ bool Fluid::step(const Vec3& apparent_accel, float dt) {
     // diagnostic. Avoiding an extra full neighbor pass keeps the 30 Hz budget.
     velocity_cap(vel_cap);
 
+    // Jitter floor: zero the residual micro-velocities of settled particles.
+    // The post-floor maximum feeds the calm-freeze gate: sleeping particles
+    // report zero, so only genuinely rolling grains can hold the sim awake.
+    const float sleep_v = kSleepFrac * h_ * inv_dt;
+    const float sleep_v2 = sleep_v * sleep_v;
+    float max_v2 = 0.0f;
+    uint16_t awake = 0;
+    for (size_t i = 0; i < count_; ++i) {
+        const float v2 = vx_[i] * vx_[i] + vy_[i] * vy_[i] + vz_[i] * vz_[i];
+        if (v2 < sleep_v2) {
+            vx_[i] = 0.0f;
+            vy_[i] = 0.0f;
+            vz_[i] = 0.0f;
+        } else {
+            ++awake;
+            if (v2 > max_v2) {
+                max_v2 = v2;
+            }
+        }
+    }
+    stats_.last_max_speed = std::sqrt(max_v2);
+    stats_.awake_count = awake;
+
     float max_err = 0.0f;
     for (size_t i = 0; i < count_; ++i) {
         const float err = std::fabs(rho_[i] * inv_rho0_ - 1.0f);
@@ -432,80 +485,106 @@ void Fluid::compute_densities_and_lambdas() {
         gsq_[i] = 0.0f;
     }
 
-    // One pass over unordered pairs (i < j) inside the 27-cell neighborhood;
-    // every pair contributes to both particles.
+    // One pass over unordered pairs via the half stencil: the own cell
+    // contributes j > i, each forward cell contributes every resident, so
+    // every pair is visited exactly once and both particles accumulate
+    // symmetrically. Particle i's position and sums live in locals so the
+    // inner loop never re-reads memory the j-side writes could alias.
+    uint64_t cand_total = 0;
     for (size_t i = 0; i < count_; ++i) {
-        int32_t cx = static_cast<int32_t>((x_[i] - kBoxXMin) / h_);
-        int32_t cy = static_cast<int32_t>((y_[i] - kBoxYMin) / h_);
-        int32_t cz = static_cast<int32_t>((z_[i] - kBoxZMin) / h_);
+        const float xi = x_[i];
+        const float yi = y_[i];
+        const float zi = z_[i];
+        float rho_i = 0.0f;
+        float gsx_i = 0.0f, gsy_i = 0.0f, gsz_i = 0.0f;
+        float gsq_i = 0.0f;
+        uint32_t cand = 0;
+
+        int32_t cx = static_cast<int32_t>((xi - kBoxXMin) / h_);
+        int32_t cy = static_cast<int32_t>((yi - kBoxYMin) / h_);
+        int32_t cz = static_cast<int32_t>((zi - kBoxZMin) / h_);
         cx = cx < 0 ? 0 : (cx >= gx_ ? gx_ - 1 : cx);
         cy = cy < 0 ? 0 : (cy >= gy_ ? gy_ - 1 : cy);
         cz = cz < 0 ? 0 : (cz >= gz_ ? gz_ - 1 : cz);
 
-        for (int32_t dz = -1; dz <= 1; ++dz) {
-            const int32_t nz = cz + dz;
+        const auto pair_with = [&](uint32_t j) {
+            ++cand;
+            const float dxp = xi - x_[j];
+            const float dyp = yi - y_[j];
+            const float dzp = zi - z_[j];
+            const float r2 = dxp * dxp + dyp * dyp + dzp * dzp;
+            if (r2 >= h2) return;
+
+            float gx, gy, gz;
+            if (r2 == 0.0f) {
+                // Exact coincidence: deterministic antisymmetric fallback
+                // direction with center-limit Spiky magnitude; both
+                // particles see a full W(0) density.
+                zero_dir(i, j, gx, gy, gz);
+                const float m = spiky_center_mag_;
+                gx = -m * gx;
+                gy = -m * gy;
+                gz = -m * gz;
+                rho_i += w0;
+                rho_[j] += w0;
+            } else {
+                const float r = std::sqrt(r2);
+                const float inv_r = 1.0f / r;
+                // r_hat points from j to i; dW/dr < 0 so the gradient of
+                // W(r_ij) points from i toward j.
+                const float m = spiky_grad_mag(r, h_, spiky_grad_k_);
+                gx = -m * (dxp * inv_r);
+                gy = -m * (dyp * inv_r);
+                gz = -m * (dzp * inv_r);
+                const float w = poly6(r2, h_, poly6_k_);
+                rho_i += w;
+                rho_[j] += w;
+            }
+            gsx_i += gx;
+            gsy_i += gy;
+            gsz_i += gz;
+            gsx_[j] -= gx;
+            gsy_[j] -= gy;
+            gsz_[j] -= gz;
+            const float m2 = gx * gx + gy * gy + gz * gz;
+            gsq_i += m2;
+            gsq_[j] += m2;
+        };
+
+        // Own cell: unordered pairs via j > i.
+        const uint32_t self_base =
+            (static_cast<uint32_t>(cz) * static_cast<uint32_t>(gy_) +
+             static_cast<uint32_t>(cy)) * static_cast<uint32_t>(gx_) +
+            static_cast<uint32_t>(cx);
+        for (uint32_t k = cell_start_[self_base]; k < cell_start_[self_base + 1]; ++k) {
+            const uint32_t j = cell_order_[k];
+            if (j <= i) continue;
+            pair_with(j);
+        }
+        // Forward cells: every resident pairs with i exactly once.
+        for (const auto &f : kForwardCells) {
+            const int32_t nx = cx + f[0];
+            if (nx < 0 || nx >= gx_) continue;
+            const int32_t ny = cy + f[1];
+            if (ny < 0 || ny >= gy_) continue;
+            const int32_t nz = cz + f[2];
             if (nz < 0 || nz >= gz_) continue;
-            for (int32_t dy = -1; dy <= 1; ++dy) {
-                const int32_t ny = cy + dy;
-                if (ny < 0 || ny >= gy_) continue;
-                for (int32_t dx = -1; dx <= 1; ++dx) {
-                    const int32_t nx = cx + dx;
-                    if (nx < 0 || nx >= gx_) continue;
-                    const uint32_t base = (static_cast<uint32_t>(nz) * static_cast<uint32_t>(gy_) +
-                                           static_cast<uint32_t>(ny)) * static_cast<uint32_t>(gx_) +
-                                          static_cast<uint32_t>(nx);
-                    const uint32_t b = cell_start_[base];
-                    const uint32_t e = cell_start_[base + 1];
-                    for (uint32_t k = b; k < e; ++k) {
-                        const uint32_t j = cell_order_[k];
-                        if (j <= i) continue;
-                        ++stats_.candidate_checks;
-
-                        const float dxp = x_[i] - x_[j];
-                        const float dyp = y_[i] - y_[j];
-                        const float dzp = z_[i] - z_[j];
-                        const float r2 = dxp * dxp + dyp * dyp + dzp * dzp;
-                        if (r2 >= h2) continue;
-
-                        float gx, gy, gz;
-                        if (r2 == 0.0f) {
-                            // Exact coincidence: deterministic antisymmetric
-                            // fallback direction with center-limit Spiky
-                            // magnitude; both particles see a full W(0) density.
-                            zero_dir(i, j, gx, gy, gz);
-                            const float m = spiky_center_mag_;
-                            gx = -m * gx;
-                            gy = -m * gy;
-                            gz = -m * gz;
-                            rho_[i] += w0;
-                            rho_[j] += w0;
-                        } else {
-                            const float r = std::sqrt(r2);
-                            const float inv_r = 1.0f / r;
-                            // r_hat points from j to i; dW/dr < 0 so the
-                            // gradient of W(r_ij) points from i toward j.
-                            const float m = spiky_grad_mag(r, h_, spiky_grad_k_);
-                            gx = -m * (dxp * inv_r);
-                            gy = -m * (dyp * inv_r);
-                            gz = -m * (dzp * inv_r);
-                            const float w = poly6(r2, h_, poly6_k_);
-                            rho_[i] += w;
-                            rho_[j] += w;
-                        }
-                        gsx_[i] += gx;
-                        gsy_[i] += gy;
-                        gsz_[i] += gz;
-                        gsx_[j] -= gx;
-                        gsy_[j] -= gy;
-                        gsz_[j] -= gz;
-                        const float m2 = gx * gx + gy * gy + gz * gz;
-                        gsq_[i] += m2;
-                        gsq_[j] += m2;
-                    }
-                }
+            const uint32_t base = (static_cast<uint32_t>(nz) * static_cast<uint32_t>(gy_) +
+                                   static_cast<uint32_t>(ny)) * static_cast<uint32_t>(gx_) +
+                                  static_cast<uint32_t>(nx);
+            for (uint32_t k = cell_start_[base]; k < cell_start_[base + 1]; ++k) {
+                pair_with(cell_order_[k]);
             }
         }
+
+        rho_[i] += rho_i;
+        gsx_[i] += gsx_i;
+        gsy_[i] += gsy_i;
+        gsz_[i] += gsz_i;
+        gsq_[i] += gsq_i;
+        cand_total += cand;
     }
+    stats_.candidate_checks += cand_total;
 
     // Constraint error C = rho/rho0 - 1 clamped to [-0.05, 1]; lambda
     // denominator is the squared self-gradient plus the neighbor gradient
@@ -531,73 +610,96 @@ void Fluid::compute_and_apply_deltas() {
         dz_[i] = 0.0f;
     }
 
+    // Same half-stencil traversal as the density pass: own cell with j > i,
+    // then the 13 forward cells in full. Particle i's accumulators are locals.
+    uint64_t cand_total = 0;
     for (size_t i = 0; i < count_; ++i) {
-        int32_t cx = static_cast<int32_t>((x_[i] - kBoxXMin) / h_);
-        int32_t cy = static_cast<int32_t>((y_[i] - kBoxYMin) / h_);
-        int32_t cz = static_cast<int32_t>((z_[i] - kBoxZMin) / h_);
+        const float xi = x_[i];
+        const float yi = y_[i];
+        const float zi = z_[i];
+        const float lambda_i = lambda_[i];
+        float dxi = 0.0f, dyi = 0.0f, dzi = 0.0f;
+        uint32_t cand = 0;
+
+        int32_t cx = static_cast<int32_t>((xi - kBoxXMin) / h_);
+        int32_t cy = static_cast<int32_t>((yi - kBoxYMin) / h_);
+        int32_t cz = static_cast<int32_t>((zi - kBoxZMin) / h_);
         cx = cx < 0 ? 0 : (cx >= gx_ ? gx_ - 1 : cx);
         cy = cy < 0 ? 0 : (cy >= gy_ ? gy_ - 1 : cy);
         cz = cz < 0 ? 0 : (cz >= gz_ ? gz_ - 1 : cz);
 
-        for (int32_t dz = -1; dz <= 1; ++dz) {
-            const int32_t nz = cz + dz;
+        const auto pair_with = [&](uint32_t j) {
+            ++cand;
+            const float dxp = xi - x_[j];
+            const float dyp = yi - y_[j];
+            const float dzp = zi - z_[j];
+            const float r2 = dxp * dxp + dyp * dyp + dzp * dzp;
+            if (r2 >= h2) return;
+
+            float gx, gy, gz;
+            float s;  // scorr surface term (negative)
+            if (r2 == 0.0f) {
+                zero_dir(i, j, gx, gy, gz);
+                const float m = spiky_center_mag_;
+                gx = -m * gx;
+                gy = -m * gy;
+                gz = -m * gz;
+                s = -scorr_k_ * pow4(w0 / w_scorr_ref_);
+            } else {
+                const float r = std::sqrt(r2);
+                const float inv_r = 1.0f / r;
+                const float m = spiky_grad_mag(r, h_, spiky_grad_k_);
+                gx = -m * (dxp * inv_r);
+                gy = -m * (dyp * inv_r);
+                gz = -m * (dzp * inv_r);
+                const float w = poly6(r2, h_, poly6_k_);
+                s = -scorr_k_ * pow4(w / w_scorr_ref_);
+            }
+            const float coeff = (lambda_i + lambda_[j] + s) * inv_rho0;
+            dxi += coeff * gx;
+            dyi += coeff * gy;
+            dzi += coeff * gz;
+            dx_[j] -= coeff * gx;
+            dy_[j] -= coeff * gy;
+            dz_[j] -= coeff * gz;
+        };
+
+        const uint32_t self_base =
+            (static_cast<uint32_t>(cz) * static_cast<uint32_t>(gy_) +
+             static_cast<uint32_t>(cy)) * static_cast<uint32_t>(gx_) +
+            static_cast<uint32_t>(cx);
+        for (uint32_t k = cell_start_[self_base]; k < cell_start_[self_base + 1]; ++k) {
+            const uint32_t j = cell_order_[k];
+            if (j <= i) continue;
+            pair_with(j);
+        }
+        for (const auto &f : kForwardCells) {
+            const int32_t nx = cx + f[0];
+            if (nx < 0 || nx >= gx_) continue;
+            const int32_t ny = cy + f[1];
+            if (ny < 0 || ny >= gy_) continue;
+            const int32_t nz = cz + f[2];
             if (nz < 0 || nz >= gz_) continue;
-            for (int32_t dy = -1; dy <= 1; ++dy) {
-                const int32_t ny = cy + dy;
-                if (ny < 0 || ny >= gy_) continue;
-                for (int32_t dx = -1; dx <= 1; ++dx) {
-                    const int32_t nx = cx + dx;
-                    if (nx < 0 || nx >= gx_) continue;
-                    const uint32_t base = (static_cast<uint32_t>(nz) * static_cast<uint32_t>(gy_) +
-                                           static_cast<uint32_t>(ny)) * static_cast<uint32_t>(gx_) +
-                                          static_cast<uint32_t>(nx);
-                    const uint32_t b = cell_start_[base];
-                    const uint32_t e = cell_start_[base + 1];
-                    for (uint32_t k = b; k < e; ++k) {
-                        const uint32_t j = cell_order_[k];
-                        if (j <= i) continue;
-                        ++stats_.candidate_checks;
-
-                        const float dxp = x_[i] - x_[j];
-                        const float dyp = y_[i] - y_[j];
-                        const float dzp = z_[i] - z_[j];
-                        const float r2 = dxp * dxp + dyp * dyp + dzp * dzp;
-                        if (r2 >= h2) continue;
-
-                        float gx, gy, gz;
-                        float s;  // scorr surface term (negative)
-                        if (r2 == 0.0f) {
-                            zero_dir(i, j, gx, gy, gz);
-                            const float m = spiky_center_mag_;
-                            gx = -m * gx;
-                            gy = -m * gy;
-                            gz = -m * gz;
-                            s = -scorr_k_ * pow4(w0 / w_scorr_ref_);
-                        } else {
-                            const float r = std::sqrt(r2);
-                            const float inv_r = 1.0f / r;
-                            const float m = spiky_grad_mag(r, h_, spiky_grad_k_);
-                            gx = -m * (dxp * inv_r);
-                            gy = -m * (dyp * inv_r);
-                            gz = -m * (dzp * inv_r);
-                            const float w = poly6(r2, h_, poly6_k_);
-                            s = -scorr_k_ * pow4(w / w_scorr_ref_);
-                        }
-                        const float coeff = (lambda_[i] + lambda_[j] + s) * inv_rho0;
-                        dx_[i] += coeff * gx;
-                        dy_[i] += coeff * gy;
-                        dz_[i] += coeff * gz;
-                        dx_[j] -= coeff * gx;
-                        dy_[j] -= coeff * gy;
-                        dz_[j] -= coeff * gz;
-                    }
-                }
+            const uint32_t base = (static_cast<uint32_t>(nz) * static_cast<uint32_t>(gy_) +
+                                   static_cast<uint32_t>(ny)) * static_cast<uint32_t>(gx_) +
+                                  static_cast<uint32_t>(nx);
+            for (uint32_t k = cell_start_[base]; k < cell_start_[base + 1]; ++k) {
+                pair_with(cell_order_[k]);
             }
         }
-    }
 
-    // Cap each delta, apply to positions, clamp all six walls.
+        dx_[i] += dxi;
+        dy_[i] += dyi;
+        dz_[i] += dzi;
+        cand_total += cand;
+    }
+    stats_.candidate_checks += cand_total;
+
+    // Under-relax, cap each delta, apply to positions, clamp all six walls.
     for (size_t i = 0; i < count_; ++i) {
+        dx_[i] *= kDeltaRelax;
+        dy_[i] *= kDeltaRelax;
+        dz_[i] *= kDeltaRelax;
         const float d2 = dx_[i] * dx_[i] + dy_[i] * dy_[i] + dz_[i] * dz_[i];
         if (d2 > cap2) {
             const float scale = delta_cap_ / std::sqrt(d2);
