@@ -85,6 +85,7 @@
 #include "input_service.hpp"
 #include "launcher.hpp"
 #include "motion_service.hpp"
+#include "ragdoll_avalanche_app.hpp"
 #include "tilt_maze_app.hpp"
 
 namespace fluid_demo {
@@ -101,6 +102,7 @@ constexpr char kTag[] = "fluid_demo";
 constexpr RegistryEntry kRegistry[] = {
     {"fluid_box", "Fluid Box", &s_fluid_app},
     {"tilt_maze", "Task Maze", &s_tilt_maze_app},
+    {"ragdoll_avalanche", "Avalanche", &s_ragdoll_avalanche_app},
 };
 constexpr size_t kRegistryCount = sizeof(kRegistry) / sizeof(kRegistry[0]);
 

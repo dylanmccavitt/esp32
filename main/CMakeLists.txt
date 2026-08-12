@@ -5,13 +5,14 @@ idf_component_register(
          "display_service.cpp"
          "fluid_app.cpp"
          "tilt_maze_app.cpp"
+         "ragdoll_avalanche_app.cpp"
          "input_service.cpp"
          "launcher.cpp"
          "motion_service.cpp"
          "runtime.cpp"
          "motion.cpp"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES console esp_lcd esp_driver_gpio esp_driver_i2c esp_driver_spi esp_timer esp_psram spi_flash heap
+    PRIV_REQUIRES console esp_lcd esp_driver_gpio esp_driver_i2c esp_driver_spi esp_timer esp_psram spi_flash heap nvs_flash
 )
 
 # Global app constraint: C++20 without exceptions or RTTI.
