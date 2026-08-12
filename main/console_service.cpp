@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "attitude.hpp"
 #include "board.hpp"
 #include "display_service.hpp"
 #include "input_service.hpp"
@@ -149,7 +150,9 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
                                 command_reboot)) != ESP_OK ||
         (err = register_command("input", "Inject a debounced shell button or launcher swipe",
                                 "<plus|pwr|boot|swipe-left|swipe-right> [hold_ms]",
-                                command_input)) != ESP_OK) {
+                                command_input)) != ESP_OK ||
+        (err = register_command("yaw", "Apply a one-shot body yaw to the attitude filter",
+                                "<radians>", command_yaw)) != ESP_OK) {
         return err;
     }
 
@@ -173,7 +176,7 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
     if (err != ESP_OK) {
         return err;
     }
-    ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot/input");
+    ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot/input/yaw");
     return ESP_OK;
 #else
     return ESP_ERR_NOT_SUPPORTED;
@@ -362,6 +365,23 @@ int ConsoleService::command_input(int argc, char **argv)
     }
     return 0;
 }
+
+int ConsoleService::command_yaw(int argc, char **argv)
+{
+    if (argc != 2) {
+        std::printf("usage: yaw <radians>\r\n");
+        return 1;
+    }
+    float radians = 0.0f;
+    if (!parse_float(argv[1], &radians)) {
+        std::printf("yaw: finite radians must be within [-18,18]\r\n");
+        return 1;
+    }
+    AttitudeFilter::request_yaw(radians);
+    std::printf("@DEV YAW %.3f\r\n", static_cast<double>(radians));
+    return 0;
+}
+
 int ConsoleService::command_framebuffer(int argc, char **argv)
 {
     if ((argc != 1 && argc != 2) || s_active->display_ == nullptr) {

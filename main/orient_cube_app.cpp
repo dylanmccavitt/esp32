@@ -65,14 +65,12 @@ constexpr LauncherVisual kLauncherVisual{
     kLauncherCubeTopBitmap,
 };
 
-constexpr float kHalf = 0.90f;
-constexpr float kCam = 6.0f;
+constexpr float kHalf = 1.00f;
+constexpr float kCam = 5.5f;
 constexpr float kFocal = 400.0f;
 constexpr float kCenter = 120.0f;
 constexpr int kDiscRadius = 118;
 constexpr int kDiscRadiusSq = kDiscRadius * kDiscRadius;
-constexpr float kViewYaw = 0.40f;
-constexpr float kViewPitch = 0.26f;
 constexpr float kLightX = 0.42f;
 constexpr float kLightY = 0.74f;
 constexpr float kLightZ = 0.53f;
@@ -109,29 +107,23 @@ void project_vertices(const float R[9], float cam[8][3], float out[8][3])
         {-kHalf, -kHalf, -kHalf}, {kHalf, -kHalf, -kHalf},
         {kHalf, kHalf, -kHalf},   {-kHalf, kHalf, -kHalf},
     };
-    const float cy = std::cos(kViewYaw);
-    const float sy = std::sin(kViewYaw);
-    const float cp = std::cos(kViewPitch);
-    const float sp = std::sin(kViewPitch);
+    // Camera sits on +Z looking toward the origin (-Z). Identity R is rest:
+    // screen face (+Z) fills the view, USB at -Y (bottom), no 3/4 offset.
     for (int i = 0; i < 8; ++i) {
         const float ax = R[0] * model[i][0] + R[1] * model[i][1] + R[2] * model[i][2];
         const float ay = R[3] * model[i][0] + R[4] * model[i][1] + R[5] * model[i][2];
         const float az = R[6] * model[i][0] + R[7] * model[i][1] + R[8] * model[i][2];
-        const float x1 = cy * ax + sy * az;
-        const float z1 = -sy * ax + cy * az;
-        const float y2 = cp * ay - sp * z1;
-        const float z2 = sp * ay + cp * z1;
-        cam[i][0] = x1;
-        cam[i][1] = y2;
-        cam[i][2] = z2;
-        float denom = kCam - z2;
+        cam[i][0] = ax;
+        cam[i][1] = ay;
+        cam[i][2] = az;
+        float denom = kCam - az;
         if (denom < 0.35f) {
             denom = 0.35f;
         }
         const float persp = kFocal / denom;
-        out[i][0] = kCenter + x1 * persp;
-        out[i][1] = kCenter - y2 * persp;
-        out[i][2] = z2;
+        out[i][0] = kCenter + ax * persp;
+        out[i][1] = kCenter - ay * persp;
+        out[i][2] = az;
     }
 }
 

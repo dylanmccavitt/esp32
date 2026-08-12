@@ -25,152 +25,168 @@ constexpr uint16_t kBezel = 0x10A2;
 constexpr uint16_t kBand = 0x1C4A;
 constexpr uint16_t kMuted = 0x7C4F;
 constexpr uint16_t kAccent = 0xFE60;
-constexpr uint16_t kSky = 0x3C9C;
-constexpr uint16_t kSkyDeep = 0x226F;
-constexpr uint16_t kGround = 0x9B43;
-constexpr uint16_t kGroundDark = 0x7222;
-constexpr uint16_t kHorizon = 0xFFFF;
-constexpr uint16_t kHorizonEdge = 0x1082;
-constexpr uint16_t kGrid = 0x82C3;
-constexpr uint16_t kSun = 0xFE60;
-constexpr uint16_t kPlane = 0xFFFF;
-constexpr uint16_t kPlaneBody = 0xFE60;
-constexpr uint16_t kPlaneOutline = 0x0841;
-constexpr uint16_t kTick = 0xDEFB;
-constexpr uint16_t kIndex = 0xFE60;
-constexpr uint16_t kCenterDot = 0xF800;
+constexpr uint16_t kFluid = 0x1B8A;
+constexpr uint16_t kFluidDeep = 0x1167;
+constexpr uint16_t kRing = 0x3C70;
+constexpr uint16_t kCross = 0xDEFB;
+constexpr uint16_t kBubble = 0xEF7D;
+constexpr uint16_t kBubbleHi = 0xFFFF;
+constexpr uint16_t kBubbleEdge = 0x9CD3;
+constexpr uint16_t kSnapBubble = 0xFE60;
+constexpr uint16_t kSnapRing = 0xFDE0;
+constexpr uint16_t kDigit = 0xFFFF;
+constexpr uint16_t kDigitSnap = 0xFE60;
 
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kDeg = kPi / 180.0f;
-constexpr float kPxPerRad = static_cast<float>(kRadius) / (0.55f * kPi);
+constexpr float kSnapRad = 2.0f * kDeg;
+constexpr float kBubbleGain = 70.0f / (15.0f * kDeg);
+constexpr int kBubbleRadius = 22;
+constexpr int kBubbleTravel = 78;
 
-constexpr uint8_t kLauncherSkyBitmap[8] = {
+constexpr uint8_t kLauncherVialBitmap[8] = {
     0b00111100,
     0b01111110,
     0b11111111,
     0b11111111,
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b00000000,
+    0b11111111,
+    0b11111111,
+    0b01111110,
+    0b00111100,
 };
-constexpr uint8_t kLauncherGroundBitmap[8] = {
+constexpr uint8_t kLauncherBubbleBitmap[8] = {
     0b00000000,
     0b00000000,
-    0b00000000,
-    0b00000000,
-    0b11111111,
-    0b11111111,
-    0b01111110,
+    0b00011000,
     0b00111100,
+    0b00111100,
+    0b00011000,
+    0b00000000,
+    0b00000000,
 };
 constexpr LauncherVisual kLauncherVisual{
     kBezel,
     kBand,
     kMuted,
     kAccent,
-    kSky,
-    kGround,
-    kLauncherSkyBitmap,
-    kLauncherGroundBitmap,
+    kFluid,
+    kSnapBubble,
+    kLauncherVialBitmap,
+    kLauncherBubbleBitmap,
 };
 
 inline int min_int(int a, int b) { return a < b ? a : b; }
+inline int max_int(int a, int b) { return a > b ? a : b; }
 inline bool finite_vec(const Vec3 &value)
 {
     return std::isfinite(value.x) && std::isfinite(value.y) &&
            std::isfinite(value.z);
 }
 
-void draw_bezel_tick(uint16_t *pixels, int width, int y0, int rows, float angle_rad,
-                     int inner, int outer, uint16_t color)
+void draw_ring(uint16_t *pixels, int width, int y0, int rows, int cx, int cy,
+               int inner, int outer, uint16_t color)
 {
-    const float c = std::cos(angle_rad);
-    const float s = std::sin(angle_rad);
-    const int x0 = kCx + static_cast<int>(static_cast<float>(inner) * s + 0.5f);
-    const int y0s = kCy - static_cast<int>(static_cast<float>(inner) * c + 0.5f);
-    const int x1 = kCx + static_cast<int>(static_cast<float>(outer) * s + 0.5f);
-    const int y1 = kCy - static_cast<int>(static_cast<float>(outer) * c + 0.5f);
-    fill_segment(pixels, width, y0, rows, x0, y0s, x1, y1, 1, color);
-}
-
-void draw_up_caret(uint16_t *pixels, int width, int y0, int rows)
-{
-    float tri[6] = {120.0f, 8.0f, 109.0f, 22.0f, 131.0f, 22.0f};
-    fill_convex(pixels, width, y0, rows, tri, 3, kIndex);
-}
-
-void draw_horizon_band(uint16_t *pixels, int width, int y0, int rows, float nx,
-                       float ny, float along, int radius, uint16_t color)
-{
-    const float px = -ny;
-    const float py = nx;
-    const float span = 112.0f;
-    const float sx0 = static_cast<float>(kCx) + nx * along - px * span;
-    const float sy0 = static_cast<float>(kCy) - ny * along + py * span;
-    const float sx1 = static_cast<float>(kCx) + nx * along + px * span;
-    const float sy1 = static_cast<float>(kCy) - ny * along - py * span;
-    fill_segment(pixels, width, y0, rows, static_cast<int>(sx0 + 0.5f),
-                 static_cast<int>(sy0 + 0.5f), static_cast<int>(sx1 + 0.5f),
-                 static_cast<int>(sy1 + 0.5f), radius, color);
-}
-
-void draw_ground_grid(uint16_t *pixels, int width, int y0, int rows, float nx,
-                      float ny, float along)
-{
-    const float px = -ny;
-    const float py = nx;
-    const float spacings[5] = {16.0f, 34.0f, 56.0f, 82.0f, 112.0f};
-    for (int i = 0; i < 5; ++i) {
-        const float dist = spacings[i];
-        const float line_along = along - dist;
-        if (std::fabs(line_along) > static_cast<float>(kRadius) - 6.0f) {
-            continue;
+    if (pixels == nullptr || width <= 0 || rows <= 0 || outer < inner || inner < 0) {
+        return;
+    }
+    const int top = max_int(y0, cy - outer);
+    const int bottom = min_int(y0 + rows - 1, cy + outer);
+    const int left = max_int(0, cx - outer);
+    const int right = min_int(width - 1, cx + outer);
+    const int outer_sq = outer * outer;
+    const int inner_sq = inner * inner;
+    for (int y = top; y <= bottom; ++y) {
+        uint16_t *row = pixels + (y - y0) * width;
+        const int dy = y - cy;
+        for (int x = left; x <= right; ++x) {
+            const int dx = x - cx;
+            const int r2 = dx * dx + dy * dy;
+            if (r2 <= outer_sq && r2 >= inner_sq) {
+                row[x] = color;
+            }
         }
-        const float half = 18.0f + dist * 0.55f;
-        const float cx = static_cast<float>(kCx) + nx * line_along;
-        const float cy = static_cast<float>(kCy) - ny * line_along;
-        fill_segment(pixels, width, y0, rows,
-                     static_cast<int>(cx - px * half + 0.5f),
-                     static_cast<int>(cy + py * half + 0.5f),
-                     static_cast<int>(cx + px * half + 0.5f),
-                     static_cast<int>(cy - py * half + 0.5f), 0, kGrid);
-    }
-    const float vanish = 160.0f;
-    const float vx = static_cast<float>(kCx) + nx * (along - vanish);
-    const float vy = static_cast<float>(kCy) - ny * (along - vanish);
-    const float offsets[7] = {-70.0f, -42.0f, -18.0f, 0.0f, 18.0f, 42.0f, 70.0f};
-    for (int i = 0; i < 7; ++i) {
-        const float hx = static_cast<float>(kCx) + nx * along + px * offsets[i];
-        const float hy = static_cast<float>(kCy) - ny * along - py * offsets[i];
-        fill_segment(pixels, width, y0, rows, static_cast<int>(vx + 0.5f),
-                     static_cast<int>(vy + 0.5f), static_cast<int>(hx + 0.5f),
-                     static_cast<int>(hy + 0.5f), 0, kGrid);
     }
 }
 
-void draw_aircraft(uint16_t *pixels, int width, int y0, int rows)
+void draw_segment_h(uint16_t *pixels, int width, int y0, int rows, int x0, int x1,
+                    int y, int thickness, uint16_t color)
 {
-    fill_segment(pixels, width, y0, rows, 28, 120, 102, 120, 5, kPlaneOutline);
-    fill_segment(pixels, width, y0, rows, 138, 120, 212, 120, 5, kPlaneOutline);
-    fill_segment(pixels, width, y0, rows, 30, 120, 100, 120, 3, kPlane);
-    fill_segment(pixels, width, y0, rows, 140, 120, 210, 120, 3, kPlane);
+    fill_segment(pixels, width, y0, rows, x0, y, x1, y, thickness, color);
+}
 
-    fill_disc(pixels, width, y0, rows, kCx, kCy, 11, kPlaneOutline);
-    fill_disc(pixels, width, y0, rows, kCx, kCy, 8, kPlaneBody);
+void draw_segment_v(uint16_t *pixels, int width, int y0, int rows, int x, int y0s,
+                    int y1, int thickness, uint16_t color)
+{
+    fill_segment(pixels, width, y0, rows, x, y0s, x, y1, thickness, color);
+}
 
-    float nose_out[6] = {120.0f, 96.0f, 106.0f, 118.0f, 134.0f, 118.0f};
-    fill_convex(pixels, width, y0, rows, nose_out, 3, kPlaneOutline);
-    float nose[6] = {120.0f, 100.0f, 110.0f, 117.0f, 130.0f, 117.0f};
-    fill_convex(pixels, width, y0, rows, nose, 3, kPlane);
+void draw_digit(uint16_t *pixels, int width, int y0, int rows, int x, int y, int h,
+                int digit, uint16_t color)
+{
+    if (digit < 0 || digit > 9) {
+        return;
+    }
+    constexpr uint8_t kSeg[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66,
+                                  0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+    const uint8_t mask = kSeg[digit];
+    const int w = (h * 3) / 5;
+    const int mid = y + h / 2;
+    const int t = max_int(1, h / 10);
+    if ((mask & 0x01) != 0) {
+        draw_segment_h(pixels, width, y0, rows, x + t, x + w - t, y, t, color);
+    }
+    if ((mask & 0x02) != 0) {
+        draw_segment_v(pixels, width, y0, rows, x + w, y + t, mid - t, t, color);
+    }
+    if ((mask & 0x04) != 0) {
+        draw_segment_v(pixels, width, y0, rows, x + w, mid + t, y + h - t, t, color);
+    }
+    if ((mask & 0x08) != 0) {
+        draw_segment_h(pixels, width, y0, rows, x + t, x + w - t, y + h, t, color);
+    }
+    if ((mask & 0x10) != 0) {
+        draw_segment_v(pixels, width, y0, rows, x, mid + t, y + h - t, t, color);
+    }
+    if ((mask & 0x20) != 0) {
+        draw_segment_v(pixels, width, y0, rows, x, y + t, mid - t, t, color);
+    }
+    if ((mask & 0x40) != 0) {
+        draw_segment_h(pixels, width, y0, rows, x + t, x + w - t, mid, t, color);
+    }
+}
 
-    fill_segment(pixels, width, y0, rows, 120, 120, 120, 142, 4, kPlaneOutline);
-    fill_segment(pixels, width, y0, rows, 120, 122, 120, 140, 2, kPlane);
-    fill_segment(pixels, width, y0, rows, 108, 138, 132, 138, 3, kPlaneOutline);
-    fill_segment(pixels, width, y0, rows, 110, 138, 130, 138, 2, kPlane);
-
-    fill_disc(pixels, width, y0, rows, kCx, kCy, 3, kPlane);
-    fill_disc(pixels, width, y0, rows, kCx, kCy, 1, kCenterDot);
+void draw_signed_degrees(uint16_t *pixels, int width, int y0, int rows, int cx,
+                         int y, int h, int value, uint16_t color)
+{
+    if (value > 99) {
+        value = 99;
+    }
+    if (value < -99) {
+        value = -99;
+    }
+    const int w = (h * 3) / 5 + 4;
+    int digits[2] = {0, 0};
+    int count = 0;
+    int abs_v = value < 0 ? -value : value;
+    if (abs_v >= 10) {
+        digits[count++] = abs_v / 10;
+    }
+    digits[count++] = abs_v % 10;
+    const int minus = value < 0 ? 1 : 0;
+    const int total = minus + count;
+    int x = cx - (total * w) / 2;
+    if (minus != 0) {
+        const int mid = y + h / 2;
+        draw_segment_h(pixels, width, y0, rows, x + 1, x + w - 6, mid, max_int(1, h / 10),
+                       color);
+        x += w;
+    }
+    for (int i = 0; i < count; ++i) {
+        draw_digit(pixels, width, y0, rows, x, y, h, digits[i], color);
+        x += w;
+    }
+    fill_disc(pixels, width, y0, rows, x + 3, y + 4, 3, color);
+    fill_disc(pixels, width, y0, rows, x + 3, y + 4, 1, kFluidDeep);
 }
 
 }  // namespace
@@ -255,25 +271,15 @@ bool AttitudeApp::on_motion(const MotionTick &tick)
         return false;
     }
 
-    const float *R = filter_.matrix();
-    Vec3 up{R[1], R[4], R[7]};
-    const float mag = std::sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
-    if (!std::isfinite(mag) || mag < 1e-5f) {
-        up = {0.0f, 1.0f, 0.0f};
-    } else {
-        up.x /= mag;
-        up.y /= mag;
-        up.z /= mag;
-    }
-    const float uxy = std::sqrt(up.x * up.x + up.y * up.y);
+    const Vec3 up = filter_.up();
     portENTER_CRITICAL(&motion_mux_);
     motion_.apparent = override_valid ? tick.apparent_accel : filter_.mapped_accel();
     motion_.valid = true;
     motion_.up_x = up.x;
     motion_.up_y = up.y;
     motion_.up_z = up.z;
-    motion_.roll = std::atan2(up.x, up.y);
-    motion_.pitch = std::atan2(up.z, uxy);
+    motion_.roll = filter_.roll();
+    motion_.pitch = filter_.pitch();
     motion_.gyro_abs = filter_.gyro_abs();
     if (physical_valid) {
         motion_.raw = tick.accel_mps2;
@@ -316,7 +322,7 @@ esp_err_t AttitudeApp::update(float dt)
         if (epoch_ == 0u) {
             epoch_ = 1u;
         }
-        ESP_LOGI(kTag, "horizon align epoch=%" PRIu32, epoch_);
+        ESP_LOGI(kTag, "level align epoch=%" PRIu32, epoch_);
     }
 
     HorizonFrame *snapshot = frames_.begin_write();
@@ -353,19 +359,25 @@ AppStats AttitudeApp::stats()
 void AttitudeApp::raster_stripe(const HorizonFrame &horizon, uint16_t *pixels,
                                 int width, int y0, int rows)
 {
-    const float ux = horizon.up_x;
-    const float uy = horizon.up_y;
-    const float uz = horizon.up_z;
-    const float uxy = std::sqrt(ux * ux + uy * uy);
-    const bool zenith = uxy < 0.045f;
-    float nx = 0.0f;
-    float ny = 1.0f;
-    float along = 0.0f;
-    if (!zenith) {
-        nx = ux / uxy;
-        ny = uy / uxy;
-        along = -std::atan2(uz, uxy) * kPxPerRad;
+    const float pitch = horizon.pitch;
+    const float roll = horizon.roll;
+    const float tilt = std::sqrt(pitch * pitch + roll * roll);
+    const bool snapped = tilt <= kSnapRad;
+    float bx = static_cast<float>(kCx) + roll * kBubbleGain;
+    float by = static_cast<float>(kCy) + pitch * kBubbleGain;
+    const float dxb = bx - static_cast<float>(kCx);
+    const float dyb = by - static_cast<float>(kCy);
+    const float travel = std::sqrt(dxb * dxb + dyb * dyb);
+    if (travel > static_cast<float>(kBubbleTravel) && travel > 1e-3f) {
+        const float scale = static_cast<float>(kBubbleTravel) / travel;
+        bx = static_cast<float>(kCx) + dxb * scale;
+        by = static_cast<float>(kCy) + dyb * scale;
     }
+    const int bubble_x = static_cast<int>(bx + 0.5f);
+    const int bubble_y = static_cast<int>(by + 0.5f);
+    const uint16_t fluid = snapped ? kFluid : kFluidDeep;
+    const uint16_t bubble = snapped ? kSnapBubble : kBubble;
+    const uint16_t digit = snapped ? kDigitSnap : kDigit;
 
     for (int local_y = 0; local_y < rows; ++local_y) {
         const int y = y0 + local_y;
@@ -373,46 +385,33 @@ void AttitudeApp::raster_stripe(const HorizonFrame &horizon, uint16_t *pixels,
         uint16_t *row = pixels + local_y * width;
         for (int x = 0; x < width; ++x) {
             const int dx = x - kCx;
-            if (dx * dx + dy * dy > kRadiusSq) {
-                row[x] = kBezel;
-                continue;
-            }
-            if (zenith) {
-                row[x] = uz >= 0.0f ? kSky : kGround;
-                continue;
-            }
-            const float proj =
-                static_cast<float>(dx) * nx + static_cast<float>(-dy) * ny;
-            if (proj > along) {
-                const float sky_t = (proj - along) / static_cast<float>(kRadius);
-                row[x] = sky_t > 0.55f ? kSkyDeep : kSky;
-            } else {
-                const float ground_t = (along - proj) / static_cast<float>(kRadius);
-                row[x] = ground_t > 0.62f ? kGroundDark : kGround;
-            }
+            row[x] = (dx * dx + dy * dy <= kRadiusSq) ? fluid : kBezel;
         }
     }
 
-    if (!zenith) {
-        draw_ground_grid(pixels, width, y0, rows, nx, ny, along);
-        const float sun_along = along + 42.0f;
-        if (std::fabs(sun_along) < static_cast<float>(kRadius) - 16.0f) {
-            fill_disc(pixels, width, y0, rows,
-                      kCx + static_cast<int>(nx * sun_along + 0.5f),
-                      kCy - static_cast<int>(ny * sun_along + 0.5f), 9, kSun);
-        }
-        draw_horizon_band(pixels, width, y0, rows, nx, ny, along, 3, kHorizonEdge);
-        draw_horizon_band(pixels, width, y0, rows, nx, ny, along, 2, kHorizon);
+    draw_ring(pixels, width, y0, rows, kCx, kCy, 52, 54, kRing);
+    draw_ring(pixels, width, y0, rows, kCx, kCy, 78, 80, kRing);
+    draw_ring(pixels, width, y0, rows, kCx, kCy, 102, 104, kRing);
+    if (snapped) {
+        draw_ring(pixels, width, y0, rows, kCx, kCy, 24, 28, kSnapRing);
+    } else {
+        draw_ring(pixels, width, y0, rows, kCx, kCy, 26, 27, kRing);
     }
 
-    constexpr float kTickDeg[5] = {0.0f, 15.0f, -15.0f, 30.0f, -30.0f};
-    for (int i = 0; i < 5; ++i) {
-        const int inner = (i == 0) ? 104 : 110;
-        draw_bezel_tick(pixels, width, y0, rows, kTickDeg[i] * kDeg, inner, kRadius,
-                        kTick);
-    }
-    draw_up_caret(pixels, width, y0, rows);
-    draw_aircraft(pixels, width, y0, rows);
+    fill_segment(pixels, width, y0, rows, kCx - 48, kCy, kCx + 48, kCy, 1, kCross);
+    fill_segment(pixels, width, y0, rows, kCx, kCy - 48, kCx, kCy + 48, 1, kCross);
+    fill_disc(pixels, width, y0, rows, kCx, kCy, 3, kCross);
+
+    fill_disc(pixels, width, y0, rows, bubble_x, bubble_y, kBubbleRadius + 1,
+              kBubbleEdge);
+    fill_disc(pixels, width, y0, rows, bubble_x, bubble_y, kBubbleRadius, bubble);
+    fill_disc(pixels, width, y0, rows, bubble_x - 6, bubble_y - 7, 6, kBubbleHi);
+    fill_disc(pixels, width, y0, rows, bubble_x - 7, bubble_y - 8, 2, kCross);
+
+    const int pitch_deg = static_cast<int>(pitch / kDeg + (pitch >= 0.0f ? 0.5f : -0.5f));
+    const int roll_deg = static_cast<int>(roll / kDeg + (roll >= 0.0f ? 0.5f : -0.5f));
+    draw_signed_degrees(pixels, width, y0, rows, 70, 188, 22, pitch_deg, digit);
+    draw_signed_degrees(pixels, width, y0, rows, 170, 188, 22, roll_deg, digit);
 
     for (int local_y = 0; local_y < rows; ++local_y) {
         uint16_t *row = pixels + local_y * width;

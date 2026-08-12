@@ -8,7 +8,9 @@
 namespace fluid_demo {
 
 /// Board-frame attitude from gyro integration plus accelerometer tilt.
-/// USB-at-bottom axis map matches MotionFilter. Yaw is relative and drifts.
+/// USB-at-bottom axis map matches MotionFilter. `matrix()` is body-to-world:
+/// it rotates the cube in world space. Yaw around vertical is gyro-only and
+/// drifts. `request_yaw` is a one-shot body yaw for host captures.
 class AttitudeFilter {
 public:
     static constexpr float kOneG = 9.807f;
@@ -17,6 +19,7 @@ public:
 
     void reset();
     void request_align();
+    static void request_yaw(float radians);
 
     /// Physical IMU sample. `gyro_rads` is ignored when `freeze_gyro`.
     /// Override gravity is supplied via `apply_override` instead.
@@ -61,6 +64,8 @@ private:
     bool valid_gravity(const Vec3 &v) const;
     void set_identity_from_gravity(const Vec3 &g_meas);
     void pull_toward_gravity(const Vec3 &g_meas, float alpha);
+    void apply_yaw(float radians);
+    void consume_yaw_request();
     void recompute();
     void hard_reset();
 

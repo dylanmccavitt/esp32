@@ -39,7 +39,7 @@ constexpr RegistryEntry kRegistry[] = {
     {"tilt_maze", "Task Maze", &s_tilt_maze_app},
     {"ragdoll_avalanche", "Avalanche", &s_ragdoll_avalanche_app},
     {"orient_cube", "Cube", &s_orient_cube_app},
-    {"attitude", "Horizon", &s_attitude_app},
+    {"attitude", "Level", &s_attitude_app},
 };
 constexpr size_t kRegistryCount = sizeof(kRegistry) / sizeof(kRegistry[0]);
 
