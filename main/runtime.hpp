@@ -24,6 +24,7 @@ constexpr uint32_t kAppGenShift = kAppModeShift + 2;
 constexpr uint32_t kNoAppIndex = 0x0Fu;
 
 const char *runtime_mode_name();
+bool runtime_active_stats(AppStats *out);
 
 [[noreturn]] void runtime_run();
 

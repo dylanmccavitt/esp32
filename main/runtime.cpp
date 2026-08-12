@@ -850,6 +850,25 @@ const char *runtime_mode_name()
     return s_mode_name.load(std::memory_order_acquire);
 }
 
+bool runtime_active_stats(AppStats *out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+    const uint32_t word = s_active_selection.load(std::memory_order_acquire);
+    if (word_mode(word) != AppMode::Running) {
+        *out = {};
+        return false;
+    }
+    App *app = app_at_index(word & kAppIndexMask);
+    if (app == nullptr) {
+        *out = {};
+        return false;
+    }
+    *out = app->stats();
+    return true;
+}
+
 [[noreturn]] void runtime_run()
 {
     // The small bounded request queue is consumed on this (ESP main) task.

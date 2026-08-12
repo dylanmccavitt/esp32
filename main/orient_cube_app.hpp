@@ -39,6 +39,9 @@ private:
         Vec3 apparent{0.0f, 0.0f, 6.0f};
         Vec3 raw{0.0f, 0.0f, 0.0f};
         float R[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+        float pitch = 0.0f;
+        float roll = 0.0f;
+        float yaw = 0.0f;
         bool valid = false;
     };
 

@@ -48,6 +48,7 @@ private:
         float up_z = 0.0f;
         float roll = 0.0f;
         float pitch = 0.0f;
+        float yaw = 0.0f;
         float gyro_abs = 0.0f;
         bool valid = false;
     };

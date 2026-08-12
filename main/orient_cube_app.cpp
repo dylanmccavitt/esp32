@@ -254,7 +254,9 @@ bool OrientCubeApp::on_motion(const MotionTick &tick)
         finite_vec(tick.accel_mps2) && finite_vec(tick.gyro_rads);
     bool physical_accepted = false;
     if (physical_valid) {
-        if (tick.override_active) {
+        // Init the world from the real IMU even if a console override is
+        // already latched, so a leftover `motion` cannot pin identity.
+        if (tick.override_active && filter_.aligned()) {
             physical_accepted = true;
         } else {
             physical_accepted = filter_.update(tick.accel_mps2, tick.gyro_rads, tick.dt);
@@ -277,6 +279,9 @@ bool OrientCubeApp::on_motion(const MotionTick &tick)
     motion_.apparent = override_valid ? tick.apparent_accel : filter_.mapped_accel();
     motion_.valid = true;
     copy_matrix(motion_.R, filter_.matrix());
+    motion_.pitch = filter_.pitch();
+    motion_.roll = filter_.roll();
+    motion_.yaw = filter_.yaw();
     if (physical_valid) {
         motion_.raw = tick.accel_mps2;
     }
@@ -341,6 +346,9 @@ AppStats OrientCubeApp::stats()
     result.apparent[0] = motion_.apparent.x;
     result.apparent[1] = motion_.apparent.y;
     result.apparent[2] = motion_.apparent.z;
+    result.pitch = motion_.pitch;
+    result.roll = motion_.roll;
+    result.yaw = motion_.yaw;
     portEXIT_CRITICAL(&motion_mux_);
     result.raster_us = raster_us_;
     result.frame_us = frame_us_;

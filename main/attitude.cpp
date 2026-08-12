@@ -85,6 +85,11 @@ AttitudeFilter::Quat AttitudeFilter::quat_mul(const Quat &a, const Quat &b)
             a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w};
 }
 
+AttitudeFilter::Quat AttitudeFilter::quat_conj(const Quat &q)
+{
+    return {q.w, -q.x, -q.y, -q.z};
+}
+
 bool AttitudeFilter::quat_normalize(Quat &q)
 {
     const float mag = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
@@ -141,6 +146,7 @@ bool AttitudeFilter::valid_gravity(const Vec3 &v) const
 void AttitudeFilter::hard_reset()
 {
     q_ = {};
+    q_ref_ = {};
     R_[0] = 1.0f;
     R_[1] = 0.0f;
     R_[2] = 0.0f;
@@ -150,7 +156,7 @@ void AttitudeFilter::hard_reset()
     R_[6] = 0.0f;
     R_[7] = 0.0f;
     R_[8] = 1.0f;
-    g_ref_ = {0.0f, -kOneG, 0.0f};
+    g_world_ = {0.0f, -kOneG, 0.0f};
     up_ = {0.0f, 1.0f, 0.0f};
     mapped_ = {};
     raw_accel_ = {};
@@ -167,6 +173,7 @@ void AttitudeFilter::hard_reset()
 void AttitudeFilter::reset()
 {
     q_ = {};
+    q_ref_ = {};
     R_[0] = 1.0f;
     R_[1] = 0.0f;
     R_[2] = 0.0f;
@@ -176,7 +183,7 @@ void AttitudeFilter::reset()
     R_[6] = 0.0f;
     R_[7] = 0.0f;
     R_[8] = 1.0f;
-    g_ref_ = {0.0f, -kOneG, 0.0f};
+    g_world_ = {0.0f, -kOneG, 0.0f};
     up_ = {0.0f, 1.0f, 0.0f};
     mapped_ = {};
     raw_accel_ = {};
@@ -228,15 +235,21 @@ void AttitudeFilter::consume_yaw_request()
 
 void AttitudeFilter::recompute()
 {
-    const float xx = q_.x * q_.x;
-    const float yy = q_.y * q_.y;
-    const float zz = q_.z * q_.z;
-    const float xy = q_.x * q_.y;
-    const float xz = q_.x * q_.z;
-    const float yz = q_.y * q_.z;
-    const float wx = q_.w * q_.x;
-    const float wy = q_.w * q_.y;
-    const float wz = q_.w * q_.z;
+    Quat q_disp = quat_mul(quat_conj(q_ref_), q_);
+    if (!quat_normalize(q_disp)) {
+        hard_reset();
+        return;
+    }
+
+    const float xx = q_disp.x * q_disp.x;
+    const float yy = q_disp.y * q_disp.y;
+    const float zz = q_disp.z * q_disp.z;
+    const float xy = q_disp.x * q_disp.y;
+    const float xz = q_disp.x * q_disp.z;
+    const float yz = q_disp.y * q_disp.z;
+    const float wx = q_disp.w * q_disp.x;
+    const float wy = q_disp.w * q_disp.y;
+    const float wz = q_disp.w * q_disp.z;
     R_[0] = 1.0f - 2.0f * (yy + zz);
     R_[1] = 2.0f * (xy - wz);
     R_[2] = 2.0f * (xz + wy);
@@ -247,12 +260,8 @@ void AttitudeFilter::recompute()
     R_[7] = 2.0f * (yz + wx);
     R_[8] = 1.0f - 2.0f * (xx + yy);
 
-    Vec3 g_ref = g_ref_;
-    if (!vec_normalize(g_ref)) {
-        hard_reset();
-        return;
-    }
-    up_ = rotate(q_, {-g_ref.x, -g_ref.y, -g_ref.z});
+    // Board +Y is screen-up (USB at -Y). Relative identity => up = (0,1,0).
+    up_ = rotate(q_disp, {0.0f, 1.0f, 0.0f});
     if (!finite_vec(up_)) {
         hard_reset();
         return;
@@ -261,8 +270,8 @@ void AttitudeFilter::recompute()
     const float uxy = std::sqrt(up_.x * up_.x + up_.y * up_.y);
     roll_ = std::atan2(up_.x, up_.y);
     pitch_ = std::atan2(up_.z, uxy);
-    yaw_ = std::atan2(2.0f * (q_.w * q_.y + q_.x * q_.z),
-                      1.0f - 2.0f * (q_.y * q_.y + q_.z * q_.z));
+    yaw_ = std::atan2(2.0f * (q_disp.w * q_disp.y + q_disp.x * q_disp.z),
+                      1.0f - 2.0f * (q_disp.y * q_disp.y + q_disp.z * q_disp.z));
     if (!std::isfinite(roll_)) {
         roll_ = 0.0f;
     }
@@ -274,10 +283,11 @@ void AttitudeFilter::recompute()
     }
 }
 
-void AttitudeFilter::set_identity_from_gravity(const Vec3 &g_meas)
+void AttitudeFilter::init_world(const Vec3 &g_meas)
 {
     q_ = {};
-    g_ref_ = g_meas;
+    q_ref_ = {};
+    g_world_ = g_meas;
     have_ref_ = true;
     gyro_abs_ = 0.0f;
     recompute();
@@ -285,10 +295,12 @@ void AttitudeFilter::set_identity_from_gravity(const Vec3 &g_meas)
 
 void AttitudeFilter::pull_toward_gravity(const Vec3 &g_meas, float alpha)
 {
-    // q is body-to-world, so R * g_body = g_world. Rotate the measurement
-    // into world and pull that estimate toward the aligned gravity reference.
+    // Tilt-only: rotate world so estimated gravity matches the stored world
+    // gravity. The shortest quat_between has no component around gravity, so
+    // yaw is left to the gyro. Display pose is q_ref^{-1} * q, so this cannot
+    // pin the cube at identity after zero.
     Vec3 meas = g_meas;
-    Vec3 g_world = g_ref_;
+    Vec3 g_world = g_world_;
     if (!vec_normalize(meas) || !vec_normalize(g_world)) {
         return;
     }
@@ -337,10 +349,13 @@ bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float
     accepted_last_ = true;
 
     const bool align = align_pending_.exchange(false, std::memory_order_acq_rel);
-    if (align || !have_ref_) {
-        set_identity_from_gravity(mapped);
+    if (!have_ref_) {
+        init_world(mapped);
         consume_yaw_request();
         return true;
+    }
+    if (align) {
+        q_ref_ = q_;
     }
 
     const float half = 0.5f * clamped_dt;
@@ -381,10 +396,13 @@ bool AttitudeFilter::apply_override(const Vec3 &apparent_accel)
     accepted_last_ = true;
 
     const bool align = align_pending_.exchange(false, std::memory_order_acq_rel);
-    if (align || !have_ref_) {
-        set_identity_from_gravity(apparent_accel);
+    if (!have_ref_) {
+        init_world(apparent_accel);
         consume_yaw_request();
         return true;
+    }
+    if (align) {
+        q_ref_ = q_;
     }
 
     const float alpha = 1.0f - std::exp(-0.01f / kOverrideTau);

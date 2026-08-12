@@ -8,9 +8,10 @@
 namespace fluid_demo {
 
 /// Board-frame attitude from gyro integration plus accelerometer tilt.
-/// USB-at-bottom axis map matches MotionFilter. `matrix()` is body-to-world:
-/// it rotates the cube in world space. Yaw around vertical is gyro-only and
-/// drifts. `request_yaw` is a one-shot body yaw for host captures.
+/// USB-at-bottom axis map matches MotionFilter. `matrix()` is the display
+/// pose `q_ref^{-1} * q_body` (body-to-world relative to the last zero).
+/// Accel corrects tilt of `q_body` only; yaw around gravity is gyro-only
+/// and drifts. `request_yaw` is a one-shot body yaw for host captures.
 class AttitudeFilter {
 public:
     static constexpr float kOneG = 9.807f;
@@ -36,6 +37,7 @@ public:
     float gyro_abs() const { return gyro_abs_; }
     Vec3 mapped_accel() const { return mapped_; }
     Vec3 raw_accel() const { return raw_accel_; }
+    bool aligned() const { return have_ref_; }
     bool last_sample_accepted() const { return accepted_last_; }
     uint32_t nonfinite_resets() const { return nonfinite_resets_; }
 
@@ -57,12 +59,13 @@ private:
     static float vec_dot(const Vec3 &a, const Vec3 &b);
     static bool vec_normalize(Vec3 &v);
     static Quat quat_mul(const Quat &a, const Quat &b);
+    static Quat quat_conj(const Quat &q);
     static bool quat_normalize(Quat &q);
     static Vec3 rotate(const Quat &q, const Vec3 &v);
     static Quat quat_between(const Vec3 &from, const Vec3 &to);
 
     bool valid_gravity(const Vec3 &v) const;
-    void set_identity_from_gravity(const Vec3 &g_meas);
+    void init_world(const Vec3 &g_meas);
     void pull_toward_gravity(const Vec3 &g_meas, float alpha);
     void apply_yaw(float radians);
     void consume_yaw_request();
@@ -70,8 +73,9 @@ private:
     void hard_reset();
 
     Quat q_{};
+    Quat q_ref_{};
     float R_[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
-    Vec3 g_ref_{0.0f, -kOneG, 0.0f};
+    Vec3 g_world_{0.0f, -kOneG, 0.0f};
     Vec3 up_{0.0f, 1.0f, 0.0f};
     Vec3 mapped_{};
     Vec3 raw_accel_{};

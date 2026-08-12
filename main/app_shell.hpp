@@ -75,6 +75,9 @@ struct AppStats {
     uint32_t physics_us = 0;         ///< Last fluid step wall time.
     float raw[3] = {0.0f, 0.0f, 0.0f};       ///< Last valid raw sensor accel.
     float apparent[3] = {0.0f, 0.0f, 6.0f};  ///< Last published apparent accel.
+    float pitch = 0.0f;              ///< Relative pitch (rad), Cube/Level.
+    float roll = 0.0f;               ///< Relative roll (rad), Cube/Level.
+    float yaw = 0.0f;                ///< Relative yaw (rad), Cube/Level.
     uint32_t raster_us = 0;          ///< Last frame raster time (excl. DMA waits).
     uint32_t frame_us = 0;           ///< Last frame total time.
 };

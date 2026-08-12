@@ -238,17 +238,30 @@ int ConsoleService::command_status(int argc, char **argv)
 
     s_active->begin_protocol_output();
     const MotionService::OverrideSnapshot snapshot = s_active->motion_->override_snapshot();
+    AppStats stats{};
+    static_cast<void>(runtime_active_stats(&stats));
     const uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
     std::printf("@DEV STATUS uptime_ms=%" PRIu64
                 " override=%u accel=%.3f,%.3f,%.3f capture_ready=%u"
-                " battery_hold=%u mode=%s\r\n",
+                " battery_hold=%u mode=%s"
+                " raw=%.3f,%.3f,%.3f apparent=%.3f,%.3f,%.3f"
+                " euler=%.3f,%.3f,%.3f\r\n",
                 uptime_ms, snapshot.active ? 1u : 0u,
                 static_cast<double>(snapshot.acceleration.x),
                 static_cast<double>(snapshot.acceleration.y),
                 static_cast<double>(snapshot.acceleration.z),
                 s_active->display_ != nullptr && s_active->display_->capture_ready() ? 1u : 0u,
                 board_battery_hold_enabled() ? 1u : 0u,
-                runtime_mode_name());
+                runtime_mode_name(),
+                static_cast<double>(stats.raw[0]),
+                static_cast<double>(stats.raw[1]),
+                static_cast<double>(stats.raw[2]),
+                static_cast<double>(stats.apparent[0]),
+                static_cast<double>(stats.apparent[1]),
+                static_cast<double>(stats.apparent[2]),
+                static_cast<double>(stats.pitch),
+                static_cast<double>(stats.roll),
+                static_cast<double>(stats.yaw));
     s_active->end_protocol_output();
     return 0;
 }
