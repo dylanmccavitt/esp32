@@ -8,7 +8,6 @@
 
 namespace fluid_demo {
 
-/// Lifecycle mode of the shell (coordinator-side state only; no app sees it).
 enum class AppMode : uint8_t {
     Launcher = 0,
     Entering = 1,
@@ -16,12 +15,10 @@ enum class AppMode : uint8_t {
     Transition = 3,
 };
 
-/// User events routed to the active app.
 enum class AppEvent : uint8_t {
     PlusPress = 0,
 };
 
-/// Action an app requests after handling an event; no shell actions exist yet.
 enum class ShellAction : uint8_t {
     None = 0,
 };
@@ -59,11 +56,6 @@ struct TouchEvent {
 };
 
 /// One motion sample delivered by the shell's raw-motion pipeline.
-///
-/// The shell's sensor lane and MotionService own the IMU poll, the
-/// [2 ms, 100 ms] dt clamp and the dev-console override check. The
-/// app owns the MotionFilter and decides to bypass it verbatim when an
-/// override is active (matches the legacy sensor task, app_main.cpp:312).
 struct MotionTick {
     Vec3 accel_mps2{};      ///< Raw sensor-frame acceleration (m/s^2).
     Vec3 gyro_rads{};       ///< Raw sensor-frame angular rate (rad/s, telemetry only).
@@ -74,10 +66,7 @@ struct MotionTick {
     bool override_active = false;  ///< Shell supplied apparent_accel verbatim.
 };
 
-/// Per-second telemetry owned by the app. The update lane writes the sim/phys
-/// fields, the render lane writes raster/frame; the shell composes the
-/// display-transport fields (dma wait, missed transfers) and heap minima into
-/// the byte-identical ESP_LOGI line.
+/// Per-second telemetry owned by the app.
 struct AppStats {
     uint32_t count = 0;              ///< Particle count (fixed at setup).
     uint32_t epoch = 0;              ///< Fluid reset epoch.
@@ -90,10 +79,7 @@ struct AppStats {
     uint32_t frame_us = 0;           ///< Last frame total time.
 };
 
-/// Fixed build-time roster of shell tasks reported through the live system
-/// telemetry callback. The sampler always fills SystemTelemetry::tasks in
-/// exactly this order:
-/// Coordinator (ESP main task), Sensor, Update, Render, Console.
+/// Fixed task roster order used by SystemTelemetry.
 enum class SystemTaskKind : uint8_t {
     Coordinator = 0,
     Sensor = 1,
@@ -123,11 +109,7 @@ struct SystemTaskTelemetry {
     bool valid = false;
 };
 
-/// One complete live-system snapshot, published at most once per second by the
-/// shell's render lane: aggregate free bytes for INTERNAL|8BIT and SPIRAM|8BIT,
-/// the exact largest currently allocatable INTERNAL|8BIT block used by Task
-/// Maze's frozen target, and the fixed 5-slot task roster in fixed order. No
-/// raw TCB or task-name pointers cross this struct — only mapped value fields.
+/// Pointer-free live-system snapshot published by the render lane.
 struct SystemTelemetry {
     uint32_t generation = 0;                 ///< Render-lane run generation.
     uint32_t internal_free_bytes = 0;        ///< INTERNAL|8BIT total free.
@@ -136,10 +118,7 @@ struct SystemTelemetry {
     SystemTaskTelemetry tasks[5];            ///< Fixed roster, fixed order.
 };
 
-/// Panel transport view handed to the app's render path. The shell binds the
-/// ops to its DisplayService instance, so the app drives render sequencing
-/// through ops only and never touches panel/I/O handles. Wire order, capture
-/// mirroring and DMA timing stay entirely in the shell's DisplayService.
+/// Shell-owned panel transport exposed to app renderers.
 struct DisplayFrame {
     uint16_t *stripe[2] = {nullptr, nullptr};
     int width = 240;
@@ -165,16 +144,7 @@ struct DisplayFrame {
     } ops;
 };
 
-/// Logical (pre-wire-swap) RGB565 palette plus fixed 8-byte glyph bitmaps
-/// for one launcher entry, defined as app-owned static-lifetime data.
-/// The generic launcher renders the exact built-in Fluid Box launcher when an
-/// app's launcher_visual() returns nullptr; a non-null descriptor renders at
-/// identical geometry (240x240, selected-entry band rows [56, 184), centered
-/// 8x8-cell glyph box [88, 152) x [88, 152), fixed left/right swipe chevrons
-/// and a page-dot row, right PLUS affordance), with the secondary bitmap
-/// drawn with priority over the primary. Bit 7 of each bitmap row is the
-/// left cell; set cells show the glyph color, unset cells show the band
-/// color.
+/// Palette and fixed 8x8 glyphs for one launcher entry.
 struct LauncherVisual {
     uint16_t background_rgb565 = 0;  ///< Full-frame fill outside the band.
     uint16_t band_rgb565 = 0;        ///< Sole selected-entry band color.
@@ -186,8 +156,7 @@ struct LauncherVisual {
     const uint8_t *secondary_bitmap = nullptr;  ///< Fixed 8-byte 8x8 overlay bitmap.
 };
 
-/// Abstract multi-app shell app. Concrete instances are registered at compile
-/// time by the coordinator in runtime.cpp.
+/// App lifecycle and lane callbacks.
 class App {
 public:
     /// Fixed simulation step, independent of wake-up granularity.
