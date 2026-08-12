@@ -15,5 +15,4 @@ idf_component_register(
     PRIV_REQUIRES console esp_lcd esp_driver_gpio esp_driver_i2c esp_driver_spi esp_timer esp_psram spi_flash heap nvs_flash
 )
 
-# Global app constraint: C++20 without exceptions or RTTI.
 target_compile_options(${COMPONENT_LIB} PRIVATE -std=gnu++20 -fno-exceptions -fno-rtti)
