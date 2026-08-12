@@ -14,7 +14,7 @@ namespace fluid_demo {
 
 namespace {
 
-constexpr const char *kTAG = "display_service";
+constexpr const char *kTag = "display_service";
 
 }  // namespace
 
@@ -32,45 +32,49 @@ esp_err_t DisplayService::init(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_ha
         return ESP_OK;  // idempotent: the callback is registered once per boot
     }
 
-    const size_t stripe_bytes = (size_t)kWidth * kStripeRows * sizeof(uint16_t);
+    const size_t stripe_bytes =
+        static_cast<size_t>(kWidth) * kStripeRows * sizeof(uint16_t);
     const size_t capture_bytes = kCaptureBytes;
-    uint16_t *a = static_cast<uint16_t *>(
+    uint16_t *stripe_a = static_cast<uint16_t *>(
         heap_caps_aligned_alloc(16, stripe_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-    uint16_t *b = static_cast<uint16_t *>(
+    uint16_t *stripe_b = static_cast<uint16_t *>(
         heap_caps_aligned_alloc(16, stripe_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     uint16_t *capture = static_cast<uint16_t *>(
         heap_caps_aligned_alloc(16, capture_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+    SemaphoreHandle_t semaphore = xSemaphoreCreateBinary();
 
-    if (a == nullptr || b == nullptr || capture == nullptr || sem == nullptr) {
-        heap_caps_free(a);
-        heap_caps_free(b);
+    if (stripe_a == nullptr || stripe_b == nullptr || capture == nullptr ||
+        semaphore == nullptr) {
+        heap_caps_free(stripe_a);
+        heap_caps_free(stripe_b);
         heap_caps_free(capture);
-        if (sem != nullptr) {
-            vSemaphoreDelete(sem);
+        if (semaphore != nullptr) {
+            vSemaphoreDelete(semaphore);
         }
-        ESP_LOGE(kTAG, "display transport allocation failed");
+        ESP_LOGE(kTag, "display transport allocation failed");
         return ESP_ERR_NO_MEM;
     }
 
-    stripe_[0] = a;
-    stripe_[1] = b;
+    stripe_[0] = stripe_a;
+    stripe_[1] = stripe_b;
     capture_ = capture;
-    sem_ = sem;
+    sem_ = semaphore;
 
-    esp_lcd_panel_io_callbacks_t cbs = {};
-    cbs.on_color_trans_done = &DisplayService::on_color_trans_done;
-    esp_err_t ret = esp_lcd_panel_io_register_event_callbacks(io, &cbs, this);
-    if (ret != ESP_OK) {
-        ESP_LOGE(kTAG, "register on_color_trans_done failed: %s", esp_err_to_name(ret));
+    esp_lcd_panel_io_callbacks_t callbacks = {};
+    callbacks.on_color_trans_done = &DisplayService::on_color_trans_done;
+    const esp_err_t result =
+        esp_lcd_panel_io_register_event_callbacks(io, &callbacks, this);
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "register on_color_trans_done failed: %s",
+                 esp_err_to_name(result));
         free_buffers();
-        return ret;
+        return result;
     }
 
     panel_ = panel;
     io_ = io;
     initialized_ = true;
-    ESP_LOGI(kTAG, "init: %dx%d, %d stripes x %d rows, %u B PSRAM capture, "
+    ESP_LOGI(kTag, "init: %dx%d, %d stripes x %d rows, %u B PSRAM capture, "
                    "on_color_trans_done registered",
              kWidth, kHeight, kStripeCount, kStripeRows,
              static_cast<unsigned>(kCaptureBytes));
@@ -147,7 +151,7 @@ esp_err_t DisplayService::submit_stripe(int s, int y0, int rows, const uint16_t 
         if (capture_armed_) {
             disarm_capture();
         }
-        ESP_LOGE(kTAG, "draw_bitmap stripe %d failed: %s", s, esp_err_to_name(ret));
+        ESP_LOGE(kTag, "draw_bitmap stripe %d failed: %s", s, esp_err_to_name(ret));
         return ret;
     }
     transfer_in_flight_ = true;  // exactly one outstanding rectangle now

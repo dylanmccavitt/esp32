@@ -1,55 +1,5 @@
 #!/usr/bin/env python3
-"""Host half of the ESP32-S3 fluid-demo serial link (USB Serial/JTAG).
-
-Opens the board's USB-serial device WITHOUT deliberately touching DTR/RTS,
-continuously drains and prints firmware logs, parses the ``@FB`` screenshot
-protocol into valid RGB PNG files (stdlib ``zlib``/``struct`` encoder only),
-and offers an interactive session so you can drive the board from stdin
-while logs keep streaming.
-
-Subcommands
------------
-session [--timeout SEC]
-                persistent reader; stdin commands are either the conveniences
-                ``screenshot [path]`` and ``pose <name> [duration_ms]``, or
-                any other line, which is sent verbatim as a firmware protocol
-                command (``ping``, ``status``, ``motion ...``, ``release``,
-                ``reset``, ``reboot``, ...). Raw ``fb`` is intentionally rejected.
-monitor         print logs until Ctrl-C.
-screenshot [OUTPUT] [--timeout SEC]
-                send a request-scoped ``fb``, save its frame as a PNG.
-send <command...> [--timeout SEC]
-                send one protocol command (words joined with spaces), keep
-                printing logs for the drain window, then exit.
-drive <pose> [--duration MS] [--screenshot [PATH]] [--timeout SEC]
-                apply a simulated gravity pose via ``motion``; optionally
-                capture a screenshot afterwards.
-
-Wire protocol (firmware -> host)
---------------------------------
- @FB BEGIN <seq> <width> <height> RGB565BE <bytes>
- @FB DATA <seq> <base64>
- ... (repeated, arbitrary chunking)
- @FB END <seq>
-
-Every pixel is big-endian RGB565 (``RGB565BE``), so ``width*height*2`` bytes
-must arrive exactly before a frame is accepted. Log lines and REPL prompt
-noise may interleave freely between protocol lines: only complete lines that
-begin with ``@FB `` are treated as protocol, everything else is printed as a
-log. Input is buffered through newlines so a serial read split cannot corrupt
-an ``@FB`` line.
-
-Poses (simulation gravity vectors, g)
--------------------------------------
-    left=(-6,0,0)   right=(6,0,0)     up=(0,6,0)
-    down=(0,-6,0)   front=(0,0,-6)    back=(0,0,6)
-
-Each saved screenshot path is printed as ``[capture] saved: <path>``.
-
-Only the Python standard library plus pyserial (available inside ``eim run``)
-is used. The module stays importable without pyserial; commands that need it
-report an actionable error.
-"""
+"""Drive the firmware shell and decode ``@FB`` screenshots over serial."""
 
 from __future__ import annotations
 
@@ -66,9 +16,9 @@ import threading
 import time
 import zlib
 
-try:  # keep the module importable without pyserial; check it lazily in main()
+try:
     import serial
-except ImportError:  # pragma: no cover - exercised only on pyserial-less hosts
+except ImportError:  # pragma: no cover
     serial = None
 
 __all__ = [
@@ -88,17 +38,12 @@ __all__ = [
     "save_frame",
 ]
 
-# ---------------------------------------------------------------------------
-# Protocol constants (match the firmware screenshot stream contract)
-# ---------------------------------------------------------------------------
-
-FRAME_FORMAT = "RGB565BE"      # big-endian RGB565, 2 bytes per pixel
-CMD_EOL = "\n"                 # line ending appended to outgoing commands
-MAX_FRAME_DIM = 4096           # sanity bound on width/height (panel is 240x240)
+FRAME_FORMAT = "RGB565BE"
+CMD_EOL = "\n"
+MAX_FRAME_DIM = 4096
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 4 * 1024 * 1024  # a single @FB line must not exceed this
 
-# Simulated gravity poses: name -> (ax, ay, az) in g-scaled units.
 POSES = collections.OrderedDict((
     ("left", (-6, 0, 0)),
     ("right", (6, 0, 0)),
@@ -108,21 +53,15 @@ POSES = collections.OrderedDict((
     ("back", (0, 0, 6)),
 ))
 
-# Serial tuning
 READ_CHUNK = 4096
-READ_TIMEOUT = 0.25            # s; keeps the reader responsive to shutdown
-WRITE_TIMEOUT = 2.0            # s
-POST_MOTION_SETTLE_S = 0.8     # let several physics frames react before capture
+READ_TIMEOUT = 0.25
+WRITE_TIMEOUT = 2.0
+POST_MOTION_SETTLE_S = 0.8
 
-# CLI defaults
 DEFAULT_BAUD = 115200
 DEFAULT_OUT_DIR = os.path.join("build", "device-captures")
-DEFAULT_CAPTURE_TIMEOUT = 45.0  # USB framebuffer dumps are intentionally bounded
-DEFAULT_SEND_DRAIN = 2.0       # s
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
+DEFAULT_CAPTURE_TIMEOUT = 45.0
+DEFAULT_SEND_DRAIN = 2.0
 
 
 class UserError(Exception):
@@ -139,11 +78,6 @@ class CaptureTimeout(UserError):
 
 class ProtocolError(UserError):
     """The frame currently being awaited was corrupted on the wire."""
-
-
-# ---------------------------------------------------------------------------
-# RGB565BE -> PNG (stdlib only)
-# ---------------------------------------------------------------------------
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -182,10 +116,6 @@ def rgb565be_to_png(data: bytes | bytearray, width: int, height: int) -> bytes:
             + _png_chunk(b"IEND", b""))
 
 
-# ---------------------------------------------------------------------------
-# @FB frame parser (line-based state machine)
-# ---------------------------------------------------------------------------
-
 FrameEvent = collections.namedtuple("FrameEvent", "seq width height data")
 
 
@@ -220,9 +150,9 @@ class FrameParser:
             return self._end(line[len("@FB END "):])
         if line.startswith("@FB ERROR "):
             rest = line[len("@FB ERROR "):]
-            tok = rest.split(maxsplit=1)
+            tokens = rest.split(maxsplit=1)
             try:
-                seq = int(tok[0]) if len(tok) == 2 else None
+                seq = int(tokens[0]) if len(tokens) == 2 else None
             except ValueError:
                 seq = None
             if seq is None:
@@ -230,7 +160,10 @@ class FrameParser:
                 return [("error", "malformed @FB ERROR: {!r}".format(rest))]
             if self._active and self.seq == seq:
                 self.reset()
-            return [("error", (seq, "firmware framebuffer error: {}".format(tok[1])))]
+            return [(
+                "error",
+                (seq, "firmware framebuffer error: {}".format(tokens[1])),
+            )]
         return [("warn", "unrecognized @FB line {!r}; expected "
                          "BEGIN/DATA/END/ERROR".format(line))]
 
@@ -243,21 +176,21 @@ class FrameParser:
                 ("warn", "new frame announced while frame seq={} was still "
                          "incomplete; previous frame discarded".format(self.seq)))
             self.reset()
-        tok = rest.split()
-        if len(tok) not in (4, 5):
+        tokens = rest.split()
+        if len(tokens) not in (4, 5):
             return [("error", "malformed @FB BEGIN: {!r} (expected "
                               "\"<seq> <w> <h> <fmt> [bytes]\")".format(rest))]
         try:
-            seq = int(tok[0])
-            width = int(tok[1])
-            height = int(tok[2])
+            seq = int(tokens[0])
+            width = int(tokens[1])
+            height = int(tokens[2])
         except ValueError:
             return [("error", "malformed @FB BEGIN numbers: {!r}".format(rest))]
         if seq < 0 or not (1 <= width <= MAX_FRAME_DIM) or not (1 <= height <= MAX_FRAME_DIM):
             return [("error", "@FB BEGIN dimensions out of range: seq={} "
                               "{}x{} (width/height must be 1..{})"
                               .format(seq, width, height, MAX_FRAME_DIM))]
-        fmt = tok[3]
+        fmt = tokens[3]
         if fmt != FRAME_FORMAT:
             return [("error", "unsupported pixel format {!r}; only {!r} is "
                               "implemented".format(fmt, FRAME_FORMAT))]
@@ -265,12 +198,12 @@ class FrameParser:
         if expected > MAX_FRAME_BYTES:
             return [("error", "@FB BEGIN frame would need {} bytes, exceeding "
                               "the {} byte safety limit".format(expected, MAX_FRAME_BYTES))]
-        if len(tok) == 5:
+        if len(tokens) == 5:
             try:
-                announced = int(tok[4])
+                announced = int(tokens[4])
             except ValueError:
                 return [("error", "malformed @FB BEGIN byte count: {!r}"
-                                  .format(tok[4]))]
+                                  .format(tokens[4]))]
             if announced != expected:
                 return [("error", "@FB BEGIN announced {} bytes but {}x{} "
                                   "RGB565BE requires exactly {}"
@@ -284,15 +217,15 @@ class FrameParser:
         return events
 
     def _data_line(self, rest: str):
-        tok = rest.split()
-        if len(tok) != 2:
+        tokens = rest.split()
+        if len(tokens) != 2:
             message = ("malformed @FB DATA: {!r} (expected "
                        "\"<seq> <base64>\")".format(rest))
             return self._abort(message) if self._active else [("error", message)]
         try:
-            seq = int(tok[0])
+            seq = int(tokens[0])
         except ValueError:
-            message = "malformed @FB DATA sequence: {!r}".format(tok[0])
+            message = "malformed @FB DATA sequence: {!r}".format(tokens[0])
             return self._abort(message) if self._active else [("error", message)]
         if not self._active:
             return [("warn", "@FB DATA for seq={} arrived with no frame in "
@@ -301,7 +234,7 @@ class FrameParser:
             return self._abort("DATA seq={} does not match in-progress frame "
                                "seq={}".format(seq, self.seq))
         try:
-            chunk = base64.b64decode(tok[1], validate=True)
+            chunk = base64.b64decode(tokens[1], validate=True)
         except (binascii.Error, ValueError):
             return self._abort("DATA seq={} carries invalid base64".format(seq))
         self._data += chunk
@@ -312,14 +245,14 @@ class FrameParser:
         return []
 
     def _end(self, rest: str):
-        tok = rest.split()
-        if len(tok) != 1:
+        tokens = rest.split()
+        if len(tokens) != 1:
             message = "malformed @FB END: {!r} (expected \"<seq>\")".format(rest)
             return self._abort(message) if self._active else [("error", message)]
         try:
-            seq = int(tok[0])
+            seq = int(tokens[0])
         except ValueError:
-            message = "malformed @FB END sequence: {!r}".format(tok[0])
+            message = "malformed @FB END sequence: {!r}".format(tokens[0])
             return self._abort(message) if self._active else [("error", message)]
         if not self._active:
             return [("warn", "@FB END for seq={} arrived with no frame in "
@@ -344,11 +277,6 @@ class FrameParser:
         self.reset()
         return [("error", (sequence, "protocol corruption: " + message +
                            "; frame discarded"))]
-
-
-# ---------------------------------------------------------------------------
-# Serial device: reader thread + event plumbing (thread-safe)
-# ---------------------------------------------------------------------------
 
 
 def discover_port():
@@ -609,11 +537,6 @@ class Device:
             self.reader.join(timeout=1.0)   # reader is a daemon; best effort
 
 
-# ---------------------------------------------------------------------------
-# Capture file handling
-# ---------------------------------------------------------------------------
-
-
 def make_capture_path(out_dir: str, seq: int) -> str:
     """Return a collision-free auto-name inside an existing ``out_dir``."""
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
@@ -651,11 +574,6 @@ def save_frame(dev: Device, ev: FrameEvent, out_dir: str, path: str | None = Non
     return absolute
 
 
-# ---------------------------------------------------------------------------
-# Poses
-# ---------------------------------------------------------------------------
-
-
 def pose_command(name: str, duration_ms=0) -> str:
     """``motion <ax> <ay> <az> [duration_ms]`` for a named pose, or raise ValueError."""
     key = str(name).strip().lower()
@@ -683,11 +601,6 @@ def _pose_type(text: str) -> str:
             "unknown pose {!r}; choose from: {}".format(
                 text, ", ".join(sorted(POSES))))
     return key
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def build_arg_parser():

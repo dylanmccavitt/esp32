@@ -5,21 +5,19 @@
 namespace fluid_demo {
 namespace {
 
-// A short low-pass removes hand tremor without lagging deliberate tilt.
 constexpr float kLowpassTauSec = 0.08f;
 constexpr float kShakeGain = 0.5f;
 
-// Bound shake separately from gravity so vigorous motion remains controlled.
 constexpr float kShakeClampSim = 1.25f * MotionFilter::kSimG;
 constexpr float kTotalClampSim = 2.25f * MotionFilter::kSimG;
 
-constexpr float kDtMin = 1e-4f;   /* guard against division by tiny/negative dt */
-constexpr float kDtMax = 0.1f;    /* filter converges to the new measurement */
-constexpr float kMinGravityMag = 0.05f * MotionFilter::kOneG; /* <0.05g: no gravity info */
-constexpr float kMaxAccelMag = 5.0f * MotionFilter::kOneG;    /* beyond 4G-range saturation */
+constexpr float kDtMin = 1e-4f;
+constexpr float kDtMax = 0.1f;
+constexpr float kMinGravityMag = 0.05f * MotionFilter::kOneG;
+constexpr float kMaxAccelMag = 5.0f * MotionFilter::kOneG;
 constexpr float kEps = 1e-6f;
 
-} // namespace
+}  // namespace
 
 float MotionFilter::clampf(float v, float lo, float hi)
 {
@@ -63,7 +61,6 @@ Vec3 MotionFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float d
 {
     accepted_last_ = false;
     if (!valid_sample(accel_mps2)) {
-        /* Retain last valid state and output (first valid sample initializes later). */
         return out_;
     }
     accepted_last_ = true;
@@ -76,26 +73,24 @@ Vec3 MotionFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float d
         -accel_mps2.z,
     };
 
-    /* dt-aware one-pole low-pass on the mapped acceleration (m/s^2). */
-    const float d = clampf(dt, kDtMin, kDtMax);
-    const float alpha = 1.0f - std::exp(-d / kLowpassTauSec);
-    const float a = alpha;
-    const float ia = 1.0f - alpha;
+    const float clamped_dt = clampf(dt, kDtMin, kDtMax);
+    const float blend = 1.0f - std::exp(-clamped_dt / kLowpassTauSec);
+    const float retained = 1.0f - blend;
 
     if (!initialized_) {
-        /* First valid sample seeds the filter: low-pass starts at the measurement,
-         * gravity is the normalized direction (or a flat default if the device is
-         * in near free fall at boot), no shake. */
         low_pass_state_ = mapped;
         raw_accel_ = accel_mps2;
         mapped_ = mapped;
         gyro_rads_ = gyro_rads;
         initialized_ = true;
 
-        const float mag = std::sqrt(mapped.x * mapped.x + mapped.y * mapped.y + mapped.z * mapped.z);
-        if (mag > kEps) {
-            const float s = kSimG / mag;
-            gravity_ = Vec3{mapped.x * s, mapped.y * s, mapped.z * s};
+        const float magnitude =
+            std::sqrt(mapped.x * mapped.x + mapped.y * mapped.y +
+                      mapped.z * mapped.z);
+        if (magnitude > kEps) {
+            const float scale = kSimG / magnitude;
+            gravity_ =
+                Vec3{mapped.x * scale, mapped.y * scale, mapped.z * scale};
         } else {
             gravity_ = Vec3{0.0f, 0.0f, kSimG};  // screen-up fallback
         }
@@ -104,59 +99,56 @@ Vec3 MotionFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float d
         return out_;
     }
 
-    /* Shake is the high-pass of the same one-pole pair: current mapped minus the
-     * previous low-pass state (computed before the state advances). */
-    Vec3 hp = {
+    const Vec3 high_pass = {
         mapped.x - low_pass_state_.x,
         mapped.y - low_pass_state_.y,
         mapped.z - low_pass_state_.z,
     };
 
-    /* Low-pass state advance. */
-    low_pass_state_.x = ia * low_pass_state_.x + a * mapped.x;
-    low_pass_state_.y = ia * low_pass_state_.y + a * mapped.y;
-    low_pass_state_.z = ia * low_pass_state_.z + a * mapped.z;
+    low_pass_state_.x = retained * low_pass_state_.x + blend * mapped.x;
+    low_pass_state_.y = retained * low_pass_state_.y + blend * mapped.y;
+    low_pass_state_.z = retained * low_pass_state_.z + blend * mapped.z;
 
-    /* Direction-preserving normalization of the filtered gravity to |gravity| = kSimG.
-     * Scaling (never per-axis clamping) means the z component is preserved. */
-    const float gm = std::sqrt(low_pass_state_.x * low_pass_state_.x +
-                               low_pass_state_.y * low_pass_state_.y +
-                               low_pass_state_.z * low_pass_state_.z);
-    if (gm > kEps) {
-        const float s = kSimG / gm;
-        gravity_ = Vec3{low_pass_state_.x * s, low_pass_state_.y * s, low_pass_state_.z * s};
+    const float gravity_magnitude =
+        std::sqrt(low_pass_state_.x * low_pass_state_.x +
+                  low_pass_state_.y * low_pass_state_.y +
+                  low_pass_state_.z * low_pass_state_.z);
+    if (gravity_magnitude > kEps) {
+        const float scale = kSimG / gravity_magnitude;
+        gravity_ = Vec3{low_pass_state_.x * scale,
+                        low_pass_state_.y * scale,
+                        low_pass_state_.z * scale};
     }
-    /* else: near free fall (|lp| ~ 0): keep the previous gravity direction. */
 
-    // High-pass shake is deliberately attenuated: orientation supplies the
-    // sustained force while translation contributes a short, bounded impulse.
     const float scale = kShakeGain * kSimG / kOneG;
-    const float hx = hp.x * scale;
-    const float hy = hp.y * scale;
-    const float hz = hp.z * scale;
-    const float hm = std::sqrt(hx * hx + hy * hy + hz * hz);
-    if (hm > kShakeClampSim) {
-        const float s = kShakeClampSim / hm;
-        shake_ = Vec3{hx * s, hy * s, hz * s};
+    const float shake_x = high_pass.x * scale;
+    const float shake_y = high_pass.y * scale;
+    const float shake_z = high_pass.z * scale;
+    const float shake_magnitude =
+        std::sqrt(shake_x * shake_x + shake_y * shake_y + shake_z * shake_z);
+    if (shake_magnitude > kShakeClampSim) {
+        const float clamp_scale = kShakeClampSim / shake_magnitude;
+        shake_ = Vec3{shake_x * clamp_scale,
+                      shake_y * clamp_scale,
+                      shake_z * clamp_scale};
     } else {
-        shake_ = Vec3{hx, hy, hz};
+        shake_ = Vec3{shake_x, shake_y, shake_z};
     }
 
-    /* Total apparent acceleration = gravity + shake, magnitude-clamped to a safe
-     * finite bound. Magnitude-only clamping preserves z. */
     Vec3 out = {
         gravity_.x + shake_.x,
         gravity_.y + shake_.y,
         gravity_.z + shake_.z,
     };
-    const float om = std::sqrt(out.x * out.x + out.y * out.y + out.z * out.z);
-    if (om > kTotalClampSim) {
-        const float s = kTotalClampSim / om;
-        out = Vec3{out.x * s, out.y * s, out.z * s};
+    const float output_magnitude =
+        std::sqrt(out.x * out.x + out.y * out.y + out.z * out.z);
+    if (output_magnitude > kTotalClampSim) {
+        const float clamp_scale = kTotalClampSim / output_magnitude;
+        out = Vec3{out.x * clamp_scale,
+                   out.y * clamp_scale,
+                   out.z * clamp_scale};
     }
 
-    /* Belt-and-braces finite guard; if clamping ever produced a degenerate value,
-     * retain the last valid output instead of poisoning the physics. */
     if (!finite(out)) {
         accepted_last_ = false;
         return out_;
@@ -171,4 +163,4 @@ Vec3 MotionFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float d
     return out_;
 }
 
-} // namespace fluid_demo
+}  // namespace fluid_demo
