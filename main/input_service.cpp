@@ -1,20 +1,3 @@
-// input_service.cpp — shell-owned BOOT/PLUS/PWR button pipeline.
-//
-// The three debounce state machines and their classification rules are moved
-// VERBATIM from the legacy sensor task (app_main.cpp:122-270): BOOT
-// debounce/short-reboot with grace + short window, PLUS validated press edge
-// (one reset per press), PWR validated release (short event, never after a
-// long hold) plus the PWR >= 2 s board_power_off hold with held-through-boot
-// disarm and poweroff_sent suppression. board.cpp's GPIO init, levels and the
-// BAT_EN power-off sequence are untouched.
-//
-// Dev-console `input` gestures are enqueued into a bounded, thread-safe FIFO
-// and replayed as synthetic raw levels through these exact state machines:
-// poll() presents "pressed from dequeue until hold_ms elapses, then
-// released" in place of the physical board level, so classification (short/
-// long, the 2 s power-off hold, poweroff_sent suppression, BOOT short reboot)
-// is identical for `input` and for a physical press.
-
 #include "input_service.hpp"
 
 #include "esp_log.h"
@@ -169,9 +152,6 @@ bool InputService::poll(uint32_t now_ms, ButtonEvent *out)
 
     bool emitted = false;
 
-    // Legacy processing order (app_main.cpp:343-347): PLUS, then PWR, then
-    // BOOT — BOOT may esp_restart() (never returns) and PWR may
-    // board_power_off(). The first event in that order wins the single slot.
     if (process_reset_button(synthetic_level(ButtonId::Plus, now_ms))) {
         emitted = true;
         if (out != nullptr) {
@@ -263,9 +243,6 @@ bool InputService::process_power_button(const uint32_t now_ms, const bool raw_pr
 
 void InputService::process_boot_button(const uint32_t now_ms, const bool raw_pressed)
 {
-    // board_boot_pressed() reports the pressed state of the active-low GPIO0
-    // level: true when the button is down (level low). `raw_pressed` is the
-    // resolved level (physical or synthetic).
     const bool level_changed = raw_pressed != boot_.pressed_debounced;
     if (level_changed) {
         if (++boot_.stable_count >= kBootDebounceSamples) {

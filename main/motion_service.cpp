@@ -1,14 +1,6 @@
-// motion_service.cpp — shell-owned raw-motion pipeline.
-//
-// All behaviors moved verbatim from the legacy sensor task's poll block
-// (app_main.cpp:298-341) and dev_console.cpp's override state (mux protocol
-// :91-108, expiry check :356-367). The dt anchor advance is the one change:
-// the app's on_motion() acceptance result is fed back via acknowledge(), so a
-// rejected fresh sample re-clamps against the previous accepted anchor exactly
-// as the legacy `if (on_motion(tick)) last_motion_us = now_us;` did.
-
 #include "motion_service.hpp"
 
+#include <cmath>
 #include <cstdint>
 
 #include "esp_timer.h"
@@ -31,15 +23,12 @@ MotionTick MotionService::motion_tick()
     tick.fresh = (last_read_error_ == ESP_OK) && fresh;
     if (tick.fresh) {
         float dt = static_cast<float>(now_us - last_motion_us_) * 1e-6f;
-        if (dt < kMinDt || dt > kMaxDt || dt != dt) {  // clamp; NaN check included
+        if (!std::isfinite(dt) || dt < kMinDt || dt > kMaxDt) {
             dt = 1.0f / static_cast<float>(kSensorHz);
         }
         tick.dt = dt;
     }
 
-    // A development-console drive bypasses the physical IMU deterministically.
-    // Expiry is evaluated here (dev_console.cpp:356-367) and again under the
-    // same mux in override_snapshot() for the console's status read.
     const int64_t override_now_us = esp_timer_get_time();
     portENTER_CRITICAL(&override_mux_);
     if (override_.active && override_.until_us != 0 &&
