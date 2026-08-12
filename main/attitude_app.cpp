@@ -26,17 +26,23 @@ constexpr uint16_t kBand = 0x1C4A;
 constexpr uint16_t kMuted = 0x7C4F;
 constexpr uint16_t kAccent = 0xFE60;
 constexpr uint16_t kSky = 0x3C9C;
-constexpr uint16_t kGround = 0xC2A6;
-constexpr uint16_t kHorizon = 0xFFDF;
-constexpr uint16_t kChevron = 0xFFFF;
+constexpr uint16_t kSkyDeep = 0x226F;
+constexpr uint16_t kGround = 0x9B43;
+constexpr uint16_t kGroundDark = 0x7222;
+constexpr uint16_t kHorizon = 0xFFFF;
+constexpr uint16_t kHorizonEdge = 0x1082;
+constexpr uint16_t kGrid = 0x82C3;
+constexpr uint16_t kSun = 0xFE60;
+constexpr uint16_t kPlane = 0xFFFF;
+constexpr uint16_t kPlaneBody = 0xFE60;
+constexpr uint16_t kPlaneOutline = 0x0841;
 constexpr uint16_t kTick = 0xDEFB;
 constexpr uint16_t kIndex = 0xFE60;
 constexpr uint16_t kCenterDot = 0xF800;
 
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kDeg = kPi / 180.0f;
-constexpr float kPxPerRad = static_cast<float>(kRadius) / (0.5f * kPi);
-constexpr float kLadderGyroMax = 0.45f;
+constexpr float kPxPerRad = static_cast<float>(kRadius) / (0.55f * kPi);
 
 constexpr uint8_t kLauncherSkyBitmap[8] = {
     0b00111100,
@@ -88,78 +94,82 @@ void draw_bezel_tick(uint16_t *pixels, int width, int y0, int rows, float angle_
     fill_segment(pixels, width, y0, rows, x0, y0s, x1, y1, 1, color);
 }
 
-void draw_bank_index(uint16_t *pixels, int width, int y0, int rows, float roll)
+void draw_up_caret(uint16_t *pixels, int width, int y0, int rows)
 {
-    const float s = std::sin(roll);
-    const float c = std::cos(roll);
-    const float r = static_cast<float>(kRadius);
-    const float tx = static_cast<float>(kCx) + r * s;
-    const float ty = static_cast<float>(kCy) - r * c;
-    const float px = c;
-    const float py = s;
-    const float ix = -s;
-    const float iy = c;
-    float tri[6] = {
-        tx + 9.0f * ix,
-        ty + 9.0f * iy,
-        tx - 7.0f * px,
-        ty - 7.0f * py,
-        tx + 7.0f * px,
-        ty + 7.0f * py,
-    };
+    float tri[6] = {120.0f, 8.0f, 109.0f, 22.0f, 131.0f, 22.0f};
     fill_convex(pixels, width, y0, rows, tri, 3, kIndex);
 }
 
-void draw_horizon_line(uint16_t *pixels, int width, int y0, int rows, float nx,
-                       float ny, float along)
+void draw_horizon_band(uint16_t *pixels, int width, int y0, int rows, float nx,
+                       float ny, float along, int radius, uint16_t color)
 {
     const float px = -ny;
     const float py = nx;
-    const float span = 110.0f;
+    const float span = 112.0f;
     const float sx0 = static_cast<float>(kCx) + nx * along - px * span;
     const float sy0 = static_cast<float>(kCy) - ny * along + py * span;
     const float sx1 = static_cast<float>(kCx) + nx * along + px * span;
     const float sy1 = static_cast<float>(kCy) - ny * along - py * span;
     fill_segment(pixels, width, y0, rows, static_cast<int>(sx0 + 0.5f),
                  static_cast<int>(sy0 + 0.5f), static_cast<int>(sx1 + 0.5f),
-                 static_cast<int>(sy1 + 0.5f), 1, kHorizon);
+                 static_cast<int>(sy1 + 0.5f), radius, color);
 }
 
-void draw_ladder(uint16_t *pixels, int width, int y0, int rows, float nx, float ny,
-                 float horizon_along)
+void draw_ground_grid(uint16_t *pixels, int width, int y0, int rows, float nx,
+                      float ny, float along)
 {
     const float px = -ny;
     const float py = nx;
-    const float marks[4] = {10.0f, 20.0f, -10.0f, -20.0f};
-    for (int i = 0; i < 4; ++i) {
-        const float along = horizon_along + marks[i] * kDeg * kPxPerRad;
-        if (std::fabs(along) > static_cast<float>(kRadius) - 12.0f) {
+    const float spacings[5] = {16.0f, 34.0f, 56.0f, 82.0f, 112.0f};
+    for (int i = 0; i < 5; ++i) {
+        const float dist = spacings[i];
+        const float line_along = along - dist;
+        if (std::fabs(line_along) > static_cast<float>(kRadius) - 6.0f) {
             continue;
         }
-        const float cx = static_cast<float>(kCx) + nx * along;
-        const float cy = static_cast<float>(kCy) - ny * along;
-        const float half = 16.0f;
-        const float gap = 5.0f;
+        const float half = 18.0f + dist * 0.55f;
+        const float cx = static_cast<float>(kCx) + nx * line_along;
+        const float cy = static_cast<float>(kCy) - ny * line_along;
         fill_segment(pixels, width, y0, rows,
                      static_cast<int>(cx - px * half + 0.5f),
                      static_cast<int>(cy + py * half + 0.5f),
-                     static_cast<int>(cx - px * gap + 0.5f),
-                     static_cast<int>(cy + py * gap + 0.5f), 1, kHorizon);
-        fill_segment(pixels, width, y0, rows,
-                     static_cast<int>(cx + px * gap + 0.5f),
-                     static_cast<int>(cy - py * gap + 0.5f),
                      static_cast<int>(cx + px * half + 0.5f),
-                     static_cast<int>(cy - py * half + 0.5f), 1, kHorizon);
+                     static_cast<int>(cy - py * half + 0.5f), 0, kGrid);
+    }
+    const float vanish = 160.0f;
+    const float vx = static_cast<float>(kCx) + nx * (along - vanish);
+    const float vy = static_cast<float>(kCy) - ny * (along - vanish);
+    const float offsets[7] = {-70.0f, -42.0f, -18.0f, 0.0f, 18.0f, 42.0f, 70.0f};
+    for (int i = 0; i < 7; ++i) {
+        const float hx = static_cast<float>(kCx) + nx * along + px * offsets[i];
+        const float hy = static_cast<float>(kCy) - ny * along - py * offsets[i];
+        fill_segment(pixels, width, y0, rows, static_cast<int>(vx + 0.5f),
+                     static_cast<int>(vy + 0.5f), static_cast<int>(hx + 0.5f),
+                     static_cast<int>(hy + 0.5f), 0, kGrid);
     }
 }
 
-void draw_chevron(uint16_t *pixels, int width, int y0, int rows)
+void draw_aircraft(uint16_t *pixels, int width, int y0, int rows)
 {
-    fill_segment(pixels, width, y0, rows, 64, 120, 102, 120, 2, kChevron);
-    fill_segment(pixels, width, y0, rows, 138, 120, 176, 120, 2, kChevron);
-    fill_segment(pixels, width, y0, rows, 102, 120, 120, 112, 2, kChevron);
-    fill_segment(pixels, width, y0, rows, 138, 120, 120, 112, 2, kChevron);
-    fill_disc(pixels, width, y0, rows, kCx, kCy, 3, kChevron);
+    fill_segment(pixels, width, y0, rows, 28, 120, 102, 120, 5, kPlaneOutline);
+    fill_segment(pixels, width, y0, rows, 138, 120, 212, 120, 5, kPlaneOutline);
+    fill_segment(pixels, width, y0, rows, 30, 120, 100, 120, 3, kPlane);
+    fill_segment(pixels, width, y0, rows, 140, 120, 210, 120, 3, kPlane);
+
+    fill_disc(pixels, width, y0, rows, kCx, kCy, 11, kPlaneOutline);
+    fill_disc(pixels, width, y0, rows, kCx, kCy, 8, kPlaneBody);
+
+    float nose_out[6] = {120.0f, 96.0f, 106.0f, 118.0f, 134.0f, 118.0f};
+    fill_convex(pixels, width, y0, rows, nose_out, 3, kPlaneOutline);
+    float nose[6] = {120.0f, 100.0f, 110.0f, 117.0f, 130.0f, 117.0f};
+    fill_convex(pixels, width, y0, rows, nose, 3, kPlane);
+
+    fill_segment(pixels, width, y0, rows, 120, 120, 120, 142, 4, kPlaneOutline);
+    fill_segment(pixels, width, y0, rows, 120, 122, 120, 140, 2, kPlane);
+    fill_segment(pixels, width, y0, rows, 108, 138, 132, 138, 3, kPlaneOutline);
+    fill_segment(pixels, width, y0, rows, 110, 138, 130, 138, 2, kPlane);
+
+    fill_disc(pixels, width, y0, rows, kCx, kCy, 3, kPlane);
     fill_disc(pixels, width, y0, rows, kCx, kCy, 1, kCenterDot);
 }
 
@@ -245,15 +255,25 @@ bool AttitudeApp::on_motion(const MotionTick &tick)
         return false;
     }
 
-    const Vec3 up = filter_.up();
+    const float *R = filter_.matrix();
+    Vec3 up{R[1], R[4], R[7]};
+    const float mag = std::sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
+    if (!std::isfinite(mag) || mag < 1e-5f) {
+        up = {0.0f, 1.0f, 0.0f};
+    } else {
+        up.x /= mag;
+        up.y /= mag;
+        up.z /= mag;
+    }
+    const float uxy = std::sqrt(up.x * up.x + up.y * up.y);
     portENTER_CRITICAL(&motion_mux_);
     motion_.apparent = override_valid ? tick.apparent_accel : filter_.mapped_accel();
     motion_.valid = true;
     motion_.up_x = up.x;
     motion_.up_y = up.y;
     motion_.up_z = up.z;
-    motion_.roll = filter_.roll();
-    motion_.pitch = filter_.pitch();
+    motion_.roll = std::atan2(up.x, up.y);
+    motion_.pitch = std::atan2(up.z, uxy);
     motion_.gyro_abs = filter_.gyro_abs();
     if (physical_valid) {
         motion_.raw = tick.accel_mps2;
@@ -277,8 +297,7 @@ void AttitudeApp::fill_snapshot(HorizonFrame &snapshot)
     snapshot.up_z = motion_.up_z;
     snapshot.roll = motion_.roll;
     snapshot.pitch = motion_.pitch;
-    snapshot.ladder_ok = motion_.gyro_abs < kLadderGyroMax &&
-                         std::fabs(motion_.pitch) < 50.0f * kDeg;
+    snapshot.ladder_ok = true;
     portEXIT_CRITICAL(&motion_mux_);
 }
 
@@ -364,26 +383,48 @@ void AttitudeApp::raster_stripe(const HorizonFrame &horizon, uint16_t *pixels,
             }
             const float proj =
                 static_cast<float>(dx) * nx + static_cast<float>(-dy) * ny;
-            row[x] = proj > along ? kSky : kGround;
+            if (proj > along) {
+                const float sky_t = (proj - along) / static_cast<float>(kRadius);
+                row[x] = sky_t > 0.55f ? kSkyDeep : kSky;
+            } else {
+                const float ground_t = (along - proj) / static_cast<float>(kRadius);
+                row[x] = ground_t > 0.62f ? kGroundDark : kGround;
+            }
         }
     }
 
     if (!zenith) {
-        draw_horizon_line(pixels, width, y0, rows, nx, ny, along);
-        if (horizon.ladder_ok) {
-            draw_ladder(pixels, width, y0, rows, nx, ny, along);
+        draw_ground_grid(pixels, width, y0, rows, nx, ny, along);
+        const float sun_along = along + 42.0f;
+        if (std::fabs(sun_along) < static_cast<float>(kRadius) - 16.0f) {
+            fill_disc(pixels, width, y0, rows,
+                      kCx + static_cast<int>(nx * sun_along + 0.5f),
+                      kCy - static_cast<int>(ny * sun_along + 0.5f), 9, kSun);
         }
+        draw_horizon_band(pixels, width, y0, rows, nx, ny, along, 3, kHorizonEdge);
+        draw_horizon_band(pixels, width, y0, rows, nx, ny, along, 2, kHorizon);
     }
 
-    constexpr float kTickDeg[9] = {0.0f, 10.0f, -10.0f, 20.0f, -20.0f,
-                                   30.0f, -30.0f, 60.0f, -60.0f};
-    for (int i = 0; i < 9; ++i) {
-        const int inner = (i == 0 || i >= 5) ? 106 : 111;
+    constexpr float kTickDeg[5] = {0.0f, 15.0f, -15.0f, 30.0f, -30.0f};
+    for (int i = 0; i < 5; ++i) {
+        const int inner = (i == 0) ? 104 : 110;
         draw_bezel_tick(pixels, width, y0, rows, kTickDeg[i] * kDeg, inner, kRadius,
                         kTick);
     }
-    draw_bank_index(pixels, width, y0, rows, horizon.roll);
-    draw_chevron(pixels, width, y0, rows);
+    draw_up_caret(pixels, width, y0, rows);
+    draw_aircraft(pixels, width, y0, rows);
+
+    for (int local_y = 0; local_y < rows; ++local_y) {
+        uint16_t *row = pixels + local_y * width;
+        const int y = y0 + local_y;
+        const int dy = y - kCy;
+        for (int x = 0; x < width; ++x) {
+            const int dx = x - kCx;
+            if (dx * dx + dy * dy > kRadiusSq) {
+                row[x] = kBezel;
+            }
+        }
+    }
 }
 
 bool AttitudeApp::render(DisplayFrame &frame)

@@ -43,9 +43,9 @@ private:
     };
 
     void fill_snapshot(CubeFrame &snapshot);
-    static void raster_stripe(const float projected[8][3], const int order[6],
-                              const bool visible[6], uint16_t *pixels, int width,
-                              int y0, int rows);
+    static void raster_stripe(const float projected[8][3], const float cam[8][3],
+                              const int order[6], const bool visible[6],
+                              uint16_t *pixels, int width, int y0, int rows);
 
     AttitudeFilter filter_;
     portMUX_TYPE motion_mux_ = portMUX_INITIALIZER_UNLOCKED;

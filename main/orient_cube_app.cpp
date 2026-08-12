@@ -18,19 +18,21 @@ constexpr int kPanelWidth = 240;
 constexpr int kPanelHeight = 240;
 
 constexpr uint16_t kBackground = 0x10A3;
+constexpr uint16_t kWell = 0x2126;
 constexpr uint16_t kBand = 0x2A28;
 constexpr uint16_t kMuted = 0x7C4F;
 constexpr uint16_t kAccent = 0xF50A;
-constexpr uint16_t kFront = 0x3D9B;
-constexpr uint16_t kFrontInset = 0x1C75;
-constexpr uint16_t kBack = 0x3186;
-constexpr uint16_t kBackMark = 0x4A69;
-constexpr uint16_t kRight = 0x1C86;
-constexpr uint16_t kLeft = 0xC165;
-constexpr uint16_t kTop = 0xDEFB;
-constexpr uint16_t kUsb = 0xD3E4;
-constexpr uint16_t kUsbMark = 0xFEC0;
-constexpr uint16_t kEdge = 0x1082;
+constexpr uint16_t kFront = 0x2A96;
+constexpr uint16_t kFrontInset = 0x12B0;
+constexpr uint16_t kFrontGlass = 0x45D9;
+constexpr uint16_t kBack = 0x3A49;
+constexpr uint16_t kBackMark = 0x632C;
+constexpr uint16_t kRight = 0x4C8E;
+constexpr uint16_t kLeft = 0x5AAB;
+constexpr uint16_t kTop = 0xC638;
+constexpr uint16_t kUsb = 0xC4A0;
+constexpr uint16_t kUsbMark = 0xFEE0;
+constexpr uint16_t kEdge = 0x0000;
 
 constexpr uint8_t kLauncherCubeBitmap[8] = {
     0b00011100,
@@ -63,10 +65,17 @@ constexpr LauncherVisual kLauncherVisual{
     kLauncherCubeTopBitmap,
 };
 
-constexpr float kHalf = 0.82f;
-constexpr float kCam = 2.55f;
-constexpr float kFocal = 168.0f;
+constexpr float kHalf = 0.90f;
+constexpr float kCam = 6.0f;
+constexpr float kFocal = 400.0f;
 constexpr float kCenter = 120.0f;
+constexpr int kDiscRadius = 118;
+constexpr int kDiscRadiusSq = kDiscRadius * kDiscRadius;
+constexpr float kViewYaw = 0.40f;
+constexpr float kViewPitch = 0.26f;
+constexpr float kLightX = 0.42f;
+constexpr float kLightY = 0.74f;
+constexpr float kLightZ = 0.53f;
 
 constexpr int kFaceVerts[6][4] = {
     {0, 1, 2, 3},  // screen / +Z
@@ -92,7 +101,7 @@ void copy_matrix(float *dst, const float *src)
     }
 }
 
-void project_vertices(const float R[9], float out[8][3])
+void project_vertices(const float R[9], float cam[8][3], float out[8][3])
 {
     const float model[8][3] = {
         {-kHalf, -kHalf, kHalf},  {kHalf, -kHalf, kHalf},
@@ -100,19 +109,58 @@ void project_vertices(const float R[9], float out[8][3])
         {-kHalf, -kHalf, -kHalf}, {kHalf, -kHalf, -kHalf},
         {kHalf, kHalf, -kHalf},   {-kHalf, kHalf, -kHalf},
     };
+    const float cy = std::cos(kViewYaw);
+    const float sy = std::sin(kViewYaw);
+    const float cp = std::cos(kViewPitch);
+    const float sp = std::sin(kViewPitch);
     for (int i = 0; i < 8; ++i) {
-        const float x = R[0] * model[i][0] + R[1] * model[i][1] + R[2] * model[i][2];
-        const float y = R[3] * model[i][0] + R[4] * model[i][1] + R[5] * model[i][2];
-        const float z = R[6] * model[i][0] + R[7] * model[i][1] + R[8] * model[i][2];
-        float denom = kCam - z;
-        if (denom < 0.25f) {
-            denom = 0.25f;
+        const float ax = R[0] * model[i][0] + R[1] * model[i][1] + R[2] * model[i][2];
+        const float ay = R[3] * model[i][0] + R[4] * model[i][1] + R[5] * model[i][2];
+        const float az = R[6] * model[i][0] + R[7] * model[i][1] + R[8] * model[i][2];
+        const float x1 = cy * ax + sy * az;
+        const float z1 = -sy * ax + cy * az;
+        const float y2 = cp * ay - sp * z1;
+        const float z2 = sp * ay + cp * z1;
+        cam[i][0] = x1;
+        cam[i][1] = y2;
+        cam[i][2] = z2;
+        float denom = kCam - z2;
+        if (denom < 0.35f) {
+            denom = 0.35f;
         }
         const float persp = kFocal / denom;
-        out[i][0] = kCenter + x * persp;
-        out[i][1] = kCenter - y * persp;
-        out[i][2] = z;
+        out[i][0] = kCenter + x1 * persp;
+        out[i][1] = kCenter - y2 * persp;
+        out[i][2] = z2;
     }
+}
+
+float face_light(const float cam[8][3], int face)
+{
+    const int ia = kFaceVerts[face][0];
+    const int ib = kFaceVerts[face][1];
+    const int ic = kFaceVerts[face][2];
+    const float e1x = cam[ib][0] - cam[ia][0];
+    const float e1y = cam[ib][1] - cam[ia][1];
+    const float e1z = cam[ib][2] - cam[ia][2];
+    const float e2x = cam[ic][0] - cam[ia][0];
+    const float e2y = cam[ic][1] - cam[ia][1];
+    const float e2z = cam[ic][2] - cam[ia][2];
+    float nx = e1y * e2z - e1z * e2y;
+    float ny = e1z * e2x - e1x * e2z;
+    float nz = e1x * e2y - e1y * e2x;
+    const float mag = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (mag < 1e-5f) {
+        return 0.35f;
+    }
+    nx /= mag;
+    ny /= mag;
+    nz /= mag;
+    float ndotl = nx * kLightX + ny * kLightY + nz * kLightZ;
+    if (ndotl < 0.0f) {
+        ndotl = 0.0f;
+    }
+    return 0.48f + 0.52f * ndotl;
 }
 
 float face_area(const float projected[8][3], int face)
@@ -145,28 +193,6 @@ void lerp_quad(const float xy[8], float t, float out[8])
     }
 }
 
-void edge_strip(const float xy[8], int a, int b, float t0, float t1, float out[8])
-{
-    const int c = (a + 3) & 3;
-    const int d = (b + 1) & 3;
-    const float ax = xy[2 * a];
-    const float ay = xy[2 * a + 1];
-    const float bx = xy[2 * b];
-    const float by = xy[2 * b + 1];
-    const float cx = xy[2 * c];
-    const float cy = xy[2 * c + 1];
-    const float dx = xy[2 * d];
-    const float dy = xy[2 * d + 1];
-    out[0] = ax + t0 * (cx - ax);
-    out[1] = ay + t0 * (cy - ay);
-    out[2] = bx + t0 * (dx - bx);
-    out[3] = by + t0 * (dy - by);
-    out[4] = bx + t1 * (dx - bx);
-    out[5] = by + t1 * (dy - by);
-    out[6] = ax + t1 * (cx - ax);
-    out[7] = ay + t1 * (cy - ay);
-}
-
 void draw_edges(const float xy[8], uint16_t *pixels, int width, int y0, int rows)
 {
     for (int i = 0; i < 4; ++i) {
@@ -174,7 +200,7 @@ void draw_edges(const float xy[8], uint16_t *pixels, int width, int y0, int rows
         fill_segment(pixels, width, y0, rows, static_cast<int>(xy[2 * i] + 0.5f),
                      static_cast<int>(xy[2 * i + 1] + 0.5f),
                      static_cast<int>(xy[2 * j] + 0.5f),
-                     static_cast<int>(xy[2 * j + 1] + 0.5f), 0, kEdge);
+                     static_cast<int>(xy[2 * j + 1] + 0.5f), 1, kEdge);
     }
 }
 
@@ -329,14 +355,17 @@ AppStats OrientCubeApp::stats()
     return result;
 }
 
-void OrientCubeApp::raster_stripe(const float projected[8][3], const int order[6],
-                                  const bool visible[6], uint16_t *pixels, int width,
-                                  int y0, int rows)
+void OrientCubeApp::raster_stripe(const float projected[8][3], const float cam[8][3],
+                                  const int order[6], const bool visible[6],
+                                  uint16_t *pixels, int width, int y0, int rows)
 {
     for (int local_y = 0; local_y < rows; ++local_y) {
         uint16_t *row = pixels + local_y * width;
+        const int y = y0 + local_y;
+        const int dy = y - static_cast<int>(kCenter);
         for (int x = 0; x < width; ++x) {
-            row[x] = kBackground;
+            const int dx = x - static_cast<int>(kCenter);
+            row[x] = (dx * dx + dy * dy <= kDiscRadiusSq) ? kWell : kBackground;
         }
     }
 
@@ -347,23 +376,54 @@ void OrientCubeApp::raster_stripe(const float projected[8][3], const int order[6
         }
         float xy[8];
         face_quad(projected, face, xy);
-        fill_convex_quad(pixels, width, y0, rows, xy, kFaceFill[face]);
+        const float light = face_light(cam, face);
+        const uint16_t fill = shade_rgb565(kFaceFill[face], light);
+        float expanded[8];
+        lerp_quad(xy, 1.03f, expanded);
+        fill_convex_quad(pixels, width, y0, rows, expanded, fill);
 
-        float inset[8];
-        if (face == 0) {
-            lerp_quad(xy, 0.78f, inset);
-            fill_convex_quad(pixels, width, y0, rows, inset, kFrontInset);
-            float usb[8];
-            edge_strip(xy, 0, 1, 0.06f, 0.20f, usb);
-            fill_convex_quad(pixels, width, y0, rows, usb, kUsbMark);
-        } else if (face == 1) {
-            lerp_quad(xy, 0.35f, inset);
-            fill_convex_quad(pixels, width, y0, rows, inset, kBackMark);
-        } else if (face == 5) {
-            lerp_quad(xy, 0.45f, inset);
-            fill_convex_quad(pixels, width, y0, rows, inset, kUsbMark);
+        const float area = std::fabs(face_area(projected, face));
+        if (area > 1200.0f) {
+            float inset[8];
+            if (face == 0) {
+                lerp_quad(xy, 0.70f, inset);
+                fill_convex_quad(pixels, width, y0, rows, inset,
+                                 shade_rgb565(kFrontInset, light));
+                lerp_quad(xy, 0.52f, inset);
+                fill_convex_quad(pixels, width, y0, rows, inset,
+                                 shade_rgb565(kFrontGlass, light * 0.90f));
+            } else if (face == 1) {
+                lerp_quad(xy, 0.28f, inset);
+                fill_convex_quad(pixels, width, y0, rows, inset,
+                                 shade_rgb565(kBackMark, light));
+            } else if (face == 5) {
+                lerp_quad(xy, 0.40f, inset);
+                fill_convex_quad(pixels, width, y0, rows, inset,
+                                 shade_rgb565(kUsbMark, light));
+            }
         }
+    }
+
+    for (int n = 0; n < 6; ++n) {
+        const int face = order[n];
+        if (!visible[face]) {
+            continue;
+        }
+        float xy[8];
+        face_quad(projected, face, xy);
         draw_edges(xy, pixels, width, y0, rows);
+    }
+
+    for (int local_y = 0; local_y < rows; ++local_y) {
+        uint16_t *row = pixels + local_y * width;
+        const int y = y0 + local_y;
+        const int dy = y - static_cast<int>(kCenter);
+        for (int x = 0; x < width; ++x) {
+            const int dx = x - static_cast<int>(kCenter);
+            if (dx * dx + dy * dy > kDiscRadiusSq) {
+                row[x] = kBackground;
+            }
+        }
     }
 }
 
@@ -384,8 +444,9 @@ bool OrientCubeApp::render(DisplayFrame &frame)
         return false;
     }
 
+    float cam[8][3];
     float projected[8][3];
-    project_vertices(cube->R, projected);
+    project_vertices(cube->R, cam, projected);
     bool visible[6];
     float depth[6];
     int order[6];
@@ -421,7 +482,7 @@ bool OrientCubeApp::render(DisplayFrame &frame)
             }
             uint16_t *pixels = frame.stripe[stripe & 1];
             const int64_t raster_start = esp_timer_get_time();
-            raster_stripe(projected, order, visible, pixels, frame.width, stripe_y,
+            raster_stripe(projected, cam, order, visible, pixels, frame.width, stripe_y,
                           stripe_rows);
             const int pixel_count = frame.width * stripe_rows;
             for (int pixel = 0; pixel < pixel_count; ++pixel) {

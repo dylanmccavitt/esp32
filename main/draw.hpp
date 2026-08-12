@@ -18,4 +18,9 @@ void fill_convex(uint16_t *pixels, int width, int y0, int rows, const float *xy,
 void fill_convex_quad(uint16_t *pixels, int width, int y0, int rows, const float *xy,
                       uint16_t color);
 
+void fill_triangle(uint16_t *pixels, int width, int y0, int rows, float x0, float y0s,
+                   float x1, float y1, float x2, float y2, uint16_t color);
+
+uint16_t shade_rgb565(uint16_t color, float light);
+
 }  // namespace fluid_demo

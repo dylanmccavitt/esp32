@@ -39,6 +39,12 @@ public:
     /// queued; ESP_ERR_NO_MEM when the bounded FIFO is full.
     esp_err_t enqueue_gesture(ButtonId button, uint32_t hold_ms);
 
+    /// Enqueue one synthetic launcher swipe. `poll_touch` emits Begin then End
+    /// with the matching `TouchGesture` on the next two idle sensor ticks.
+    /// ESP_OK when queued; ESP_ERR_NO_MEM if a swipe is already pending;
+    /// ESP_ERR_INVALID_ARG if `gesture` is not a swipe.
+    esp_err_t enqueue_swipe(TouchGesture gesture);
+
     void set_power_off_marker(PowerOffMarker marker);
     void set_reboot_marker(RebootMarker marker);
 
@@ -115,6 +121,14 @@ private:
     uint16_t touch_last_x_ = 0;
     uint16_t touch_last_y_ = 0;
     esp_err_t last_touch_error_ = ESP_OK;
+
+    bool swipe_pending_ = false;
+    bool swipe_began_ = false;
+    TouchGesture swipe_gesture_ = TouchGesture::None;
+    uint16_t swipe_x0_ = 0;
+    uint16_t swipe_y0_ = 0;
+    uint16_t swipe_x1_ = 0;
+    uint16_t swipe_y1_ = 0;
 };
 
 }  // namespace fluid_demo

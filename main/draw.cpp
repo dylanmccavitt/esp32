@@ -127,10 +127,79 @@ void fill_convex(uint16_t *pixels, int width, int y0, int rows, const float *xy,
     }
 }
 
+void fill_triangle(uint16_t *pixels, int width, int y0, int rows, float x0, float y0s,
+                   float x1, float y1, float x2, float y2, uint16_t color)
+{
+    if (pixels == nullptr || width <= 0 || rows <= 0) {
+        return;
+    }
+    const float area = (x1 - x0) * (y2 - y0s) - (x2 - x0) * (y1 - y0s);
+    if (std::fabs(area) < 0.25f) {
+        return;
+    }
+    const float min_x = (x0 < x1 ? x0 : x1) < x2 ? (x0 < x1 ? x0 : x1) : x2;
+    const float max_x = (x0 > x1 ? x0 : x1) > x2 ? (x0 > x1 ? x0 : x1) : x2;
+    const float min_y = (y0s < y1 ? y0s : y1) < y2 ? (y0s < y1 ? y0s : y1) : y2;
+    const float max_y = (y0s > y1 ? y0s : y1) > y2 ? (y0s > y1 ? y0s : y1) : y2;
+    const int top = max_int(y0, static_cast<int>(std::floor(min_y)));
+    const int bottom = min_int(y0 + rows - 1, static_cast<int>(std::ceil(max_y)));
+    const int left = max_int(0, static_cast<int>(std::floor(min_x)));
+    const int right = min_int(width - 1, static_cast<int>(std::ceil(max_x)));
+    if (top > bottom || left > right) {
+        return;
+    }
+    const float e01x = y0s - y1;
+    const float e01y = x1 - x0;
+    const float e12x = y1 - y2;
+    const float e12y = x2 - x1;
+    const float e20x = y2 - y0s;
+    const float e20y = x0 - x2;
+    const float sign = area > 0.0f ? 1.0f : -1.0f;
+    for (int y = top; y <= bottom; ++y) {
+        const float py = static_cast<float>(y) + 0.5f;
+        uint16_t *row = pixels + (y - y0) * width;
+        for (int x = left; x <= right; ++x) {
+            const float px = static_cast<float>(x) + 0.5f;
+            const float w0 = sign * (e12x * (px - x1) + e12y * (py - y1));
+            const float w1 = sign * (e20x * (px - x2) + e20y * (py - y2));
+            const float w2 = sign * (e01x * (px - x0) + e01y * (py - y0s));
+            if (w0 >= -0.35f && w1 >= -0.35f && w2 >= -0.35f) {
+                row[x] = color;
+            }
+        }
+    }
+}
+
 void fill_convex_quad(uint16_t *pixels, int width, int y0, int rows, const float *xy,
                       uint16_t color)
 {
     fill_convex(pixels, width, y0, rows, xy, 4, color);
+}
+
+uint16_t shade_rgb565(uint16_t color, float light)
+{
+    if (light < 0.0f) {
+        light = 0.0f;
+    }
+    if (light > 1.0f) {
+        light = 1.0f;
+    }
+    int r = (color >> 11) & 0x1F;
+    int g = (color >> 5) & 0x3F;
+    int b = color & 0x1F;
+    r = static_cast<int>(static_cast<float>(r) * light + 0.5f);
+    g = static_cast<int>(static_cast<float>(g) * light + 0.5f);
+    b = static_cast<int>(static_cast<float>(b) * light + 0.5f);
+    if (r > 31) {
+        r = 31;
+    }
+    if (g > 63) {
+        g = 63;
+    }
+    if (b > 31) {
+        b = 31;
+    }
+    return static_cast<uint16_t>((r << 11) | (g << 5) | b);
 }
 
 }  // namespace fluid_demo

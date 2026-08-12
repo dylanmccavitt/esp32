@@ -147,8 +147,9 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
                                 command_reset)) != ESP_OK ||
         (err = register_command("reboot", "Restart the firmware", nullptr,
                                 command_reboot)) != ESP_OK ||
-        (err = register_command("input", "Inject a debounced shell button gesture",
-                                "<plus|pwr|boot> [hold_ms]", command_input)) != ESP_OK) {
+        (err = register_command("input", "Inject a debounced shell button or launcher swipe",
+                                "<plus|pwr|boot|swipe-left|swipe-right> [hold_ms]",
+                                command_input)) != ESP_OK) {
         return err;
     }
 
@@ -314,8 +315,24 @@ int ConsoleService::command_reboot(int argc, char **argv)
 
 int ConsoleService::command_input(int argc, char **argv)
 {
-    if ((argc != 2 && argc != 3) || s_active->input_ == nullptr) {
-        std::printf("usage: input <plus|pwr|boot> [hold_ms]\r\n");
+    if (s_active->input_ == nullptr) {
+        std::printf("usage: input <plus|pwr|boot|swipe-left|swipe-right> [hold_ms]\r\n");
+        return 1;
+    }
+    if (argc == 2 && (std::strcmp(argv[1], "swipe-left") == 0 ||
+                      std::strcmp(argv[1], "swipe-right") == 0)) {
+        const TouchGesture gesture = std::strcmp(argv[1], "swipe-left") == 0
+                                         ? TouchGesture::SwipeLeft
+                                         : TouchGesture::SwipeRight;
+        const esp_err_t err = s_active->input_->enqueue_swipe(gesture);
+        if (err != ESP_OK) {
+            std::printf("input: swipe queue full\r\n");
+            return 1;
+        }
+        return 0;
+    }
+    if (argc != 2 && argc != 3) {
+        std::printf("usage: input <plus|pwr|boot|swipe-left|swipe-right> [hold_ms]\r\n");
         return 1;
     }
 
@@ -327,7 +344,7 @@ int ConsoleService::command_input(int argc, char **argv)
     } else if (std::strcmp(argv[1], "boot") == 0) {
         button = ButtonId::Boot;
     } else {
-        std::printf("usage: input <plus|pwr|boot> [hold_ms]\r\n");
+        std::printf("usage: input <plus|pwr|boot|swipe-left|swipe-right> [hold_ms]\r\n");
         return 1;
     }
 
