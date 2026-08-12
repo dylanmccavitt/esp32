@@ -23,7 +23,7 @@ namespace fluid_demo {
 class MotionFilter {
 public:
     /** Simulation gravity magnitude the filtered gravity is normalized to. */
-    static constexpr float kSimG = 6.0f;
+    static constexpr float kSimG = 9.0f;
     /** Standard gravity used for the shake scaling and sanity bounds. */
     static constexpr float kOneG = 9.807f;
 

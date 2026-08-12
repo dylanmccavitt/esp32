@@ -1,6 +1,5 @@
 #include "fluid_app.hpp"
 
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -15,40 +14,117 @@ namespace {
 
 constexpr const char *kTag = "fluid_demo";
 
-// Native square panel geometry (mirrors DisplayService constants; the app
-// drives sequencing through DisplayFrame ops, but the raster row strides here
-// are canonical and byte-identical to the pre-split renderer).
-constexpr int kWidth = 240;
-constexpr int kHeight = 240;
-constexpr int kSurfaceScale = 2;
-constexpr int kSurfaceWidth = kWidth / kSurfaceScale;
-constexpr int kSurfaceHeight = kHeight / kSurfaceScale;
-constexpr uint16_t kSurfaceThreshold = 40;
-constexpr uint16_t kSurfaceAaWidth = 28;
+// ---------------------------------------------------------------------------
+// Engine constants ("Popcorn Walker" spec). Units: positions Q8.8 pixels,
+// velocities Q8.8 px/frame, dt = 1/30 s fixed (one step per render call);
+// every time-based constant is pre-baked for that dt.
+// ---------------------------------------------------------------------------
 
-// Physical volume: 27.72 mm square active LCD and 22.5 mm enclosure depth.
-// The front display is z=0; +z enters the case.
-constexpr float kBoxHalfX = 0.5f;
-constexpr float kBoxHalfY = 0.5f;
-constexpr float kBoxDepthZ = 0.812f;
+// Gravity / input. |apparent| = 9.0 sim units at full edge tilt.
+constexpr int kAccelQ8PerUnit = 64;      // raw px/frame^2 per sim unit
+constexpr int kAccelClampRaw = 1024;     // +/-4 px/frame/axis per frame
+// Down ALWAYS exists. Above this in-plane magnitude the live tilt sets
+// the gravity direction; below it the last-known direction keeps pulling
+// (a box seen through a side window always has a floor). Particles can
+// never hang in the air, whatever the device orientation.
+constexpr float kGravUpdateMag = 0.6f;
+// Applied pull magnitude is never below FULL gravity (9.0): tilt only
+// chooses the direction. There is no weak-pull regime anywhere - a
+// disturbed speck always falls at full acceleration, so nothing can
+// ever read as floating or drifting slowly.
+constexpr float kAccelFloorUnits = 9.0f;
 
-// Perspective makes the 22.5 mm enclosure depth legible without over-shrinking
-// particles at the back. The front face is 210 px square with a 15 px border.
-constexpr float kFocal = 1.3f;
-constexpr float kPxPerWorld = 210.0f;
+// Motion.
+constexpr int kDragShift = 7;      // v -= v>>7 per frame (~0.992)
+constexpr int kVmaxRaw = 4096;     // 16 px/frame per axis (480 px/s)
+constexpr int kMaxWalkSteps = 18;  // per particle per frame (covers vmax)
+// 75% of the reachable walk-step ceiling (3000 particles * (18+4) guard);
+// past this the frame is under genuine overload and the brake engages.
+constexpr uint32_t kStepGovernor = (3000u * (kMaxWalkSteps + 4) * 3u) / 4u;
+constexpr int kGovernorDispRaw = 1024;  // 4 px displacement clamp when hit
+constexpr int kGovernorGuard = 6;       // walk iteration cap when governed
 
-// Depth buffer fixed point: 1/4096 world unit. All particle surfaces stay far
-// below 65535, so 0xFFFF (bytes 0xFF) is a valid "empty" marker.
-constexpr float kDepthFxScale = 4096.0f;
+// Collision response.
+constexpr int kWallRestNum = 153;   // e_wall = 0.60
+constexpr int kFloorFricShift = 3;  // tangential loss on the gravity axis wall
+constexpr int kSideFricShift = 5;   // tangential loss on other walls
+constexpr int kWallJitterRaw = 64;  // +/-0.25 px/frame tangential jitter
+constexpr int kDeadStopRaw = 90;    // post-bounce |v_n| < 0.35 px/frame -> 0
+constexpr int kPpTangNum = 230;     // particle hit: v_t *= 0.9; v_n = -(v_n>>1)
 
-// Dim wireframe color for the 3D box edges (drawn before particles).
-constexpr uint16_t kEdgeColor = 0x1905;  // dark blue-gray RGB565
+// Kick (grid bits 6-7, harvested next frame). Impact kicks occupy counts
+// 1-2; count 3 (0xC0) is reserved as a wake-only tag written by
+// support-loss, so a vacated-support particle wakes and falls under
+// gravity instead of being launched upward (which self-pumps).
+constexpr int kKickTriggerRaw = 512;  // pre-impact |v_n| >= 2 px/frame
+constexpr int kKickUpRaw = 640;       // 2.5 px/frame anti-gravity per count
+constexpr int kKickLatRaw = 230;      // 0.9 px/frame random-sign lateral
 
-// Velocity palette reference: speed >= kSpeedRef maps to the hottest color.
-constexpr float kSpeedRef = 2.5f;
+// Leveling / sleep / wake.
+constexpr int kSlideMaxRaw = 205;   // water rule below 0.8 px/frame
+constexpr int kSleepSpeedRaw = 90;  // quiet threshold
+constexpr int kSleepFrames = 10;    // ~0.33 s supported + quiet -> ASLEEP
+constexpr float kWakeDirCos = 0.966f;   // >15 deg gravity swing wakes all
+constexpr float kWakeMagDelta = 1.5f;   // |d|a|| jump wakes all
+// Rest gate (also the simmer and wake-all threshold); above the gravity
+// arm point so desk-tilt noise cannot hold the gate open.
+constexpr float kRestGateMag = 0.6f;
+constexpr uint32_t kRestGateFrames = 15;
+
+// Speed -> palette level thresholds (Manhattan |vx|+|vy|, raw Q8.8).
+constexpr int kLevelThreshRaw[7] = {90, 205, 448, 832, 1408, 2304, 3584};
+
+// Dim border ring marking the box walls (logical RGB565, swapped at setup).
+constexpr uint16_t kWallColor = 0x31A6;  // dark warm gray
+
+// Fixed per-particle sand shades, dark to light, as 8-bit RGB.
+constexpr uint8_t kSandRgb[6][3] = {
+    {0x8a, 0x6b, 0x3e},  // deep tan
+    {0xa3, 0x7c, 0x48},
+    {0xb9, 0x8f, 0x55},
+    {0xcf, 0xa6, 0x68},
+    {0xe0, 0xb8, 0x78},
+    {0xf0, 0xcd, 0x8e},  // pale gold
+};
+
+// Velocity ramp anchors, indexed by glow level 1..7 (0 = base shade).
+constexpr uint8_t kRampRgb[8][3] = {
+    {0x00, 0x00, 0x00},  // level 0: unused (base shade)
+    {0xff, 0xdd, 0x70},  // glint
+    {0xff, 0xd2, 0x3f},  // gold
+    {0xff, 0xb8, 0x2e},  // amber
+    {0xff, 0x9a, 0x20},  // light orange
+    {0xff, 0x6a, 0x10},  // vivid orange
+    {0xff, 0x3d, 0x0c},  // orange-red
+    {0xff, 0x1a, 0x08},  // red
+};
+
+// Blend weight (/255) of the ramp anchor over the base shade per level.
+constexpr uint8_t kRampWeight[8] = {0, 90, 140, 180, 210, 235, 250, 255};
+
+// Position raw bounds: [1.0 px, 239.0 px) keeps cells inside [1, 238].
+constexpr int32_t kPosMinRaw = 256;
+constexpr int32_t kPosMaxRaw = 61183;
+
+inline uint16_t pack565(int r, int g, int b)
+{
+    return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
 
 inline int min_int(int a, int b) { return a < b ? a : b; }
-inline int max_int(int a, int b) { return a > b ? a : b; }
+
+inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/// Every velocity write funnels through this: int32 math, then saturate.
+inline int16_t sat16(int32_t v)
+{
+    return static_cast<int16_t>(clamp_i32(v, -32768, 32767));
+}
+
+inline int abs_int(int v) { return v < 0 ? -v : v; }
 
 }  // namespace
 
@@ -56,11 +132,22 @@ FluidBoxApp s_fluid_app;
 
 FluidBoxApp::~FluidBoxApp()
 {
-    free_buffers();
+    heap_caps_free(arena_);
+    heap_caps_free(grid_);
+    arena_ = nullptr;
+    grid_ = nullptr;
+}
+
+inline uint32_t FluidBoxApp::rnd()
+{
+    rng_ ^= rng_ << 13;
+    rng_ ^= rng_ >> 17;
+    rng_ ^= rng_ << 5;
+    return rng_;
 }
 
 // ---------------------------------------------------------------------------
-// Setup / teardown
+// Setup / lifecycle
 // ---------------------------------------------------------------------------
 
 esp_err_t FluidBoxApp::setup_once()
@@ -69,88 +156,79 @@ esp_err_t FluidBoxApp::setup_once()
         return ESP_OK;  // idempotent
     }
 
-    if (!fluid_.init(kInitialParticles)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const size_t surface_bytes =
-        (size_t)kSurfaceWidth * kSurfaceHeight * sizeof(uint16_t);
-    uint16_t *field = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    uint16_t *heat = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    uint16_t *depth = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, surface_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    Projected *proj = static_cast<Projected *>(
-        heap_caps_malloc(sizeof(Projected) * kMaxParticles, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-
-    if (field == nullptr || heat == nullptr || depth == nullptr || proj == nullptr) {
-        heap_caps_free(field);
-        heap_caps_free(heat);
-        heap_caps_free(depth);
-        heap_caps_free(proj);
-        ESP_LOGE(kTag, "fluid app buffer allocation failed");
+    // SoA arena: px, py (u16), vx, vy (i16), state, rest (u8) = 10 B each.
+    const size_t arena_bytes = static_cast<size_t>(kParticleCount) * 10;
+    uint8_t *arena = static_cast<uint8_t *>(
+        heap_caps_malloc(arena_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    uint8_t *grid = static_cast<uint8_t *>(heap_caps_malloc(
+        static_cast<size_t>(kGridW) * kGridH, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (arena == nullptr || grid == nullptr) {
+        heap_caps_free(arena);
+        heap_caps_free(grid);
+        ESP_LOGE(kTag, "particle allocation failed");
         return ESP_ERR_NO_MEM;
     }
+    arena_ = arena;
+    px_ = reinterpret_cast<uint16_t *>(arena);
+    py_ = px_ + kParticleCount;
+    vx_ = reinterpret_cast<int16_t *>(py_ + kParticleCount);
+    vy_ = vx_ + kParticleCount;
+    pstate_ = reinterpret_cast<uint8_t *>(vy_ + kParticleCount);
+    prest_ = pstate_ + kParticleCount;
+    grid_ = grid;
 
-    surface_field_ = field;
-    surface_heat_ = heat;
-    surface_depth_ = depth;
-    proj_ = proj;
-    build_luts();
-    // setup_once() initializes Fluid before the lanes start. Publish the same
-    // initialized epoch/stats immediately so launcher-era telemetry cannot
-    // expose the atomics' zero defaults while Fluid already holds epoch 1.
-    const FluidStats &initial_stats = fluid_.stats();
-    epoch_.store(fluid_.reset_epoch(), std::memory_order_relaxed);
-    candidate_checks_.store(initial_stats.candidate_checks, std::memory_order_relaxed);
-    nonfinite_resets_.store(initial_stats.nonfinite_resets, std::memory_order_relaxed);
+    // Palette: each glow level blends the base shade toward its ramp anchor.
+    for (int lv = 0; lv < 8; ++lv) {
+        const int w = kRampWeight[lv];
+        for (int s = 0; s < 6; ++s) {
+            const int r =
+                kSandRgb[s][0] + ((kRampRgb[lv][0] - kSandRgb[s][0]) * w) / 255;
+            const int gc =
+                kSandRgb[s][1] + ((kRampRgb[lv][1] - kSandRgb[s][1]) * w) / 255;
+            const int b =
+                kSandRgb[s][2] + ((kRampRgb[lv][2] - kSandRgb[s][2]) * w) / 255;
+            shade_wire_[(lv << 3) | (s + 1)] = __builtin_bswap16(pack565(r, gc, b));
+        }
+    }
+
+    reset_particles();
     setup_done_ = true;
-
-    ESP_LOGI(kTag, "fluid initialized: %u particles, radius %.4f",
-             static_cast<unsigned>(fluid_.count()), fluid_.particle_radius());
+    ESP_LOGI(kTag, "specks initialized: %d ballistic particles", kParticleCount);
     return ESP_OK;
 }
 
-void FluidBoxApp::free_buffers()
+void FluidBoxApp::reset_particles()
 {
-    heap_caps_free(surface_field_);
-    heap_caps_free(surface_heat_);
-    heap_caps_free(surface_depth_);
-    heap_caps_free(proj_);
-    surface_field_ = nullptr;
-    surface_heat_ = nullptr;
-    surface_depth_ = nullptr;
-    proj_ = nullptr;
-    setup_done_ = false;
+    // Deterministic flat starting bed: fill the bottom rows left-to-right,
+    // ~12.6 rows deep, cell-centered, asleep, glow 0.
+    rng_ = 0x2545F491u;
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int x = 1 + (i % (kGridW - 2));
+        const int y = (kGridH - 2) - (i / (kGridW - 2));
+        px_[i] = static_cast<uint16_t>((x << 8) | 128);
+        py_[i] = static_cast<uint16_t>((y << 8) | 128);
+        vx_[i] = 0;
+        vy_[i] = 0;
+        pstate_[i] = static_cast<uint8_t>((rnd() % 6) | kStateAsleep);
+        prest_[i] = kSleepFrames;
+    }
+    std::memset(grid_, 0, static_cast<size_t>(kGridW) * kGridH);
+    for (int i = 0; i < kParticleCount; ++i) {
+        const size_t cell = static_cast<size_t>(py_[i] >> 8) * kGridW + (px_[i] >> 8);
+        grid_[cell] = static_cast<uint8_t>((pstate_[i] & kStateShadeMask) + 1);
+    }
+    awake_count_ = 0;
+    rest_gate_frames_ = 0;
+    epoch_.fetch_add(1, std::memory_order_relaxed);
 }
-
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 esp_err_t FluidBoxApp::enter()
 {
-    // Post-barrier: the render lane is idle, so this drain is the sole
-    // snapshot consumer. Retire any stale READY frames so the first post-enter
-    // render shows a fresh exchange entry rather than a pre-transition frame.
-    const ParticleFrame *stale = snapshots_.acquire_latest();
-    while (stale != nullptr) {
-        snapshots_.release(stale);
-        stale = snapshots_.acquire_latest();
-    }
-    frame_seen_ = false;
-    // A pending reset set while inactive stays set: the first update() below
-    // consumes it via exchange(false) exactly once (never dropped, never
-    // doubled). Running-time requests were already consumed before the lanes
-    // acked the quiesce, so nothing stale leaks across the transition.
     return ESP_OK;
 }
 
 void FluidBoxApp::leave()
 {
-    // No allocation; quiesce motion validity so a resumed run never applies a
-    // stale gravity vector from a previous lifecycle.
     portENTER_CRITICAL(&motion_mux_);
     motion_.valid = false;
     portEXIT_CRITICAL(&motion_mux_);
@@ -158,25 +236,24 @@ void FluidBoxApp::leave()
 
 ShellAction FluidBoxApp::handle_event(AppEvent event)
 {
-    // PlusPress is the only routed event: it sets the app's reset atomic,
-    // consumed exactly once by the first post-enter update(). No event
-    // requires a shell action in this slice.
     if (event == AppEvent::PlusPress) {
         request_fluid_reset();
     }
     return ShellAction::None;
 }
 
+void FluidBoxApp::request_fluid_reset()
+{
+    reset_requested_.store(true, std::memory_order_release);
+}
+
 // ---------------------------------------------------------------------------
-// Sensor lane: motion filter + override bypass
+// Sensor lane: motion filter + override bypass (unchanged pattern)
 // ---------------------------------------------------------------------------
 
 bool FluidBoxApp::on_motion(const MotionTick &tick)
 {
     if (!tick.fresh) {
-        // A stale/failed IMU read still honors an active override (legacy
-        // app_main.cpp:313-320): the injected value publishes, the last valid
-        // raw read stays untouched.
         if (tick.override_active) {
             portENTER_CRITICAL(&motion_mux_);
             motion_.apparent_accel = tick.apparent_accel;
@@ -186,15 +263,9 @@ bool FluidBoxApp::on_motion(const MotionTick &tick)
         return false;
     }
 
-    // The filter always tracks the physical IMU, so a later `release` resumes
-    // from a live state. An override only replaces the published apparent
-    // value (bypasses the filter verbatim, matching app_main.cpp:296-320).
     const Vec3 apparent = filter_.update(tick.accel_mps2, tick.gyro_rads, tick.dt);
     const bool accepted = filter_.last_sample_accepted();
     if (!accepted) {
-        // A rejected fresh sample keeps the last valid raw/filter state, but
-        // an active override still publishes verbatim (the legacy override
-        // check ran after the filter branch regardless of acceptance).
         if (tick.override_active) {
             portENTER_CRITICAL(&motion_mux_);
             motion_.apparent_accel = tick.apparent_accel;
@@ -211,66 +282,624 @@ bool FluidBoxApp::on_motion(const MotionTick &tick)
     return true;
 }
 
-void FluidBoxApp::request_fluid_reset()
+// ---------------------------------------------------------------------------
+// Physics lane: intentionally idle
+// ---------------------------------------------------------------------------
+
+esp_err_t FluidBoxApp::update(float)
 {
-    reset_requested_.store(true, std::memory_order_release);
+    return ESP_OK;
 }
 
 // ---------------------------------------------------------------------------
-// Physics lane: consume reset, step, publish
+// The engine: one fixed-dt step
 // ---------------------------------------------------------------------------
 
-esp_err_t FluidBoxApp::update(float dt)
+uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
 {
-    // Handle a reset notification in this lane's context: swap the flag, then
-    // re-roll the fluid into its deterministic lattice. A request issued while
-    // inactive was never cleared by enter(), so this is its exactly-once
-    // consumption point.
-    if (reset_requested_.exchange(false)) {
-        fluid_.reset();
-        ESP_LOGI(kTag, "PLUS press - fluid reset (epoch %u)", fluid_.reset_epoch());
+    // -- Per-frame gravity terms (the only float math in the step) --------
+    float ax = sgx;
+    float ay = sgy;
+    if (!std::isfinite(ax) || !std::isfinite(ay)) {
+        ax = 0.0f;
+        ay = 0.0f;
+    }
+    const float m2 = ax * ax + ay * ay;
+    const float m_in = std::sqrt(m2);
+    if (m_in >= kGravUpdateMag) {
+        const float inv = 1.0f / m_in;
+        dir_gx_ = ax * inv;
+        dir_gy_ = ay * inv;
+    }
+    // Down always exists: live direction when tilted, remembered direction
+    // when flat, magnitude never below the floor.
+    const float eff =
+        (m_in > kAccelFloorUnits ? m_in : kAccelFloorUnits) *
+        static_cast<float>(kAccelQ8PerUnit);
+    const int32_t dvx = clamp_i32(static_cast<int32_t>(lroundf(dir_gx_ * eff)),
+                                  -kAccelClampRaw, kAccelClampRaw);
+    const int32_t dvy = clamp_i32(static_cast<int32_t>(lroundf(dir_gy_ * eff)),
+                                  -kAccelClampRaw, kAccelClampRaw);
+
+    // Quantized gravity octant (each component -1/0/1) for leveling, kick
+    // and simmer directions. tan(22.5 deg) ~ 0.414 splits the octants.
+    int gox = 0;
+    int goy = 0;
+    {
+        const float axa = std::fabs(dir_gx_);
+        const float aya = std::fabs(dir_gy_);
+        if (axa > 0.414f * aya) {
+            gox = (dir_gx_ >= 0.0f) ? 1 : -1;
+        }
+        if (aya > 0.414f * axa) {
+            goy = (dir_gy_ >= 0.0f) ? 1 : -1;
+        }
+    }
+    const bool grav_x_dom = std::fabs(dir_gx_) >= std::fabs(dir_gy_);
+
+    // -- Global wake: gravity swung, jumped, or flipped -------------------
+    const float mag = std::sqrt(m2);
+    {
+        const float pmag =
+            std::sqrt(prev_gx_ * prev_gx_ + prev_gy_ * prev_gy_);
+        const float dot = ax * prev_gx_ + ay * prev_gy_;
+        bool wake_all = false;
+        if (mag >= kRestGateMag) {
+            if (dot < 0.0f && pmag > 0.2f) {
+                wake_all = true;  // flipped
+            } else if (pmag > 0.2f && dot < kWakeDirCos * mag * pmag) {
+                wake_all = true;  // direction swing > ~15 deg
+            } else if (std::fabs(mag - pmag) > kWakeMagDelta) {
+                wake_all = true;  // magnitude jump
+            }
+        }
+        if (wake_all) {
+            for (int i = 0; i < kParticleCount; ++i) {
+                pstate_[i] &= static_cast<uint8_t>(~kStateAsleep);
+                prest_[i] = 0;
+            }
+            awake_count_ = kParticleCount;
+        }
+        // Anchor, not previous-frame: it only re-arms on a wake or while
+        // quiet, so a slow tilt accumulates direction/magnitude change
+        // until a wake fires (periodic avalanches), instead of the bed
+        // freezing solid because no single frame crossed a threshold.
+        if (wake_all || mag < kRestGateMag) {
+            prev_gx_ = ax;
+            prev_gy_ = ay;
+        }
     }
 
-    // Latest apparent acceleration from the sensor lane.
-    Vec3 apparent{0.0f, 0.0f, 6.0f};
+    // -- Rest gate: quiet and everyone asleep -> skip the step ------------
+    if (mag < kRestGateMag && awake_count_ == 0) {
+        if (rest_gate_frames_ < kRestGateFrames) {
+            ++rest_gate_frames_;
+        }
+    } else {
+        rest_gate_frames_ = 0;
+    }
+    if (rest_gate_frames_ >= kRestGateFrames) {
+        return 0;  // scene is settled and bit-stable; grid stays valid
+    }
+
+    uint8_t *g = grid_;
+
+    // Diagonal octants carry sqrt(2) more Euclidean punch per component;
+    // scale impulse coefficients by 181/256 so tilt compass direction does
+    // not change agitation intensity.
+    const bool go_diag = (gox != 0 && goy != 0);
+    const int32_t kick_up = go_diag ? (kKickUpRaw * 181) >> 8 : kKickUpRaw;
+    const int32_t kick_lat = go_diag ? (kKickLatRaw * 181) >> 8 : kKickLatRaw;
+
+    // -- Kick harvest (reads LAST frame's grid, before the rebuild) -------
+    for (int i = 0; i < kParticleCount; ++i) {
+        const size_t cell =
+            static_cast<size_t>(py_[i] >> 8) * kGridW + (px_[i] >> 8);
+        const uint32_t k = static_cast<uint32_t>(g[cell]) >> 6;
+        if (k == 0u) {
+            continue;
+        }
+        if (k < 3u) {
+            // Counts 1-2 = impact kicks with impulse; 3 = wake-only tag.
+            const int lat_sign = ((rnd() & 1u) != 0u) ? 1 : -1;
+            vx_[i] = sat16(vx_[i] - gox * static_cast<int32_t>(k) * kick_up -
+                           goy * lat_sign * static_cast<int32_t>(k) * kick_lat);
+            vy_[i] = sat16(vy_[i] - goy * static_cast<int32_t>(k) * kick_up +
+                           gox * lat_sign * static_cast<int32_t>(k) * kick_lat);
+        }
+        pstate_[i] &= static_cast<uint8_t>(~kStateAsleep);
+        prest_[i] = 0;
+    }
+
+    // -- Grid rebuild from positions (positions are the only truth) -------
+    std::memset(g, 0, static_cast<size_t>(kGridW) * kGridH);
+    for (int i = 0; i < kParticleCount; ++i) {
+        const size_t cell =
+            static_cast<size_t>(py_[i] >> 8) * kGridW + (px_[i] >> 8);
+        if (g[cell] == 0u) {
+            g[cell] = static_cast<uint8_t>(
+                ((pstate_[i] & kStateGlowMask) << 0) |
+                ((pstate_[i] & kStateShadeMask) + 1));
+        } else {
+            // Overlap (possible for one frame after a flip): separation
+            // impulse; the loser is not drawn this frame and must not
+            // lift the winner's byte during its walk.
+            const uint32_t r = rnd();
+            vx_[i] = sat16(vx_[i] + (((r & 1u) != 0u) ? 256 : -256));
+            vy_[i] = sat16(vy_[i] + (((r & 2u) != 0u) ? 256 : -256));
+            pstate_[i] = static_cast<uint8_t>(
+                (pstate_[i] & ~kStateAsleep) | kStateOverlap);
+            prest_[i] = 0;
+        }
+    }
+
+    // -- Particle update --------------------------------------------------
+    uint32_t steps_used = 0;
+    uint32_t awake = 0;
+    const bool fwd_sweep = ((frame_parity_++ & 1u) == 0u);
+    for (int n = 0; n < kParticleCount; ++n) {
+        const int i = fwd_sweep ? n : (kParticleCount - 1 - n);
+        uint8_t st = pstate_[i];
+        if ((st & kStateAsleep) != 0u) {
+            continue;
+        }
+
+        // Integrate: gravity, drag, per-axis clamp.
+        int32_t vx = vx_[i] + dvx;
+        int32_t vy = vy_[i] + dvy;
+        vx -= vx >> kDragShift;
+        vy -= vy >> kDragShift;
+        vx = clamp_i32(vx, -kVmaxRaw, kVmaxRaw);
+        vy = clamp_i32(vy, -kVmaxRaw, kVmaxRaw);
+
+        int32_t posx = px_[i];
+        int32_t posy = py_[i];
+        int cx = posx >> 8;
+        int cy = posy >> 8;
+        const int start_cx = cx;
+        const int start_cy = cy;
+        const size_t start_cell = static_cast<size_t>(cy) * kGridW + cx;
+        // Overlap losers don't own their start cell's byte: leave it.
+        const bool overlap_loser = (st & kStateOverlap) != 0u;
+        st &= static_cast<uint8_t>(~kStateOverlap);
+        uint8_t kick_bits = 0;
+        if (!overlap_loser) {
+            // Lift the particle out of the grid for the walk, carrying any
+            // kick/wake bits written at it earlier this frame so they
+            // survive to next frame's harvest.
+            kick_bits = static_cast<uint8_t>(g[start_cell] & 0xC0u);
+            g[start_cell] = 0;
+        }
+
+        int32_t rx = vx;
+        int32_t ry = vy;
+        int guard = kMaxWalkSteps + 4;
+        if (steps_used > kStepGovernor) {
+            governor_hits_.fetch_add(1, std::memory_order_relaxed);
+            rx = clamp_i32(rx, -kGovernorDispRaw, kGovernorDispRaw);
+            ry = clamp_i32(ry, -kGovernorDispRaw, kGovernorDispRaw);
+            guard = kGovernorGuard;
+        }
+
+        // Cell walk: sub-steps of <= 1 px per axis, probing before entry.
+        // The substep increments (2 hw divides) are loop-invariant between
+        // bounces, so they are recomputed only when nsub hits 0.
+        int32_t nsub = 0;
+        int32_t sx = 0;
+        int32_t sy = 0;
+        while ((rx != 0 || ry != 0) && guard-- > 0) {
+            if (nsub <= 0) {
+                const int32_t axr = abs_int(rx);
+                const int32_t ayr = abs_int(ry);
+                const int32_t m = axr > ayr ? axr : ayr;
+                nsub = (m + 255) >> 8;
+                if (nsub <= 0) {
+                    break;
+                }
+                sx = rx / nsub;
+                sy = ry / nsub;
+                if (sx == 0 && sy == 0) {
+                    break;
+                }
+            }
+            ++steps_used;
+            int32_t npx = posx + sx;
+            int32_t npy = posy + sy;
+            int ncx = npx >> 8;
+            int ncy = npy >> 8;
+            bool bounced_x = false;
+            bool bounced_y = false;
+
+            // X axis crossing.
+            if (ncx != cx) {
+                bool blocked = false;
+                bool wall = false;
+                if (ncx < 1 || ncx > kGridW - 2) {
+                    blocked = true;
+                    wall = true;
+                } else if (g[static_cast<size_t>(cy) * kGridW + ncx] != 0u) {
+                    blocked = true;
+                }
+                if (blocked) {
+                    if (wall) {
+                        vx = -(vx * kWallRestNum) >> 8;
+                        rx = -(rx * kWallRestNum) >> 8;
+                        const int fs =
+                            grav_x_dom ? kFloorFricShift : kSideFricShift;
+                        vy -= vy >> fs;
+                        vy += static_cast<int32_t>(rnd() % (2 * kWallJitterRaw + 1)) -
+                              kWallJitterRaw;
+                        if (abs_int(vx) < kDeadStopRaw) {
+                            vx = 0;
+                            rx = 0;
+                        }
+                    } else {
+                        // Pass-through blocking, not reflection: co-falling
+                        // neighbors must not ricochet off each other. The
+                        // follower keeps its direction (damped) and resumes
+                        // the moment the cell clears, so a cloud rains at
+                        // one rate. Kicks only fire into supported (bedded)
+                        // targets - a mid-air hit must not shove another
+                        // faller against the rain.
+                        const int sdx = ncx + gox;
+                        const int sdy = cy + goy;
+                        const bool bedded =
+                            sdx < 1 || sdx > kGridW - 2 || sdy < 1 ||
+                            sdy > kGridH - 2 ||
+                            g[static_cast<size_t>(sdy) * kGridW + sdx] != 0u;
+                        if (bedded && abs_int(vx) >= kKickTriggerRaw) {
+                            uint8_t &tc =
+                                g[static_cast<size_t>(cy) * kGridW + ncx];
+                            if ((tc >> 6) < 2u) {
+                                tc = static_cast<uint8_t>(tc + 0x40u);
+                            }
+                        }
+                        // Damped keep-sign block; the retry happens next
+                        // frame (rem zeroed), never as an in-frame storm.
+                        // Pressing into the bed sheds energy fast (>>2) so
+                        // pressed grains still level and settle.
+                        vx = vx >> (bedded ? 2 : 1);
+                        rx = 0;
+                        vy = (vy * kPpTangNum) >> 8;
+                    }
+                    // Flush against the boundary of the current cell.
+                    npx = (sx > 0) ? ((cx << 8) | 0xFF) : (cx << 8);
+                    ncx = cx;
+                    bounced_x = true;
+                }
+            }
+            // Y axis crossing (against the possibly X-corrected column).
+            if (ncy != cy) {
+                bool blocked = false;
+                bool wall = false;
+                if (ncy < 1 || ncy > kGridH - 2) {
+                    blocked = true;
+                    wall = true;
+                } else if (g[static_cast<size_t>(ncy) * kGridW + ncx] != 0u) {
+                    blocked = true;
+                }
+                if (blocked) {
+                    if (wall) {
+                        vy = -(vy * kWallRestNum) >> 8;
+                        ry = -(ry * kWallRestNum) >> 8;
+                        const int fs =
+                            grav_x_dom ? kSideFricShift : kFloorFricShift;
+                        vx -= vx >> fs;
+                        vx += static_cast<int32_t>(rnd() % (2 * kWallJitterRaw + 1)) -
+                              kWallJitterRaw;
+                        if (abs_int(vy) < kDeadStopRaw) {
+                            vy = 0;
+                            ry = 0;
+                        }
+                    } else {
+                        const int sdx = ncx + gox;
+                        const int sdy = ncy + goy;
+                        const bool bedded =
+                            sdx < 1 || sdx > kGridW - 2 || sdy < 1 ||
+                            sdy > kGridH - 2 ||
+                            g[static_cast<size_t>(sdy) * kGridW + sdx] != 0u;
+                        if (bedded && abs_int(vy) >= kKickTriggerRaw) {
+                            uint8_t &tc =
+                                g[static_cast<size_t>(ncy) * kGridW + ncx];
+                            if ((tc >> 6) < 2u) {
+                                tc = static_cast<uint8_t>(tc + 0x40u);
+                            }
+                        }
+                        vy = vy >> (bedded ? 2 : 1);
+                        ry = 0;
+                        vx = (vx * kPpTangNum) >> 8;
+                    }
+                    npy = (sy > 0) ? ((cy << 8) | 0xFF) : (cy << 8);
+                    ncy = cy;
+                    bounced_y = true;
+                }
+            }
+
+            posx = npx;
+            posy = npy;
+            cx = ncx;
+            cy = ncy;
+            // Consume the taken step per axis; a bounced axis keeps its
+            // reflected remainder instead. Any bounce invalidates the
+            // hoisted substep increments.
+            if (!bounced_x) {
+                rx -= sx;
+            }
+            if (!bounced_y) {
+                ry -= sy;
+            }
+            if (bounced_x || bounced_y) {
+                nsub = 0;
+            } else {
+                --nsub;
+            }
+        }
+
+        posx = clamp_i32(posx, kPosMinRaw, kPosMaxRaw);
+        posy = clamp_i32(posy, kPosMinRaw, kPosMaxRaw);
+        cx = posx >> 8;
+        cy = posy >> 8;
+
+        // -- Zero-repose leveling: slow + supported drains toward flat.
+        // Up to two slide hops per frame, and a successful slide writes a
+        // small velocity along the hop so the drain keeps flowing (and
+        // glows) instead of stuttering asleep mid-avalanche.
+        int32_t speed = abs_int(vx) + abs_int(vy);
+        const int dcx = cx + gox;
+        const int dcy = cy + goy;
+        const bool down_blocked =
+            (dcx < 1 || dcx > kGridW - 2 || dcy < 1 || dcy > kGridH - 2) ||
+            (g[static_cast<size_t>(dcy) * kGridW + dcx] != 0u);
+        bool supported = down_blocked;
+        bool leveled = false;
+        if (speed < kSlideMaxRaw && down_blocked && (gox | goy) != 0) {
+            // Slide neighbors: for a cardinal octant the two down-diagonals;
+            // for a diagonal octant the two adjacent cardinals.
+            int s1x, s1y, s2x, s2y;
+            if (gox != 0 && goy != 0) {
+                s1x = gox; s1y = 0;
+                s2x = 0;   s2y = goy;
+            } else if (gox != 0) {
+                s1x = gox; s1y = 1;
+                s2x = gox; s2y = -1;
+            } else {
+                s1x = 1;  s1y = goy;
+                s2x = -1; s2y = goy;
+            }
+            int hop_dx = 0;
+            int hop_dy = 0;
+            for (int hop = 0; hop < 2; ++hop) {
+                const uint32_t r = rnd();
+                const bool swap = (r & 1u) != 0u;
+                const int a1x = swap ? s2x : s1x, a1y = swap ? s2y : s1y;
+                const int a2x = swap ? s1x : s2x, a2y = swap ? s1y : s2y;
+                bool moved = false;
+                for (int attempt = 0; attempt < 2 && !moved; ++attempt) {
+                    const int tx = cx + (attempt == 0 ? a1x : a2x);
+                    const int ty = cy + (attempt == 0 ? a1y : a2y);
+                    if (tx >= 1 && tx <= kGridW - 2 && ty >= 1 &&
+                        ty <= kGridH - 2 &&
+                        g[static_cast<size_t>(ty) * kGridW + tx] == 0u) {
+                        hop_dx = tx - cx;
+                        hop_dy = ty - cy;
+                        cx = tx;
+                        cy = ty;
+                        posx = (tx << 8) | (posx & 0xFF);
+                        posy = (ty << 8) | (posy & 0xFF);
+                        moved = true;
+                        leveled = true;
+                    }
+                }
+                if (!moved && !leveled && (r & 2u) != 0u) {
+                    // Lateral hop, only into a cell whose down cell is empty.
+                    const int lx = (goy != 0) ? (((r & 4u) != 0u) ? 1 : -1) : 0;
+                    const int ly =
+                        (gox != 0 && goy == 0) ? (((r & 4u) != 0u) ? 1 : -1) : 0;
+                    const int tx = cx + lx;
+                    const int ty = cy + ly;
+                    const int tdx = tx + gox;
+                    const int tdy = ty + goy;
+                    if ((lx | ly) != 0 && tx >= 1 && tx <= kGridW - 2 &&
+                        ty >= 1 && ty <= kGridH - 2 &&
+                        g[static_cast<size_t>(ty) * kGridW + tx] == 0u &&
+                        tdx >= 1 && tdx <= kGridW - 2 && tdy >= 1 &&
+                        tdy <= kGridH - 2 &&
+                        g[static_cast<size_t>(tdy) * kGridW + tdx] == 0u) {
+                        hop_dx = lx;
+                        hop_dy = ly;
+                        cx = tx;
+                        cy = ty;
+                        posx = (tx << 8) | (posx & 0xFF);
+                        posy = (ty << 8) | (posy & 0xFF);
+                        leveled = true;
+                    }
+                }
+                if (!moved) {
+                    break;
+                }
+            }
+            if (leveled) {
+                // Flow velocity along the drain: keeps the avalanche
+                // continuous and lights the surface gold.
+                vx = hop_dx * 180;
+                vy = hop_dy * 180;
+                prest_[i] = 0;
+            }
+            // Support may have changed after sliding.
+            const int ddx = cx + gox;
+            const int ddy = cy + goy;
+            supported =
+                (ddx < 1 || ddx > kGridW - 2 || ddy < 1 || ddy > kGridH - 2) ||
+                (g[static_cast<size_t>(ddy) * kGridW + ddx] != 0u);
+        }
+        speed = abs_int(vx) + abs_int(vy);
+
+        // -- Glow: raw level from speed, one-level-per-frame afterglow.
+        int raw_level = 0;
+        while (raw_level < 7 && speed >= kLevelThreshRaw[raw_level]) {
+            ++raw_level;
+        }
+        const int prev_level = (st & kStateGlowMask) >> kStateGlowShift;
+        const int level =
+            raw_level > prev_level - 1 ? raw_level : prev_level - 1;
+
+        // -- Sleep: quiet, cooled, supported, not mid-drain, hysteresis.
+        // Support is mandatory: down always exists, so nothing may ever
+        // rest mid-air.
+        bool slept = false;
+        if (speed < kSleepSpeedRaw && level == 0 && supported && !leveled) {
+            if (prest_[i] < 255u) {
+                ++prest_[i];
+            }
+            if (prest_[i] >= kSleepFrames) {
+                vx = 0;
+                vy = 0;
+                st |= kStateAsleep;
+                slept = true;
+            }
+        } else {
+            prest_[i] = 0;
+        }
+
+        st = static_cast<uint8_t>(
+            (st & ~kStateGlowMask) |
+            (static_cast<uint8_t>(level) << kStateGlowShift));
+        pstate_[i] = st;
+        vx_[i] = sat16(vx);
+        vy_[i] = sat16(vy);
+        px_[i] = static_cast<uint16_t>(posx);
+        py_[i] = static_cast<uint16_t>(posy);
+        if (!slept) {
+            ++awake;
+        }
+
+        // Place back into the grid with the updated level, carrying kick
+        // bits written at the start cell earlier this frame so next
+        // frame's harvest still sees them. If someone claimed the cell
+        // mid-walk (rare), the position self-heals at next rebuild.
+        uint8_t *dst = &g[static_cast<size_t>(cy) * kGridW + cx];
+        if (*dst == 0u) {
+            *dst = static_cast<uint8_t>(
+                kick_bits | (static_cast<uint8_t>(level) << 3) |
+                ((st & kStateShadeMask) + 1));
+        }
+
+        // Support-loss wake: tag the anti-gravity neighbor of a vacated
+        // cell with the wake-only code (0xC0) so nothing hangs as a
+        // floating shelf — a wake, not a launch. Never tag the mover's
+        // own new cell (self-pump), and overlap losers vacated nothing.
+        if (!overlap_loser && (cx != start_cx || cy != start_cy) &&
+            (gox | goy) != 0) {
+            const int ux = start_cx - gox;
+            const int uy = start_cy - goy;
+            if ((ux != cx || uy != cy) && ux >= 1 && ux <= kGridW - 2 &&
+                uy >= 1 && uy <= kGridH - 2) {
+                uint8_t &above = g[static_cast<size_t>(uy) * kGridW + ux];
+                if (above != 0u && (above >> 6) == 0u) {
+                    above |= 0xC0u;
+                }
+            }
+        }
+    }
+
+    awake_count_ = awake;
+    return steps_used;
+}
+
+// ---------------------------------------------------------------------------
+// Render lane: step + rasterize
+// ---------------------------------------------------------------------------
+
+void FluidBoxApp::draw_grid(uint16_t *buf, int y0, int rows)
+{
+    const uint16_t wall = __builtin_bswap16(kWallColor);
+    const int y1 = y0 + rows;
+    for (int y = y0; y < y1; ++y) {
+        uint16_t *out = buf + static_cast<size_t>(y - y0) * kGridW;
+        if (y == 0 || y == kGridH - 1) {
+            for (int x = 0; x < kGridW; ++x) {
+                out[x] = wall;
+            }
+            continue;
+        }
+        out[0] = wall;
+        out[kGridW - 1] = wall;
+        const uint8_t *row = grid_ + static_cast<size_t>(y) * kGridW;
+        for (int x = 1; x < kGridW - 1; ++x) {
+            const uint8_t c = row[x];
+            if (c != 0u) {
+                out[x] = shade_wire_[c & 0x3Fu];
+            }
+        }
+    }
+}
+
+bool FluidBoxApp::render(DisplayFrame &frame)
+{
+    if (!setup_done_ || frame.transport == nullptr) {
+        ESP_LOGW(kTag, "render failed: %s", esp_err_to_name(ESP_ERR_INVALID_STATE));
+        return false;
+    }
+    const int64_t t_frame = esp_timer_get_time();
+
+    if (reset_requested_.exchange(false)) {
+        reset_particles();
+        ESP_LOGI(kTag, "PLUS press - specks reset (epoch %u)",
+                 static_cast<unsigned>(epoch_.load(std::memory_order_relaxed)));
+    }
+
+    // Latest apparent acceleration; box +y is screen-up, so screen-down
+    // gravity is -y. z (into the case) has no in-plane effect.
+    Vec3 apparent{0.0f, 0.0f, 9.0f};
     portENTER_CRITICAL(&motion_mux_);
     if (motion_.valid) {
         apparent = motion_.apparent_accel;
     }
     portEXIT_CRITICAL(&motion_mux_);
 
-    // step() returns false only on a skip (never happens here: count is set at
-    // boot and dt is fixed finite) or when nonfinite state forced a
-    // deterministic reset — either way the frame below is still valid.
-    const int64_t step_start_us = esp_timer_get_time();
-    static_cast<void>(fluid_.step(apparent, dt));
-    physics_us_.store(static_cast<uint32_t>(esp_timer_get_time() - step_start_us));
-    const FluidStats &fluid_stats = fluid_.stats();
-    epoch_.store(fluid_.reset_epoch());
-    candidate_checks_.store(fluid_stats.candidate_checks);
-    nonfinite_resets_.store(fluid_stats.nonfinite_resets);
+    const int64_t t_step = esp_timer_get_time();
+    const uint32_t steps = step_particles(apparent.x, -apparent.y);
+    walk_steps_.fetch_add(steps, std::memory_order_relaxed);
+    physics_us_.store(static_cast<uint32_t>(esp_timer_get_time() - t_step),
+                      std::memory_order_relaxed);
 
-    ParticleFrame *slot = snapshots_.begin_write();
-    if (slot == nullptr) {
-        return ESP_OK;  // defensive pool exhaustion; the lane guard preserves WDT
+    if (frame.ops.wait_previous(frame.transport) != ESP_OK) {
+        return false;
     }
-    fluid_.fill_frame(*slot, ++sequence_);
-    snapshots_.publish(slot);
-    return ESP_OK;
-}
+    static_cast<void>(frame.ops.latch_capture(frame.transport));
 
-// ---------------------------------------------------------------------------
-// Render lane
-// ---------------------------------------------------------------------------
+    uint32_t raster_total = 0;
+    for (int s = 0; s < frame.stripe_count; s++) {
+        const int y0 = s * frame.stripe_rows;
+        const int rows = min_int(frame.stripe_rows, frame.height - y0);
+        uint16_t *buf = frame.stripe[s & 1];
+
+        const int64_t t_raster = esp_timer_get_time();
+        std::memset(buf, 0, static_cast<size_t>(frame.width) * rows * sizeof(uint16_t));
+        draw_grid(buf, y0, rows);
+        raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_raster);
+
+        if (frame.ops.submit(frame.transport, s, y0, rows, buf) != ESP_OK) {
+            return false;
+        }
+    }
+    if (frame.ops.finish(frame.transport) != ESP_OK) {
+        return false;
+    }
+
+    frame_us_ = static_cast<uint32_t>(esp_timer_get_time() - t_frame);
+    raster_us_ = raster_total + frame.ops.capture_copy_us(frame.transport);
+    return true;
+}
 
 AppStats FluidBoxApp::stats()
 {
     AppStats st = {};
-    st.count = fluid_.count();
-    st.epoch = epoch_.load();
-    st.candidate_checks = candidate_checks_.load();
-    st.nonfinite_resets = nonfinite_resets_.load();
-    st.physics_us = physics_us_.load();
+    st.count = kParticleCount;
+    st.epoch = epoch_.load(std::memory_order_relaxed);
+    st.candidate_checks = walk_steps_.load(std::memory_order_relaxed);
+    st.nonfinite_resets = governor_hits_.load(std::memory_order_relaxed);
+    st.physics_us = physics_us_.load(std::memory_order_relaxed);
     portENTER_CRITICAL(&motion_mux_);
     st.raw[0] = motion_.raw_accel.x;
     st.raw[1] = motion_.raw_accel.y;
@@ -282,431 +911,6 @@ AppStats FluidBoxApp::stats()
     st.raster_us = raster_us_;
     st.frame_us = frame_us_;
     return st;
-}
-
-bool FluidBoxApp::render(DisplayFrame &frame)
-{
-    if (!setup_done_ || frame.transport == nullptr) {
-        ESP_LOGW(kTag, "render failed: %s", esp_err_to_name(ESP_ERR_INVALID_STATE));
-        return false;
-    }
-    const ParticleFrame *snapshot = snapshots_.acquire_latest();
-    if (snapshot == nullptr) {
-        return false;  // blank pass: no new frame, no transport touched
-    }
-    const esp_err_t ret = render_frame(*snapshot, frame);
-    snapshots_.release(snapshot);
-    if (ret != ESP_OK) {
-        ESP_LOGW(kTag, "render failed: %s", esp_err_to_name(ret));
-        return false;
-    }
-    return true;
-}
-
-esp_err_t FluidBoxApp::render_frame(const ParticleFrame &frame, DisplayFrame &df)
-{
-    const int64_t t_frame = esp_timer_get_time();
-    uint32_t raster_total = 0;
-
-    // The previous frame leaves its final stripe queued. Retire it before
-    // touching either ping-pong buffer; after a timeout, retrying this wait on
-    // the next frame remains safe because the in-flight flag stays set.
-    if (df.ops.wait_previous(df.transport) != ESP_OK) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    const int count = (frame.count > kMaxParticles) ? kMaxParticles : frame.count;
-    preproject(frame, count);
-    project_box_edges();
-    const int64_t t_surface = esp_timer_get_time();
-    build_surface();
-    raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_surface);
-
-    // Frame-boundary capture latch (the old renderer.cpp:602 exchange point).
-    // The DisplayService mirrors when armed and re-arms on any mid-frame
-    // failure, so a request is never latched lazily mid-frame.
-    static_cast<void>(df.ops.latch_capture(df.transport));
-
-    for (int s = 0; s < df.stripe_count; s++) {
-        const int y0 = s * df.stripe_rows;
-        const int rows = min_int(df.stripe_rows, df.height - y0);
-        uint16_t *buf = df.stripe[s & 1];
-
-        // Rasterize into the idle stripe buffer while the previous stripe's DMA
-        // (stripe s-1, the other buffer) is still running.
-        const int64_t t_raster = esp_timer_get_time();
-        std::memset(buf, 0, static_cast<size_t>(df.width) * rows * sizeof(uint16_t));
-        draw_box_edges(buf, y0, rows);
-        shade_surface(buf, y0, rows);
-        raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_raster);
-
-        // Mirror (if armed) -> wait for the previous transfer (including the
-        // one carried from the previous frame) -> draw -> mark in flight.
-        esp_err_t ret = df.ops.submit(df.transport, s, y0, rows, buf);
-        if (ret != ESP_OK) {
-            // The DisplayService handles re-arming a failed capture; frame
-            // telemetry keeps the last completed frame's values.
-            return ret;
-        }
-    }
-
-    esp_err_t ret = df.ops.finish(df.transport);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    frame_us_ = static_cast<uint32_t>(esp_timer_get_time() - t_frame);
-    // The DisplayService resets its capture-copy counter at each latch and
-    // accumulates PSRAM mirror time across the armed frame's stripes; the
-    // reported raster duration includes it (byte-identical to the pre-split
-    // renderer's frame telemetry).
-    raster_us_ = raster_total + df.ops.capture_copy_us(df.transport);
-    frame_seen_ = true;
-    return ESP_OK;
-}
-
-// ---------------------------------------------------------------------------
-// Raster helpers (moved verbatim from renderer.cpp)
-// ---------------------------------------------------------------------------
-
-void FluidBoxApp::build_luts()
-{
-    // sqrt/shade LUT: nz = sqrt(1 - t), t = (d/r)^2, in [0, 1].
-    // Used both for the front-surface depth reduction and the radial shade.
-    // Fixed point 0.16.
-    for (int i = 0; i < 256; i++) {
-        const float t = static_cast<float>(i) / 255.0f;
-        const float nz = std::sqrt(1.0f - t);
-        nz_lut_[i] = static_cast<uint16_t>(nz * 65535.0f + 0.5f);
-    }
-
-    // Velocity palette: slow = blue/cyan, fast = orange/red (hue 230 -> 0 deg),
-    // ramping saturation/value so slow particles are dim and fast ones glow.
-    for (int i = 0; i < 256; i++) {
-        const float u = static_cast<float>(i) / 255.0f;
-        const float hue = (1.0f - u) * 230.0f;
-        const float sat = 0.85f;
-        const float val = 0.45f + 0.55f * u;
-        palette_[i] = hsv_to_rgb565(hue, sat, val);
-    }
-}
-
-uint16_t FluidBoxApp::hsv_to_rgb565(float h, float s, float v)
-{
-    const float c = v * s;
-    const float hp = h / 60.0f;
-    const float x = c * (1.0f - std::fabs(std::fmod(hp, 2.0f) - 1.0f));
-    float r = 0.0f;
-    float g = 0.0f;
-    float bl = 0.0f;
-    if (hp < 1.0f) {
-        r = c;
-        g = x;
-    } else if (hp < 2.0f) {
-        r = x;
-        g = c;
-    } else if (hp < 3.0f) {
-        g = c;
-        bl = x;
-    } else if (hp < 4.0f) {
-        g = x;
-        bl = c;
-    } else if (hp < 5.0f) {
-        r = x;
-        bl = c;
-    } else {
-        r = c;
-        bl = x;
-    }
-    const float m = v - c;
-    r += m;
-    g += m;
-    bl += m;
-    const uint32_t r5 = static_cast<uint32_t>(r * 31.0f + 0.5f) & 0x1Fu;
-    const uint32_t g6 = static_cast<uint32_t>(g * 63.0f + 0.5f) & 0x3Fu;
-    const uint32_t b5 = static_cast<uint32_t>(bl * 31.0f + 0.5f) & 0x1Fu;
-    return static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5);
-}
-
-void FluidBoxApp::preproject(const ParticleFrame &frame, int count)
-{
-    active_count_ = count;
-    const float radius_world = frame.particle_radius;
-    for (int i = 0; i < kMaxParticles; i++) {
-        proj_[i].active = 0;
-    }
-    for (int i = 0; i < count; i++) {
-        Projected &p = proj_[i];
-        const RenderParticle &src = frame.particles[i];
-        if (!std::isfinite(src.x) || !std::isfinite(src.y) || !std::isfinite(src.z) ||
-            !std::isfinite(src.speed) || radius_world <= 0.0f) {
-            continue;
-        }
-        const float scale = kPxPerWorld * (kFocal / (kFocal + src.z));
-        const int sx = static_cast<int>(std::lrintf(kWidth * 0.5f + src.x * scale));
-        // World +y is screen-up; particles rest at the bottom of the box.
-        const int sy = static_cast<int>(std::lrintf(kHeight * 0.5f - src.y * scale));
-        int rad = static_cast<int>(std::lrintf(radius_world * scale));
-        if (rad < 1) {
-            rad = 1;
-        }
-        p.x = static_cast<int16_t>(sx);
-        p.y = static_cast<int16_t>(sy);
-        p.radius = static_cast<uint16_t>(rad);
-
-        float zc = (src.z < 0.0f) ? 0.0f : src.z;
-        p.z_fx = static_cast<uint32_t>(zc * kDepthFxScale + 0.5f);
-        p.rw_fx = static_cast<uint32_t>(radius_world * kDepthFxScale + 0.5f);
-
-        const float sp = (src.speed < 0.0f) ? 0.0f : src.speed;
-        p.speed_idx = (sp >= kSpeedRef) ? 255u
-                                        : static_cast<uint8_t>((sp / kSpeedRef) * 255.0f);
-        p.active = 1;
-    }
-}
-
-void FluidBoxApp::project_box_edges()
-{
-    constexpr float corners[8][3] = {
-        {-kBoxHalfX, kBoxHalfY, 0.0f},   // front TL
-        {kBoxHalfX, kBoxHalfY, 0.0f},    // front TR
-        {kBoxHalfX, -kBoxHalfY, 0.0f},   // front BR
-        {-kBoxHalfX, -kBoxHalfY, 0.0f},  // front BL
-        {-kBoxHalfX, kBoxHalfY, kBoxDepthZ},    // back TL
-        {kBoxHalfX, kBoxHalfY, kBoxDepthZ},     // back TR
-        {kBoxHalfX, -kBoxHalfY, kBoxDepthZ},    // back BR
-        {-kBoxHalfX, -kBoxHalfY, kBoxDepthZ},   // back BL
-    };
-    int sx[8] = {};
-    int sy[8] = {};
-    for (int i = 0; i < 8; i++) {
-        const float scale = kPxPerWorld * (kFocal / (kFocal + corners[i][2]));
-        sx[i] = static_cast<int>(std::lrintf(kWidth * 0.5f + corners[i][0] * scale));
-        sy[i] = static_cast<int>(std::lrintf(kHeight * 0.5f - corners[i][1] * scale));
-    }
-    // Front face (z=0): 0-1-2-3; back face: 4-5-6-7; connectors front->back.
-    edges_[0] = {sx[0], sy[0], sx[1], sy[1]};
-    edges_[1] = {sx[1], sy[1], sx[2], sy[2]};
-    edges_[2] = {sx[2], sy[2], sx[3], sy[3]};
-    edges_[3] = {sx[3], sy[3], sx[0], sy[0]};
-    edges_[4] = {sx[4], sy[4], sx[5], sy[5]};
-    edges_[5] = {sx[5], sy[5], sx[6], sy[6]};
-    edges_[6] = {sx[6], sy[6], sx[7], sy[7]};
-    edges_[7] = {sx[7], sy[7], sx[4], sy[4]};
-    edges_[8] = {sx[0], sy[0], sx[4], sy[4]};
-    edges_[9] = {sx[1], sy[1], sx[5], sy[5]};
-    edges_[10] = {sx[2], sy[2], sx[6], sy[6]};
-    edges_[11] = {sx[3], sy[3], sx[7], sy[7]};
-}
-
-void FluidBoxApp::draw_box_edges(uint16_t *buf, int y0, int rows)
-{
-    const int y1 = y0 + rows;
-    const uint16_t edge = __builtin_bswap16(kEdgeColor);
-    for (int e = 0; e < 12; e++) {
-        const Edge &seg = edges_[e];
-        const int ya = min_int(seg.y0, seg.y1);
-        const int yb = max_int(seg.y0, seg.y1);
-        if (yb < y0 || ya >= y1) {
-            continue;
-        }
-        if (ya == yb) {
-            // Horizontal span on a single row.
-            if (ya < y0 || ya >= y1) {
-                continue;
-            }
-            int xa = min_int(seg.x0, seg.x1);
-            int xb = max_int(seg.x0, seg.x1);
-            xa = max_int(xa, 0);
-            xb = min_int(xb, kWidth - 1);
-            uint16_t *row = buf + static_cast<size_t>(ya - y0) * kWidth;
-            for (int x = xa; x <= xb; x++) {
-                row[x] = edge;
-            }
-            continue;
-        }
-        // Diagonal (or vertical) edge: step x per row with 16-bit fraction.
-        const int xa = (seg.y0 == ya) ? seg.x0 : seg.x1;
-        const int xb = (seg.y0 == ya) ? seg.x1 : seg.x0;
-        const int dy = yb - ya;  // > 0
-        int32_t x16 = static_cast<int32_t>(xa) << 16;
-        int32_t step = (static_cast<int32_t>(xb - xa) << 16) / dy;
-        int r0 = max_int(ya, y0);
-        const int r1 = min_int(yb, y1 - 1);
-        x16 += step * (r0 - ya);
-        for (int y = r0; y <= r1; y++) {
-            const int x = static_cast<int>(x16 >> 16);
-            if (x >= 0 && x < kWidth) {
-                buf[static_cast<size_t>(y - y0) * kWidth + x] = edge;
-            }
-            x16 += step;
-        }
-    }
-}
-
-void FluidBoxApp::build_surface()
-{
-    constexpr size_t kSurfacePixels =
-        static_cast<size_t>(kSurfaceWidth) * kSurfaceHeight;
-    std::memset(surface_field_, 0, kSurfacePixels * sizeof(uint16_t));
-    std::memset(surface_heat_, 0, kSurfacePixels * sizeof(uint16_t));
-    std::memset(surface_depth_, 0xFF, kSurfacePixels * sizeof(uint16_t));
-
-    // Screen-space implicit surface. At half resolution, a support radius equal
-    // to the full-resolution particle radius is twice the drawn particle radius
-    // in screen space. Neighbor kernels therefore meet near the iso-threshold,
-    // turning the point cloud into one smooth liquid body.
-    for (int i = 0; i < active_count_; ++i) {
-        const Projected &p = proj_[i];
-        if (!p.active) {
-            continue;
-        }
-        const int cx = p.x / kSurfaceScale;
-        const int cy = p.y / kSurfaceScale;
-        const int radius = max_int(static_cast<int>(p.radius), 2);
-        const uint32_t r2 = static_cast<uint32_t>(radius * radius);
-        const uint32_t d2_mul =
-            static_cast<uint32_t>((255.0f * 65536.0f) / static_cast<float>(r2) + 0.5f);
-        const int x0 = max_int(cx - radius, 0);
-        const int x1 = min_int(cx + radius, kSurfaceWidth - 1);
-        const int y0 = max_int(cy - radius, 0);
-        const int y1 = min_int(cy + radius, kSurfaceHeight - 1);
-
-        for (int y = y0; y <= y1; ++y) {
-            const int dy = y - cy;
-            const uint32_t dy2 = static_cast<uint32_t>(dy * dy);
-            const size_t row = static_cast<size_t>(y) * kSurfaceWidth;
-            for (int x = x0; x <= x1; ++x) {
-                const int dx = x - cx;
-                const uint32_t d2 = static_cast<uint32_t>(dx * dx) + dy2;
-                const uint32_t lut_idx = (d2 * d2_mul) >> 16;
-                if (lut_idx >= 256u) {
-                    continue;
-                }
-
-                const uint32_t falloff = 255u - lut_idx;
-                const uint32_t weight = (falloff * falloff) >> 8;
-                if (weight == 0u) {
-                    continue;
-                }
-                const size_t at = row + static_cast<size_t>(x);
-                const uint32_t field = surface_field_[at] + weight;
-                surface_field_[at] =
-                    static_cast<uint16_t>(field > UINT16_MAX ? UINT16_MAX : field);
-
-                // Store heat in field-weight units. Dividing heat by field when
-                // shading gives a smooth weighted velocity palette index.
-                const uint32_t heat_add = (weight * p.speed_idx + 127u) / 255u;
-                const uint32_t heat = surface_heat_[at] + heat_add;
-                surface_heat_[at] =
-                    static_cast<uint16_t>(heat > UINT16_MAX ? UINT16_MAX : heat);
-
-                const uint32_t nz = nz_lut_[lut_idx];
-                int32_t surf = static_cast<int32_t>(p.z_fx) -
-                               static_cast<int32_t>((p.rw_fx * nz) >> 16);
-                if (surf < 0) {
-                    surf = 0;
-                }
-                if (static_cast<uint32_t>(surf) < surface_depth_[at]) {
-                    surface_depth_[at] = static_cast<uint16_t>(surf);
-                }
-            }
-        }
-    }
-}
-
-void FluidBoxApp::shade_surface(uint16_t *buf, int y0, int rows)
-{
-    constexpr uint32_t kBoxDepthFx =
-        static_cast<uint32_t>(kBoxDepthZ * kDepthFxScale + 0.5f);
-    const int y1 = y0 + rows;
-    for (int y = y0; y < y1; ++y) {
-        const int sy = y / kSurfaceScale;
-        const int sy1 = min_int(sy + 1, kSurfaceHeight - 1);
-        const int sym = max_int(sy - 1, 0);
-        const int fy = y & 1;
-        const uint32_t wy0 = static_cast<uint32_t>(2 - fy);
-        const uint32_t wy1 = static_cast<uint32_t>(fy);
-        const size_t row0 = static_cast<size_t>(sy) * kSurfaceWidth;
-        const size_t row1 = static_cast<size_t>(sy1) * kSurfaceWidth;
-        const size_t rowm = static_cast<size_t>(sym) * kSurfaceWidth;
-        uint16_t *out = buf + static_cast<size_t>(y - y0) * kWidth;
-
-        for (int x = 0; x < kWidth; ++x) {
-            const int sx = x / kSurfaceScale;
-            const int sx1 = min_int(sx + 1, kSurfaceWidth - 1);
-            const int sxm = max_int(sx - 1, 0);
-            const int fx = x & 1;
-            const uint32_t wx0 = static_cast<uint32_t>(2 - fx);
-            const uint32_t wx1 = static_cast<uint32_t>(fx);
-
-            const uint32_t w00 = wx0 * wy0;
-            const uint32_t w10 = wx1 * wy0;
-            const uint32_t w01 = wx0 * wy1;
-            const uint32_t w11 = wx1 * wy1;
-            const uint32_t field =
-                (surface_field_[row0 + sx] * w00 +
-                 surface_field_[row0 + sx1] * w10 +
-                 surface_field_[row1 + sx] * w01 +
-                 surface_field_[row1 + sx1] * w11) >> 2;
-            if (field < kSurfaceThreshold) {
-                continue;
-            }
-            const uint32_t heat =
-                (surface_heat_[row0 + sx] * w00 +
-                 surface_heat_[row0 + sx1] * w10 +
-                 surface_heat_[row1 + sx] * w01 +
-                 surface_heat_[row1 + sx1] * w11) >> 2;
-            uint32_t speed_idx = (heat * 255u + field / 2u) / field;
-            if (speed_idx > 255u) {
-                speed_idx = 255u;
-            }
-
-            // The scalar-field gradient supplies a continuous surface normal,
-            // eliminating per-particle circular highlights. Light comes from
-            // upper-left; accumulated field adds a modest body highlight.
-            const int32_t gx = static_cast<int32_t>(surface_field_[row0 + sx1]) -
-                               static_cast<int32_t>(surface_field_[row0 + sxm]);
-            const int32_t gy = static_cast<int32_t>(surface_field_[row1 + sx]) -
-                               static_cast<int32_t>(surface_field_[rowm + sx]);
-            int32_t brightness =
-                188 + min_int(static_cast<int>((field - kSurfaceThreshold) >> 2), 42) +
-                (gx + gy) / 8;
-            brightness = max_int(72, min_int(brightness, 255));
-
-            uint16_t z = surface_depth_[row0 + sx];
-            const uint16_t z10 = surface_depth_[row0 + sx1];
-            const uint16_t z01 = surface_depth_[row1 + sx];
-            const uint16_t z11 = surface_depth_[row1 + sx1];
-            if (z10 < z) z = z10;
-            if (z01 < z) z = z01;
-            if (z11 < z) z = z11;
-            if (z != UINT16_MAX) {
-                const uint32_t fade =
-                    255u - min_int(static_cast<int>((static_cast<uint32_t>(z) * 65u) /
-                                                   kBoxDepthFx),
-                                   65);
-                brightness = static_cast<int32_t>(
-                    (static_cast<uint32_t>(brightness) * fade) >> 8);
-            }
-
-            // Fade the first 28 field units above the iso-threshold for a
-            // one-pixel antialiased silhouette after 2x bilinear upsampling.
-            const uint32_t coverage =
-                min_int(static_cast<int>(((field - kSurfaceThreshold) * 255u) /
-                                         kSurfaceAaWidth),
-                        255);
-            brightness = static_cast<int32_t>(
-                (static_cast<uint32_t>(brightness) * coverage) >> 8);
-
-            const uint16_t pal = palette_[speed_idx];
-            const uint32_t r5 = ((pal >> 11) & 0x1Fu) * brightness >> 8;
-            const uint32_t g6 = ((pal >> 5) & 0x3Fu) * brightness >> 8;
-            const uint32_t b5 = (pal & 0x1Fu) * brightness >> 8;
-            out[x] = __builtin_bswap16(
-                static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5));
-        }
-    }
 }
 
 }  // namespace fluid_demo

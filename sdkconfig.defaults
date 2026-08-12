@@ -3,6 +3,10 @@
 # ESP-IDF 6.0.2 target: ESP32-S3R8, 8 MB octal PSRAM, 16 MB flash.
 # -----------------------------------------------------------------------------
 
+# Pin the chip target: without this a fresh checkout configures for plain
+# ESP32 and board.cpp fails on S3-only GPIO numbers.
+CONFIG_IDF_TARGET="esp32s3"
+
 # CPU: run at 240 MHz
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 

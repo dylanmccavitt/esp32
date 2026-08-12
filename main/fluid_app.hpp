@@ -8,141 +8,139 @@
 #include "freertos/FreeRTOS.h"
 
 #include "app_shell.hpp"
-#include "fluid.hpp"
 #include "motion.hpp"
-#include "snapshot_exchange.hpp"
 
 namespace fluid_demo {
 
-/// Fluid Box app: owns the Fluid simulation (non-movable, in-place value), the
-/// MotionFilter, the SnapshotExchange, the reset atomic, the app motion mux,
-/// the telemetry atomics, and the whole Fluid raster half (Projected/Edge,
-/// surface maps, LUTs, edges, raster caller) that renderer.cpp used to own.
+/// Fluid Box app, bouncy-speck edition: ~3000 ballistic 1-pixel particles
+/// with real Q8.8 velocities, wall/particle restitution, kick-wake
+/// agitation and zero-repose leveling. Specks fly in arcs, bounce off
+/// the box and each other, and drain into a shallow level bed instead of
+/// piling into heaps. Color tracks speed: sand shades at rest, gold ->
+/// orange -> red with velocity, decaying as afterglow.
 ///
-/// All heavy state lives inside this one namespace-scope object (s_fluid_app),
-/// never on a task stack. The sensor lane calls on_motion(), the physics lane
-/// update(), the render lane render(); the app allocates nothing between
-/// setup_once() and the end of the process.
+/// Threading: the sensor lane feeds on_motion() through the MotionFilter
+/// exactly as before. The engine is single-threaded — it steps and
+/// rasterizes inside render() on the render lane (positions are the only
+/// ground truth; the occupancy grid is rebuilt from them every frame and
+/// doubles as the raster source). update() (physics lane) is a no-op.
 class FluidBoxApp final : public App {
 public:
-    /// Tuned startup count for 30 Hz physics on the 240x240 panel.
-    static constexpr uint16_t kInitialParticles = 216;
-
     FluidBoxApp() = default;
     ~FluidBoxApp() override;
     FluidBoxApp(const FluidBoxApp &) = delete;
     FluidBoxApp &operator=(const FluidBoxApp &) = delete;
 
-    /// Transactional one-time setup: fluid lattice + raster buffers + LUTs.
-    /// Rollback + ESP_ERR_NO_MEM on any allocation failure; idempotent.
+    /// One-time setup: allocate the particle arrays and occupancy grid,
+    /// build the wire-order palette, lay down the starting bed. Rollback +
+    /// ESP_ERR_NO_MEM on allocation failure; idempotent.
     esp_err_t setup_once() override;
 
-    /// Post-barrier entry: drains stale snapshots, frame_seen_ = false, does
-    /// NOT clear a pending reset (honored by the first post-enter update()).
+    /// Post-barrier entry; no allocation. A pending reset set while
+    /// inactive stays set and is consumed by the first render() step.
     esp_err_t enter() override;
 
     /// Sensor lane: filter (or override bypass) + publish under the app mux.
-    /// Returns true iff the fresh physical sample was accepted by the filter.
     bool on_motion(const MotionTick &tick) override;
 
-    /// PlusPress sets the app's reset atomic; no event needs a shell action.
+    /// PlusPress sets the reset atomic; no event needs a shell action.
     ShellAction handle_event(AppEvent) override;
 
-    /// Physics lane at fixed dt: consume pending reset exactly once, step the
-    /// simulation, publish a frame.
+    /// Physics lane: no-op — the engine steps in render() so no state
+    /// crosses cores.
     esp_err_t update(float dt = kPhysicsDt) override;
 
-    /// Render lane: acquire internally, raster + stream via DisplayFrame ops.
-    /// Returns true iff a frame was rendered to completion.
+    /// Render lane: consume a pending reset, step the particle engine
+    /// toward the current gravity, rasterize the grid through DisplayFrame.
     bool render(DisplayFrame &frame) override;
 
-    /// Telemetry: atomics written by update/render lanes. Non-const because it
-    /// samples the motion state under the app's portMUX critical section.
+    /// Telemetry: count = particle population, candidate_checks =
+    /// cumulative walk steps, nonfinite_resets = step-governor hits,
+    /// physics_us = last engine step time.
     AppStats stats() override;
 
     /// No-allocation leave: quiesce motion validity.
     void leave() override;
 
-    /// Console/PLUS reset path: sets the app's reset atomic. Consumed by the
-    /// first post-enter update() via exchange(false) exactly once.
+    /// Console/PLUS reset path: rebuild the starting bed (render lane
+    /// consumes the atomic exactly once).
     void request_fluid_reset();
 
 private:
-    // ---- Fluid raster half (moved from renderer.cpp, byte-for-byte) ----
-    struct Projected {
-        int16_t x;          ///< Full-resolution screen center x (px).
-        int16_t y;          ///< Full-resolution screen center y (px).
-        uint16_t radius;    ///< Full-resolution particle radius (px), >= 1.
-        uint8_t speed_idx;  ///< Palette index for the velocity color.
-        uint8_t active;     ///< 0 = particle skipped (non-finite/out of range).
-        uint32_t z_fx;      ///< Center depth, fixed point, 1/4096 world unit.
-        uint32_t rw_fx;     ///< World radius, fixed point, 1/4096 world unit.
-    };
+    // ---- geometry ----
+    static constexpr int kGridW = 240;
+    static constexpr int kGridH = 240;
+    static constexpr int kParticleCount = 3000;  ///< bed ~12.6 px on an edge
 
-    struct Edge {
-        int x0;
-        int y0;
-        int x1;
-        int y1;
-    };
+    // Particle state byte: bits 0-2 base shade (0..5), bits 3-5 displayed
+    // glow level, bit 6 ASLEEP. Grid byte: 0 empty, else
+    // (level << 3) | (shade + 1) with bits 6-7 = saturating kick counter
+    // harvested one frame later; the raster masks & 0x3F so kick bits are
+    // invisible.
+    static constexpr uint8_t kStateShadeMask = 0x07;
+    static constexpr int kStateGlowShift = 3;
+    static constexpr uint8_t kStateGlowMask = 0x38;
+    static constexpr uint8_t kStateAsleep = 0x40;
+    /// Rebuild overlap loser this frame: its start cell holds the winner's
+    /// byte, so its walk must not lift or wake-tag around that cell.
+    static constexpr uint8_t kStateOverlap = 0x80;
 
-    void build_luts();
-    void preproject(const ParticleFrame &frame, int count);
-    void project_box_edges();
-    void build_surface();
-    void draw_box_edges(uint16_t *buf, int y0, int rows);
-    void shade_surface(uint16_t *buf, int y0, int rows);
-    void free_buffers();
-    esp_err_t render_frame(const ParticleFrame &frame, DisplayFrame &df);
+    void reset_particles();
+    /// One fixed-dt engine step toward screen-space gravity (sim units,
+    /// sgx right, sgy down). Returns walk steps consumed (telemetry).
+    uint32_t step_particles(float sgx, float sgy);
+    void draw_grid(uint16_t *buf, int y0, int rows);
+    inline uint32_t rnd();
 
-    static uint16_t hsv_to_rgb565(float h, float s, float v);
-
-    // ---- app-owned simulation/motion state (absorbed from app_main) ----
-    Fluid fluid_;                // non-movable; in-place value, never moved
     MotionFilter filter_;
-    SnapshotExchange snapshots_;
 
-    /// Motion state published by the sensor lane to the update lane under a
-    /// short critical section (same portMUX pattern as legacy app_main).
+    /// Motion state published by the sensor lane to the render lane under a
+    /// short critical section (same portMUX pattern as previous builds).
     struct SharedMotion {
-        Vec3 apparent_accel{0.0f, 0.0f, 6.0f};  // rest-gravity placeholder
+        Vec3 apparent_accel{0.0f, 0.0f, 9.0f};  // rest-gravity placeholder
         Vec3 raw_accel{0.0f, 0.0f, 0.0f};
         bool valid{false};
     };
     portMUX_TYPE motion_mux_ = portMUX_INITIALIZER_UNLOCKED;
     SharedMotion motion_;
 
-    /// Reset request: any task sets, the update lane consumes once.
+    /// Reset request: any task sets, the render lane consumes once.
     std::atomic<bool> reset_requested_{false};
 
-    // Fluid telemetry copied by the update lane into atomics (the render lane
-    // reads them for telemetry; reading FluidStats directly would race).
+    // Telemetry atomics (stats() may be called from another lane).
     std::atomic<uint32_t> epoch_{0};
-    std::atomic<uint64_t> candidate_checks_{0};
-    std::atomic<uint32_t> nonfinite_resets_{0};
+    std::atomic<uint64_t> walk_steps_{0};
+    std::atomic<uint32_t> governor_hits_{0};
     std::atomic<uint32_t> physics_us_{0};
 
-    // ---- raster state ----
-    uint16_t *surface_field_ = nullptr;
-    uint16_t *surface_heat_ = nullptr;
-    uint16_t *surface_depth_ = nullptr;
-    Projected *proj_ = nullptr;
-    int active_count_ = 0;
+    // ---- particle SoA (one internal-heap arena) + occupancy grid ----
+    void *arena_ = nullptr;      ///< owning pointer for the SoA block
+    uint16_t *px_ = nullptr;     ///< Q8.8 pixels, raw [256, 61183]
+    uint16_t *py_ = nullptr;
+    int16_t *vx_ = nullptr;      ///< Q8.8 px/frame
+    int16_t *vy_ = nullptr;
+    uint8_t *pstate_ = nullptr;  ///< shade | glow | ASLEEP
+    uint8_t *prest_ = nullptr;   ///< consecutive quiet frames toward sleep
+    uint8_t *grid_ = nullptr;    ///< kGridW * kGridH occupancy + raster bytes
 
-    // Render-task-only telemetry for the last frame.
+    uint32_t rng_ = 0x2545F491u;  ///< xorshift32 state (render lane only)
+    uint32_t frame_parity_ = 0;   ///< alternates sweep direction per frame
+    uint32_t awake_count_ = 0;    ///< particles not ASLEEP after last step
+    uint32_t rest_gate_frames_ = 0;
+    float dir_gx_ = 0.0f;         ///< remembered gravity direction (unit);
+    float dir_gy_ = 1.0f;         ///< down always exists, boot = screen-down
+    float prev_gx_ = 0.0f;        ///< wake-reference in-plane accel anchor
+    float prev_gy_ = 0.0f;
+
+    /// Wire-order (pre-swapped) RGB565 palette indexed by the grid byte
+    /// (level << 3 | shade + 1) & 0x3F; shade-0 slots unused.
+    uint16_t shade_wire_[64] = {};
+
+    // Render-lane-only telemetry for the last frame.
     uint32_t frame_us_ = 0;
     uint32_t raster_us_ = 0;
 
-    // Look-up tables built at setup: sphere-front depth and velocity palette.
-    uint16_t nz_lut_[256] = {};
-    uint16_t palette_[256] = {};
-
-    Edge edges_[12] = {};
-
-    // Update-lane-only producer sequence; sensor-lane/other plain state.
-    uint32_t sequence_ = 0;
     bool setup_done_ = false;
-    bool frame_seen_ = false;  // first-frame gate, opened by enter()
 };
 
 /// One namespace-scope instance of the registered Fluid Box app (defined in
