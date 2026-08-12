@@ -1,5 +1,6 @@
 #include "fluid_app.hpp"
 
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -14,24 +15,19 @@ namespace {
 
 constexpr const char *kTag = "fluid_demo";
 
-// ---------------------------------------------------------------------------
-// Engine constants ("Popcorn Walker" spec). Units: positions Q8.8 pixels,
-// velocities Q8.8 px/frame, dt = 1/30 s fixed (one step per render call);
-// every time-based constant is pre-baked for that dt.
-// ---------------------------------------------------------------------------
+// Positions use Q8.8 pixels and velocities use Q8.8 pixels per frame.
+// Time-based constants assume one fixed 1/30-second render step.
 
 // Gravity / input. |apparent| = 9.0 sim units at full edge tilt.
 constexpr int kAccelQ8PerUnit = 64;      // raw px/frame^2 per sim unit
 constexpr int kAccelClampRaw = 1024;     // +/-4 px/frame/axis per frame
-// Down ALWAYS exists. Above this in-plane magnitude the live tilt sets
-// the gravity direction; below it the last-known direction keeps pulling
-// (a box seen through a side window always has a floor). Particles can
-// never hang in the air, whatever the device orientation.
-constexpr float kGravUpdateMag = 0.6f;
-// Applied pull magnitude is never below FULL gravity (9.0): tilt only
-// chooses the direction. There is no weak-pull regime anywhere - a
-// disturbed speck always falls at full acceleration, so nothing can
-// ever read as floating or drifting slowly.
+// Flat/tilted mode hysteresis; Z is trusted as a face selector only outside
+// the near-free-fall band.
+constexpr float kEnterFlatMag = 0.45f;
+constexpr float kExitFlatMag = 0.75f;
+constexpr float kFlatFaceMin = 0.6f;
+constexpr float kValidAccelMin = 0.6f;
+// Tilt selects direction; pull remains at least one simulated gravity.
 constexpr float kAccelFloorUnits = 9.0f;
 
 // Motion.
@@ -65,10 +61,6 @@ constexpr int kSlideMaxRaw = 205;   // water rule below 0.8 px/frame
 constexpr int kSleepSpeedRaw = 90;  // quiet threshold
 constexpr int kSleepFrames = 10;    // ~0.33 s supported + quiet -> ASLEEP
 constexpr float kWakeDirCos = 0.966f;   // >15 deg gravity swing wakes all
-constexpr float kWakeMagDelta = 1.5f;   // |d|a|| jump wakes all
-// Rest gate (also the simmer and wake-all threshold); above the gravity
-// arm point so desk-tilt noise cannot hold the gate open.
-constexpr float kRestGateMag = 0.6f;
 constexpr uint32_t kRestGateFrames = 15;
 
 // Speed -> palette level thresholds (Manhattan |vx|+|vy|, raw Q8.8).
@@ -77,23 +69,23 @@ constexpr int kLevelThreshRaw[7] = {90, 205, 448, 832, 1408, 2304, 3584};
 // Dim border ring marking the box walls (logical RGB565, swapped at setup).
 constexpr uint16_t kWallColor = 0x31A6;  // dark warm gray
 
-// Fixed per-particle sand shades, dark to light, as 8-bit RGB.
-constexpr uint8_t kSandRgb[6][3] = {
-    {0x8a, 0x6b, 0x3e},  // deep tan
-    {0xa3, 0x7c, 0x48},
-    {0xb9, 0x8f, 0x55},
-    {0xcf, 0xa6, 0x68},
-    {0xe0, 0xb8, 0x78},
-    {0xf0, 0xcd, 0x8e},  // pale gold
+// Fixed per-particle fluid shades, deep blue to pale aqua, as 8-bit RGB.
+constexpr uint8_t kFluidRgb[6][3] = {
+    {0x18, 0x52, 0x68},  // deep ocean
+    {0x1f, 0x6f, 0x86},
+    {0x2b, 0x8f, 0xa6},
+    {0x43, 0xb3, 0xc4},
+    {0x70, 0xd2, 0xd8},
+    {0xa8, 0xec, 0xe8},  // pale aqua
 };
 
 // Velocity ramp anchors, indexed by glow level 1..7 (0 = base shade).
 constexpr uint8_t kRampRgb[8][3] = {
     {0x00, 0x00, 0x00},  // level 0: unused (base shade)
-    {0xff, 0xdd, 0x70},  // glint
-    {0xff, 0xd2, 0x3f},  // gold
+    {0xd8, 0xff, 0xf2},  // cool glint
+    {0x9f, 0xf4, 0xe5},  // aqua
+    {0xff, 0xe0, 0x58},  // yellow
     {0xff, 0xb8, 0x2e},  // amber
-    {0xff, 0x9a, 0x20},  // light orange
     {0xff, 0x6a, 0x10},  // vivid orange
     {0xff, 0x3d, 0x0c},  // orange-red
     {0xff, 0x1a, 0x08},  // red
@@ -118,7 +110,6 @@ inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/// Every velocity write funnels through this: int32 math, then saturate.
 inline int16_t sat16(int32_t v)
 {
     return static_cast<int16_t>(clamp_i32(v, -32768, 32767));
@@ -145,10 +136,6 @@ inline uint32_t FluidBoxApp::rnd()
     rng_ ^= rng_ << 5;
     return rng_;
 }
-
-// ---------------------------------------------------------------------------
-// Setup / lifecycle
-// ---------------------------------------------------------------------------
 
 esp_err_t FluidBoxApp::setup_once()
 {
@@ -182,11 +169,11 @@ esp_err_t FluidBoxApp::setup_once()
         const int w = kRampWeight[lv];
         for (int s = 0; s < 6; ++s) {
             const int r =
-                kSandRgb[s][0] + ((kRampRgb[lv][0] - kSandRgb[s][0]) * w) / 255;
+                kFluidRgb[s][0] + ((kRampRgb[lv][0] - kFluidRgb[s][0]) * w) / 255;
             const int gc =
-                kSandRgb[s][1] + ((kRampRgb[lv][1] - kSandRgb[s][1]) * w) / 255;
+                kFluidRgb[s][1] + ((kRampRgb[lv][1] - kFluidRgb[s][1]) * w) / 255;
             const int b =
-                kSandRgb[s][2] + ((kRampRgb[lv][2] - kSandRgb[s][2]) * w) / 255;
+                kFluidRgb[s][2] + ((kRampRgb[lv][2] - kFluidRgb[s][2]) * w) / 255;
             shade_wire_[(lv << 3) | (s + 1)] = __builtin_bswap16(pack565(r, gc, b));
         }
     }
@@ -219,11 +206,17 @@ void FluidBoxApp::reset_particles()
     }
     awake_count_ = 0;
     rest_gate_frames_ = 0;
+    frame_parity_ = 0;
+    gravity_ = {};
     epoch_.fetch_add(1, std::memory_order_relaxed);
 }
 
 esp_err_t FluidBoxApp::enter()
 {
+    if (!setup_done_) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    frames_.drain();
     return ESP_OK;
 }
 
@@ -246,10 +239,6 @@ void FluidBoxApp::request_fluid_reset()
 {
     reset_requested_.store(true, std::memory_order_release);
 }
-
-// ---------------------------------------------------------------------------
-// Sensor lane: motion filter + override bypass (unchanged pattern)
-// ---------------------------------------------------------------------------
 
 bool FluidBoxApp::on_motion(const MotionTick &tick)
 {
@@ -282,96 +271,150 @@ bool FluidBoxApp::on_motion(const MotionTick &tick)
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Physics lane: intentionally idle
-// ---------------------------------------------------------------------------
-
-esp_err_t FluidBoxApp::update(float)
+esp_err_t FluidBoxApp::update(float dt)
 {
+    if (!setup_done_) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!std::isfinite(dt) || dt <= 0.0f) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const int64_t update_start = esp_timer_get_time();
+    const bool reset =
+        reset_requested_.exchange(false, std::memory_order_acq_rel);
+    if (reset) {
+        reset_particles();
+        ESP_LOGI(kTag, "PLUS press - specks reset (epoch %u)",
+                 static_cast<unsigned>(
+                     epoch_.load(std::memory_order_relaxed)));
+    } else {
+        Vec3 apparent{0.0f, 0.0f, 9.0f};
+        portENTER_CRITICAL(&motion_mux_);
+        if (motion_.valid) {
+            apparent = motion_.apparent_accel;
+        }
+        portEXIT_CRITICAL(&motion_mux_);
+
+        const uint32_t steps =
+            step_particles(apparent.x, -apparent.y, apparent.z);
+        walk_steps_.fetch_add(steps, std::memory_order_relaxed);
+    }
+
+    FluidFrame *frame = frames_.begin_write();
+    if (frame != nullptr) {
+        fill_frame(*frame);
+        frames_.publish(frame);
+    }
+    physics_us_.store(
+        static_cast<uint32_t>(esp_timer_get_time() - update_start),
+        std::memory_order_relaxed);
     return ESP_OK;
 }
 
-// ---------------------------------------------------------------------------
-// The engine: one fixed-dt step
-// ---------------------------------------------------------------------------
-
-uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
+FluidBoxApp::GravityState::Frame FluidBoxApp::GravityState::resolve(
+    float sgx, float sgy, float sgz)
 {
-    // -- Per-frame gravity terms (the only float math in the step) --------
-    float ax = sgx;
-    float ay = sgy;
-    if (!std::isfinite(ax) || !std::isfinite(ay)) {
-        ax = 0.0f;
-        ay = 0.0f;
+    float acceleration_units = kAccelFloorUnits;
+    const bool finite =
+        std::isfinite(sgx) && std::isfinite(sgy) && std::isfinite(sgz);
+    if (finite) {
+        const float in_plane_squared = sgx * sgx + sgy * sgy;
+        const float total_squared = in_plane_squared + sgz * sgz;
+        const bool usable =
+            std::isfinite(total_squared) &&
+            total_squared >= kValidAccelMin * kValidAccelMin;
+        if (usable) {
+            const float in_plane_magnitude = std::sqrt(in_plane_squared);
+            const float abs_z = std::fabs(sgz);
+            bool use_tilt = false;
+
+            if (mode == Mode::Flat) {
+                if (in_plane_magnitude >= kExitFlatMag) {
+                    mode = Mode::Tilted;
+                    use_tilt = true;
+                } else if (abs_z >= kFlatFaceMin) {
+                    // Face-up (+Z) settles screen-down; face-down (-Z)
+                    // settles screen-up.
+                    x = 0.0f;
+                    y = sgz >= 0.0f ? 1.0f : -1.0f;
+                }
+            } else if (in_plane_magnitude <= kEnterFlatMag) {
+                if (abs_z >= kFlatFaceMin) {
+                    mode = Mode::Flat;
+                    x = 0.0f;
+                    y = sgz >= 0.0f ? 1.0f : -1.0f;
+                }
+            } else {
+                use_tilt = true;
+            }
+
+            if (use_tilt) {
+                const float inverse_magnitude = 1.0f / in_plane_magnitude;
+                x = sgx * inverse_magnitude;
+                y = sgy * inverse_magnitude;
+                acceleration_units =
+                    in_plane_magnitude > kAccelFloorUnits
+                        ? in_plane_magnitude
+                        : kAccelFloorUnits;
+                const float max_acceleration_units =
+                    static_cast<float>(kAccelClampRaw) / kAccelQ8PerUnit;
+                if (acceleration_units > max_acceleration_units) {
+                    acceleration_units = max_acceleration_units;
+                }
+            }
+        }
     }
-    const float m2 = ax * ax + ay * ay;
-    const float m_in = std::sqrt(m2);
-    if (m_in >= kGravUpdateMag) {
-        const float inv = 1.0f / m_in;
-        dir_gx_ = ax * inv;
-        dir_gy_ = ay * inv;
+
+    const bool wake_all =
+        x * wake_anchor_x + y * wake_anchor_y < kWakeDirCos;
+    if (wake_all) {
+        wake_anchor_x = x;
+        wake_anchor_y = y;
     }
-    // Down always exists: live direction when tilted, remembered direction
-    // when flat, magnitude never below the floor.
-    const float eff =
-        (m_in > kAccelFloorUnits ? m_in : kAccelFloorUnits) *
-        static_cast<float>(kAccelQ8PerUnit);
-    const int32_t dvx = clamp_i32(static_cast<int32_t>(lroundf(dir_gx_ * eff)),
-                                  -kAccelClampRaw, kAccelClampRaw);
-    const int32_t dvy = clamp_i32(static_cast<int32_t>(lroundf(dir_gy_ * eff)),
-                                  -kAccelClampRaw, kAccelClampRaw);
+    return {x, y, acceleration_units, wake_all};
+}
+
+uint32_t FluidBoxApp::step_particles(float sgx, float sgy, float sgz)
+{
+    const GravityState::Frame gravity = gravity_.resolve(sgx, sgy, sgz);
+    const float acceleration_q8 =
+        gravity.acceleration_units * static_cast<float>(kAccelQ8PerUnit);
+    const int32_t dvx =
+        clamp_i32(static_cast<int32_t>(lroundf(gravity.x * acceleration_q8)),
+                  -kAccelClampRaw, kAccelClampRaw);
+    const int32_t dvy =
+        clamp_i32(static_cast<int32_t>(lroundf(gravity.y * acceleration_q8)),
+                  -kAccelClampRaw, kAccelClampRaw);
 
     // Quantized gravity octant (each component -1/0/1) for leveling, kick
     // and simmer directions. tan(22.5 deg) ~ 0.414 splits the octants.
     int gox = 0;
     int goy = 0;
     {
-        const float axa = std::fabs(dir_gx_);
-        const float aya = std::fabs(dir_gy_);
+        const float axa = std::fabs(gravity.x);
+        const float aya = std::fabs(gravity.y);
         if (axa > 0.414f * aya) {
-            gox = (dir_gx_ >= 0.0f) ? 1 : -1;
+            gox = (gravity.x >= 0.0f) ? 1 : -1;
         }
         if (aya > 0.414f * axa) {
-            goy = (dir_gy_ >= 0.0f) ? 1 : -1;
+            goy = (gravity.y >= 0.0f) ? 1 : -1;
         }
     }
-    const bool grav_x_dom = std::fabs(dir_gx_) >= std::fabs(dir_gy_);
+    const bool grav_x_dom = std::fabs(gravity.x) >= std::fabs(gravity.y);
 
-    // -- Global wake: gravity swung, jumped, or flipped -------------------
-    const float mag = std::sqrt(m2);
-    {
-        const float pmag =
-            std::sqrt(prev_gx_ * prev_gx_ + prev_gy_ * prev_gy_);
-        const float dot = ax * prev_gx_ + ay * prev_gy_;
-        bool wake_all = false;
-        if (mag >= kRestGateMag) {
-            if (dot < 0.0f && pmag > 0.2f) {
-                wake_all = true;  // flipped
-            } else if (pmag > 0.2f && dot < kWakeDirCos * mag * pmag) {
-                wake_all = true;  // direction swing > ~15 deg
-            } else if (std::fabs(mag - pmag) > kWakeMagDelta) {
-                wake_all = true;  // magnitude jump
-            }
+    // The wake anchor uses this same effective direction. It only re-arms
+    // after a wake, so sub-threshold changes accumulate beyond 15 degrees.
+    if (gravity.wake_all) {
+        for (int i = 0; i < kParticleCount; ++i) {
+            pstate_[i] &= static_cast<uint8_t>(~kStateAsleep);
+            prest_[i] = 0;
         }
-        if (wake_all) {
-            for (int i = 0; i < kParticleCount; ++i) {
-                pstate_[i] &= static_cast<uint8_t>(~kStateAsleep);
-                prest_[i] = 0;
-            }
-            awake_count_ = kParticleCount;
-        }
-        // Anchor, not previous-frame: it only re-arms on a wake or while
-        // quiet, so a slow tilt accumulates direction/magnitude change
-        // until a wake fires (periodic avalanches), instead of the bed
-        // freezing solid because no single frame crossed a threshold.
-        if (wake_all || mag < kRestGateMag) {
-            prev_gx_ = ax;
-            prev_gy_ = ay;
-        }
+        awake_count_ = kParticleCount;
     }
 
-    // -- Rest gate: quiet and everyone asleep -> skip the step ------------
-    if (mag < kRestGateMag && awake_count_ == 0) {
+    // -- Rest gate: no wake-worthy direction change and all asleep --------
+    if (!gravity.wake_all && awake_count_ == 0) {
         if (rest_gate_frames_ < kRestGateFrames) {
             ++rest_gate_frames_;
         }
@@ -806,11 +849,33 @@ uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
     return steps_used;
 }
 
-// ---------------------------------------------------------------------------
-// Render lane: step + rasterize
-// ---------------------------------------------------------------------------
+void FluidBoxApp::fill_frame(FluidFrame &frame)
+{
+    ++sequence_;
+    if (sequence_ == 0u) {
+        sequence_ = 1u;
+    }
+    frame.sequence = sequence_;
+    frame.epoch = epoch_.load(std::memory_order_relaxed);
+    frame.count = 0;
+    for (uint32_t cell = 0; cell < static_cast<uint32_t>(kGridW * kGridH);
+         ++cell) {
+        const uint8_t color = grid_[cell] & 0x3Fu;
+        if (color == 0u) {
+            continue;
+        }
+        if (frame.count == kParticleCount) {
+            assert(false);
+            break;
+        }
+        frame.cells[frame.count] = static_cast<uint16_t>(cell);
+        frame.colors[frame.count] = color;
+        ++frame.count;
+    }
+}
 
-void FluidBoxApp::draw_grid(uint16_t *buf, int y0, int rows)
+void FluidBoxApp::draw_frame(
+    const FluidFrame &frame, uint16_t *buf, int y0, int rows)
 {
     const uint16_t wall = __builtin_bswap16(kWallColor);
     const int y1 = y0 + rows;
@@ -824,12 +889,14 @@ void FluidBoxApp::draw_grid(uint16_t *buf, int y0, int rows)
         }
         out[0] = wall;
         out[kGridW - 1] = wall;
-        const uint8_t *row = grid_ + static_cast<size_t>(y) * kGridW;
-        for (int x = 1; x < kGridW - 1; ++x) {
-            const uint8_t c = row[x];
-            if (c != 0u) {
-                out[x] = shade_wire_[c & 0x3Fu];
-            }
+    }
+    for (uint16_t i = 0; i < frame.count; ++i) {
+        const int cell = frame.cells[i];
+        const int y = cell / kGridW;
+        if (y >= y0 && y < y1) {
+            buf[static_cast<size_t>(y - y0) * kGridW +
+                static_cast<size_t>(cell % kGridW)] =
+                shade_wire_[frame.colors[i]];
         }
     }
 }
@@ -842,48 +909,40 @@ bool FluidBoxApp::render(DisplayFrame &frame)
     }
     const int64_t t_frame = esp_timer_get_time();
 
-    if (reset_requested_.exchange(false)) {
-        reset_particles();
-        ESP_LOGI(kTag, "PLUS press - specks reset (epoch %u)",
-                 static_cast<unsigned>(epoch_.load(std::memory_order_relaxed)));
-    }
-
-    // Latest apparent acceleration; box +y is screen-up, so screen-down
-    // gravity is -y. z (into the case) has no in-plane effect.
-    Vec3 apparent{0.0f, 0.0f, 9.0f};
-    portENTER_CRITICAL(&motion_mux_);
-    if (motion_.valid) {
-        apparent = motion_.apparent_accel;
-    }
-    portEXIT_CRITICAL(&motion_mux_);
-
-    const int64_t t_step = esp_timer_get_time();
-    const uint32_t steps = step_particles(apparent.x, -apparent.y);
-    walk_steps_.fetch_add(steps, std::memory_order_relaxed);
-    physics_us_.store(static_cast<uint32_t>(esp_timer_get_time() - t_step),
-                      std::memory_order_relaxed);
-
-    if (frame.ops.wait_previous(frame.transport) != ESP_OK) {
+    const FluidFrame *fluid = frames_.acquire_latest();
+    if (fluid == nullptr) {
         return false;
     }
-    static_cast<void>(frame.ops.latch_capture(frame.transport));
 
+    esp_err_t result = frame.ops.wait_previous(frame.transport);
     uint32_t raster_total = 0;
-    for (int s = 0; s < frame.stripe_count; s++) {
-        const int y0 = s * frame.stripe_rows;
-        const int rows = min_int(frame.stripe_rows, frame.height - y0);
-        uint16_t *buf = frame.stripe[s & 1];
+    if (result == ESP_OK) {
+        static_cast<void>(frame.ops.latch_capture(frame.transport));
+        for (int s = 0; s < frame.stripe_count; s++) {
+            const int y0 = s * frame.stripe_rows;
+            const int rows = min_int(frame.stripe_rows, frame.height - y0);
+            uint16_t *buf = frame.stripe[s & 1];
 
-        const int64_t t_raster = esp_timer_get_time();
-        std::memset(buf, 0, static_cast<size_t>(frame.width) * rows * sizeof(uint16_t));
-        draw_grid(buf, y0, rows);
-        raster_total += static_cast<uint32_t>(esp_timer_get_time() - t_raster);
+            const int64_t t_raster = esp_timer_get_time();
+            std::memset(
+                buf, 0,
+                static_cast<size_t>(frame.width) * rows * sizeof(uint16_t));
+            draw_frame(*fluid, buf, y0, rows);
+            raster_total +=
+                static_cast<uint32_t>(esp_timer_get_time() - t_raster);
 
-        if (frame.ops.submit(frame.transport, s, y0, rows, buf) != ESP_OK) {
-            return false;
+            result = frame.ops.submit(frame.transport, s, y0, rows, buf);
+            if (result != ESP_OK) {
+                break;
+            }
+        }
+        if (result == ESP_OK) {
+            result = frame.ops.finish(frame.transport);
         }
     }
-    if (frame.ops.finish(frame.transport) != ESP_OK) {
+
+    frames_.release(fluid);
+    if (result != ESP_OK) {
         return false;
     }
 
