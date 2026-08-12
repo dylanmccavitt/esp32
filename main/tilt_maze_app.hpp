@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 
 #include "app_shell.hpp"
+#include "frame_exchange.hpp"
 #include "motion.hpp"
 
 namespace fluid_demo {
@@ -35,8 +36,6 @@ public:
     void leave() override;
 
 private:
-    static constexpr std::size_t kSnapshotSlotCount = 3;
-
     struct MazeFrame {
         uint32_t sequence = 0;
         uint32_t epoch = 0;
@@ -54,13 +53,6 @@ private:
         uint32_t frozen_internal_largest_free_block = 0;
     };
 
-    enum class SlotState : uint8_t {
-        Free,
-        Writing,
-        Ready,
-        Reading,
-    };
-
     struct SharedMotion {
         Vec3 apparent{0.0f, 0.0f, 6.0f};
         Vec3 raw{0.0f, 0.0f, 0.0f};
@@ -73,11 +65,6 @@ private:
     void move_y(float delta);
     void update_progress_and_win();
 
-    MazeFrame *begin_snapshot();
-    void publish_snapshot(MazeFrame *snapshot);
-    const MazeFrame *acquire_snapshot();
-    void release_snapshot(const MazeFrame *snapshot);
-    void drain_snapshots();
     void fill_snapshot(MazeFrame &snapshot);
     void freeze_memory_target();
 
@@ -128,11 +115,7 @@ private:
     uint8_t progress_ = 0;
     bool solved_ = false;
 
-    // Single-producer/single-consumer, bounded non-blocking handoff.
-    std::array<MazeFrame, kSnapshotSlotCount> snapshots_{};
-    std::array<std::atomic<SlotState>, kSnapshotSlotCount> snapshot_states_{};
-    std::array<std::atomic<uint32_t>, kSnapshotSlotCount> snapshot_sequences_{};
-    MazeFrame *write_snapshot_ = nullptr;
+    LatestFrameExchange<MazeFrame, 3> frames_;
 
     // Cross-lane telemetry; raster/frame timings are render-lane-only.
     std::atomic<uint32_t> published_epoch_{0};

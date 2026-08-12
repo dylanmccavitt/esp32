@@ -19,10 +19,7 @@ namespace {
 
 constexpr const char *kTag = "ragdoll";
 
-// ---------------------------------------------------------------------------
-// Design tokens (logical RGB565, pre-wire-swap; render converts at stripe
-// store to RGB565BE).
-// ---------------------------------------------------------------------------
+// Logical RGB565 colors; render() converts each stripe to wire order.
 constexpr uint16_t kBackground = 0x2D4B;       // deep night sky
 constexpr uint16_t kSnowDot = 0x5ADB;          // faint static snow specks
 constexpr uint16_t kBody = 0xB5B6;             // pale blue-grey ragdoll
@@ -35,10 +32,8 @@ constexpr uint16_t kGameOverBg = 0xD546;       // game-over overlay band
 constexpr uint16_t kSeparator = 0x5AEB;        // soft divider
 constexpr uint16_t kMuted = 0x7BEF;            // hollow/unused accent
 
-// ---------------------------------------------------------------------------
 // 3x5 pixel digit font — 5 rows of 3 bits per digit. Bit 2 (MSB of row byte)
 // is the left column. Scaled at draw time.
-// ---------------------------------------------------------------------------
 constexpr uint8_t kDigitBitmap[10][5] = {
     {0b111, 0b101, 0b101, 0b101, 0b111},  // 0
     {0b010, 0b110, 0b010, 0b010, 0b111},  // 1
@@ -52,9 +47,7 @@ constexpr uint8_t kDigitBitmap[10][5] = {
     {0b111, 0b101, 0b111, 0b001, 0b111},  // 9
 };
 
-// ---------------------------------------------------------------------------
 // Launcher visual — snowflake (flake) over falling drop (meteor).
-// ---------------------------------------------------------------------------
 constexpr uint8_t kLauncherFlakeBitmap[8] = {
     0b00011000,
     0b00100100,
@@ -86,9 +79,6 @@ constexpr LauncherVisual kLauncherVisual{
     kLauncherFlakeBitmap,
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 inline int min_int(int a, int b) { return a < b ? a : b; }
 inline int max_int(int a, int b) { return a > b ? a : b; }
 inline float clamp_float(float v, float lo, float hi)
@@ -137,22 +127,14 @@ void draw_snow_specks(uint16_t *pixels, int width, int y0, int rows)
     }
 }
 
-}  // anonymous namespace
+}  // namespace
 
 RagdollAvalancheApp s_ragdoll_avalanche_app;
-
-// =========================================================================
-// Launcher visual
-// =========================================================================
 
 const LauncherVisual *RagdollAvalancheApp::launcher_visual() const
 {
     return &kLauncherVisual;
 }
-
-// =========================================================================
-// Setup / enter / leave
-// =========================================================================
 
 esp_err_t RagdollAvalancheApp::setup_once()
 {
@@ -160,7 +142,6 @@ esp_err_t RagdollAvalancheApp::setup_once()
         return ESP_OK;
     }
 
-    // One-time NVS init (shared across any app using NVS).
     if (!nvs_inited_) {
         esp_err_t err = nvs_flash_init();
         if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -171,22 +152,13 @@ esp_err_t RagdollAvalancheApp::setup_once()
         }
         if (err != ESP_OK) {
             ESP_LOGE(kTag, "NVS init failed: %s", esp_err_to_name(err));
-            // Continue without persistence — highscore always 0.
         }
         nvs_inited_ = true;
     }
 
-    // One seed per boot; within a run the unaudited std::rand stream is
-    // deterministic (good for dev-mode replay).
     std::srand(static_cast<unsigned>(esp_random()));
 
     load_highscores();
-
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        snapshot_states_[i].store(SlotState::Free, std::memory_order_relaxed);
-        snapshot_sequences_[i].store(0, std::memory_order_relaxed);
-    }
-    write_snapshot_ = nullptr;
 
     reset_game();
     published_epoch_.store(epoch_, std::memory_order_relaxed);
@@ -199,7 +171,7 @@ esp_err_t RagdollAvalancheApp::enter()
     if (!setup_done_) {
         return ESP_ERR_INVALID_STATE;
     }
-    drain_snapshots();
+    frames_.drain();
     portENTER_CRITICAL(&motion_mux_);
     motion_.valid = false;
     portEXIT_CRITICAL(&motion_mux_);
@@ -212,10 +184,6 @@ void RagdollAvalancheApp::leave()
     motion_.valid = false;
     portEXIT_CRITICAL(&motion_mux_);
 }
-
-// =========================================================================
-// Motion, touch, events
-// =========================================================================
 
 bool RagdollAvalancheApp::on_motion(const MotionTick &tick)
 {
@@ -265,10 +233,6 @@ ShellAction RagdollAvalancheApp::handle_event(AppEvent event)
     }
     return ShellAction::None;
 }
-
-// =========================================================================
-// Game logic
-// =========================================================================
 
 void RagdollAvalancheApp::spawn_wave()
 {
@@ -909,10 +873,6 @@ void RagdollAvalancheApp::step_substep()
     }
 }
 
-// =========================================================================
-// Update (update lane)
-// =========================================================================
-
 esp_err_t RagdollAvalancheApp::update(float dt)
 {
     if (!setup_done_) {
@@ -936,133 +896,15 @@ esp_err_t RagdollAvalancheApp::update(float dt)
         }
     }
 
-    AvalancheFrame *snapshot = begin_snapshot();
+    AvalancheFrame *snapshot = frames_.begin_write();
     if (snapshot != nullptr) {
         fill_snapshot(*snapshot);
-        publish_snapshot(snapshot);
+        frames_.publish(snapshot);
     }
     published_epoch_.store(epoch_, std::memory_order_relaxed);
     physics_us_.store(static_cast<uint32_t>(esp_timer_get_time() - update_start),
                       std::memory_order_relaxed);
     return ESP_OK;
-}
-
-// =========================================================================
-// Triple snapshot exchange (identical protocol to tilt maze)
-// =========================================================================
-
-RagdollAvalancheApp::AvalancheFrame *RagdollAvalancheApp::begin_snapshot()
-{
-    if (write_snapshot_ != nullptr) {
-        return nullptr;
-    }
-
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        SlotState expected = SlotState::Free;
-        if (snapshot_states_[i].compare_exchange_strong(
-                expected, SlotState::Writing, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            write_snapshot_ = &snapshots_[i];
-            return write_snapshot_;
-        }
-    }
-
-    std::size_t oldest = kSnapshotSlotCount;
-    uint32_t oldest_sequence = 0;
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        if (snapshot_states_[i].load(std::memory_order_acquire) != SlotState::Ready) {
-            continue;
-        }
-        const uint32_t seq =
-            snapshot_sequences_[i].load(std::memory_order_relaxed);
-        if (oldest == kSnapshotSlotCount ||
-            static_cast<int32_t>(oldest_sequence - seq) > 0) {
-            oldest = i;
-            oldest_sequence = seq;
-        }
-    }
-    if (oldest < kSnapshotSlotCount) {
-        SlotState expected = SlotState::Ready;
-        if (snapshot_states_[oldest].compare_exchange_strong(
-                expected, SlotState::Writing, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            write_snapshot_ = &snapshots_[oldest];
-            return write_snapshot_;
-        }
-    }
-    return nullptr;
-}
-
-void RagdollAvalancheApp::publish_snapshot(AvalancheFrame *snapshot)
-{
-    if (snapshot == nullptr || snapshot != write_snapshot_) {
-        return;
-    }
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        if (snapshot == &snapshots_[i]) {
-            snapshot_sequences_[i].store(snapshot->sequence, std::memory_order_relaxed);
-            snapshot_states_[i].store(SlotState::Ready, std::memory_order_release);
-            write_snapshot_ = nullptr;
-            return;
-        }
-    }
-}
-
-const RagdollAvalancheApp::AvalancheFrame *RagdollAvalancheApp::acquire_snapshot()
-{
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        std::size_t newest = kSnapshotSlotCount;
-        uint32_t newest_sequence = 0;
-        for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-            if (snapshot_states_[i].load(std::memory_order_acquire) != SlotState::Ready) {
-                continue;
-            }
-            const uint32_t seq =
-                snapshot_sequences_[i].load(std::memory_order_relaxed);
-            if (newest == kSnapshotSlotCount ||
-                static_cast<int32_t>(seq - newest_sequence) > 0) {
-                newest = i;
-                newest_sequence = seq;
-            }
-        }
-        if (newest == kSnapshotSlotCount) {
-            return nullptr;
-        }
-        SlotState expected = SlotState::Ready;
-        if (snapshot_states_[newest].compare_exchange_strong(
-                expected, SlotState::Reading, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            return &snapshots_[newest];
-        }
-    }
-    return nullptr;
-}
-
-void RagdollAvalancheApp::release_snapshot(const AvalancheFrame *snapshot)
-{
-    if (snapshot == nullptr) {
-        return;
-    }
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        if (snapshot == &snapshots_[i]) {
-            SlotState expected = SlotState::Reading;
-            static_cast<void>(snapshot_states_[i].compare_exchange_strong(
-                expected, SlotState::Free, std::memory_order_release,
-                std::memory_order_relaxed));
-            return;
-        }
-    }
-}
-
-void RagdollAvalancheApp::drain_snapshots()
-{
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        const AvalancheFrame *stale = acquire_snapshot();
-        if (stale == nullptr) {
-            break;
-        }
-        release_snapshot(stale);
-    }
 }
 
 void RagdollAvalancheApp::fill_snapshot(AvalancheFrame &snapshot)
@@ -1090,10 +932,6 @@ void RagdollAvalancheApp::fill_snapshot(AvalancheFrame &snapshot)
     }
 }
 
-// =========================================================================
-// Stats (shell telemetry)
-// =========================================================================
-
 AppStats RagdollAvalancheApp::stats()
 {
     AppStats result{};
@@ -1114,10 +952,6 @@ AppStats RagdollAvalancheApp::stats()
     result.frame_us = frame_us_;
     return result;
 }
-
-// =========================================================================
-// Render drawing primitives
-// =========================================================================
 
 void RagdollAvalancheApp::draw_rect(uint16_t *pixels, int width, int y0,
                                     int rows, int left, int top,
@@ -1302,10 +1136,6 @@ void RagdollAvalancheApp::draw_number(uint16_t *pixels, int width, int y0,
     }
 }
 
-// =========================================================================
-// Stripe rasterization
-// =========================================================================
-
 void RagdollAvalancheApp::raster_stripe(const AvalancheFrame &frame,
                                         uint16_t *pixels, int width,
                                         int y0, int rows)
@@ -1389,10 +1219,6 @@ void RagdollAvalancheApp::raster_stripe(const AvalancheFrame &frame,
     }
 }
 
-// =========================================================================
-// Render (render lane)
-// =========================================================================
-
 bool RagdollAvalancheApp::render(DisplayFrame &frame)
 {
     if (!setup_done_ || frame.transport == nullptr || frame.width != kPanelWidth ||
@@ -1405,7 +1231,7 @@ bool RagdollAvalancheApp::render(DisplayFrame &frame)
         return false;
     }
 
-    const AvalancheFrame *av = acquire_snapshot();
+    const AvalancheFrame *av = frames_.acquire_latest();
     if (av == nullptr) {
         return false;
     }
@@ -1442,7 +1268,7 @@ bool RagdollAvalancheApp::render(DisplayFrame &frame)
         }
     }
 
-    release_snapshot(av);
+    frames_.release(av);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "render transport failed: %s", esp_err_to_name(result));
         return false;
