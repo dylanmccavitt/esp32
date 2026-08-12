@@ -1,12 +1,3 @@
-// console_service.cpp — USB Serial/JTAG dev REPL (replaces dev_console.cpp).
-//
-// Commands, help text, @DEV/@FB wire format, the std::atomic<bool> s_dumping
-// stdout dump gate, bounded base64 lines and the REPL parameters (prompt
-// "fluid> ", prio 2, core 0, 6144-byte stack) are preserved.
-// State moved from dev_console's file statics: the override now lives in the
-// shell's MotionService and the reset path uses a trampoline bound exactly
-// once at start() to the Fluid app's reset atomic.
-
 #include "console_service.hpp"
 
 #include <cerrno>
@@ -139,7 +130,9 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
     s_active = this;
 
     esp_err_t err = esp_console_register_help_command();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        return err;
+    }
     if ((err = register_command("ping", "Verify the firmware development link", nullptr,
                                 command_ping)) != ESP_OK ||
         (err = register_command("status", "Report uptime and development-control state", nullptr,
@@ -150,7 +143,7 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
                                 "<ax> <ay> <az> [duration_ms]", command_motion)) != ESP_OK ||
         (err = register_command("release", "Return motion control to the physical IMU", nullptr,
                                 command_release)) != ESP_OK ||
-        (err = register_command("reset", "Reset only the in-memory fluid simulation", nullptr,
+        (err = register_command("reset", "Reset the currently running app", nullptr,
                                 command_reset)) != ESP_OK ||
         (err = register_command("reboot", "Restart the firmware", nullptr,
                                 command_reboot)) != ESP_OK ||
@@ -171,10 +164,14 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
         ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
     esp_console_repl_t *repl = nullptr;
     err = esp_console_new_repl_usb_serial_jtag(&device_config, &repl_config, &repl);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        return err;
+    }
     repl_ = repl;
     err = esp_console_start_repl(repl);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        return err;
+    }
     ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot/input");
     return ESP_OK;
 #else
@@ -216,8 +213,6 @@ void ConsoleService::emit_rebooting()
     std::printf("\r\n@DEV REBOOTING\r\n");
     end_protocol_output();
 }
-
-
 int ConsoleService::command_ping(int argc, char **argv)
 {
     static_cast<void>(argv);
@@ -295,7 +290,11 @@ int ConsoleService::command_reset(int argc, char **argv)
         std::printf("usage: reset\r\n");
         return 1;
     }
-    s_active->reset_callback_();
+    const esp_err_t err = s_active->reset_callback_();
+    if (err != ESP_OK) {
+        std::printf("reset: no running app\r\n");
+        return 1;
+    }
     std::printf("@DEV RESET_REQUESTED\r\n");
     return 0;
 }
@@ -346,8 +345,6 @@ int ConsoleService::command_input(int argc, char **argv)
     }
     return 0;
 }
-
-
 int ConsoleService::command_framebuffer(int argc, char **argv)
 {
     if ((argc != 1 && argc != 2) || s_active->display_ == nullptr) {
