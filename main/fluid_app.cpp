@@ -28,9 +28,11 @@ constexpr int kAccelClampRaw = 1024;     // +/-4 px/frame/axis per frame
 // (a box seen through a side window always has a floor). Particles can
 // never hang in the air, whatever the device orientation.
 constexpr float kGravUpdateMag = 0.6f;
-// Minimum pull strength: the applied magnitude is max(|a|, this), so
-// even the remembered-direction pull at device-flat is a hard yank.
-constexpr float kAccelFloorUnits = 4.0f;
+// Applied pull magnitude is never below FULL gravity (9.0): tilt only
+// chooses the direction. There is no weak-pull regime anywhere - a
+// disturbed speck always falls at full acceleration, so nothing can
+// ever read as floating or drifting slowly.
+constexpr float kAccelFloorUnits = 9.0f;
 
 // Motion.
 constexpr int kDragShift = 7;      // v -= v>>7 per frame (~0.992)
@@ -55,8 +57,8 @@ constexpr int kPpTangNum = 230;     // particle hit: v_t *= 0.9; v_n = -(v_n>>1)
 // support-loss, so a vacated-support particle wakes and falls under
 // gravity instead of being launched upward (which self-pumps).
 constexpr int kKickTriggerRaw = 512;  // pre-impact |v_n| >= 2 px/frame
-constexpr int kKickUpRaw = 307;       // 1.2 px/frame anti-gravity per count
-constexpr int kKickLatRaw = 115;      // 0.45 px/frame random-sign lateral
+constexpr int kKickUpRaw = 640;       // 2.5 px/frame anti-gravity per count
+constexpr int kKickLatRaw = 230;      // 0.9 px/frame random-sign lateral
 
 // Leveling / sleep / wake.
 constexpr int kSlideMaxRaw = 205;   // water rule below 0.8 px/frame
@@ -64,10 +66,6 @@ constexpr int kSleepSpeedRaw = 90;  // quiet threshold
 constexpr int kSleepFrames = 10;    // ~0.33 s supported + quiet -> ASLEEP
 constexpr float kWakeDirCos = 0.966f;   // >15 deg gravity swing wakes all
 constexpr float kWakeMagDelta = 1.5f;   // |d|a|| jump wakes all
-constexpr int kSimmerCount = 64;        // wake attempts/frame while tilted
-constexpr int kSimmerMinRaw = 77;       // 0.3..0.6 px/frame simmer speed
-constexpr int kSimmerSpanRaw = 78;
-
 // Rest gate (also the simmer and wake-all threshold); above the gravity
 // arm point so desk-tilt noise cannot hold the gate open.
 constexpr float kRestGateMag = 0.6f;
@@ -801,42 +799,6 @@ uint32_t FluidBoxApp::step_particles(float sgx, float sgy)
                     above |= 0xC0u;
                 }
             }
-        }
-    }
-
-    // -- Simmer: while tilted, tickle a few sleepers on the surface -------
-    if (mag >= kRestGateMag) {
-        for (int t = 0; t < kSimmerCount; ++t) {
-            const uint32_t r = rnd();
-            const int i = static_cast<int>(r % kParticleCount);
-            if ((pstate_[i] & kStateAsleep) == 0u) {
-                continue;
-            }
-            const int cx = px_[i] >> 8;
-            const int cy = py_[i] >> 8;
-            // Surface test: any cardinal neighbor empty (not fully
-            // buried) — the free surface is not always the anti-gravity
-            // face (a bottom bed under sideways gravity exposes its top).
-            const size_t cc = static_cast<size_t>(cy) * kGridW + cx;
-            const bool buried =
-                g[cc - 1] != 0u && g[cc + 1] != 0u &&
-                g[cc - kGridW] != 0u && g[cc + kGridW] != 0u;
-            if (buried) {
-                continue;
-            }
-            int32_t sp =
-                kSimmerMinRaw + static_cast<int32_t>((r >> 8) % kSimmerSpanRaw);
-            int32_t lat = static_cast<int32_t>((r >> 16) % (sp + 1)) -
-                          (sp >> 1);
-            if (go_diag) {
-                sp = (sp * 181) >> 8;
-                lat = (lat * 181) >> 8;
-            }
-            vx_[i] = sat16(-gox * sp - goy * lat);
-            vy_[i] = sat16(-goy * sp + gox * lat);
-            pstate_[i] &= static_cast<uint8_t>(~kStateAsleep);
-            prest_[i] = 0;
-            ++awake;
         }
     }
 
