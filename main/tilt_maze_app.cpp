@@ -70,9 +70,12 @@ constexpr std::array<WallRect, 3> kMazeWalls{{
 
 constexpr float kSubstepDt = 1.0f / 60.0f;
 constexpr int kSubstepsPerUpdate = 2;
-constexpr float kAccelerationScale = 24.0f;  // apparent units -> px/s^2
-constexpr float kDampingPerSubstep = 0.985f;
-constexpr float kMaximumSpeed = 96.0f;
+constexpr float kMoveClamp = 15.0f;
+constexpr float kAccelerationScale = 42.0f;  // apparent units -> px/s^2
+constexpr float kDampingPerSubstep = 0.976f;
+// Avalanche parity remains collision-safe: 210 px/s advances 3.5 px per
+// substep, less than the maze's 8 px wall thickness.
+constexpr float kMaximumSpeed = 210.0f;
 constexpr float kRestSpeed = 0.025f;
 constexpr float kRestAcceleration = 0.025f;
 constexpr uint8_t kProgressPipCount = 6;
@@ -363,14 +366,20 @@ void TiltMazeApp::step_substep(float apparent_x, float apparent_y)
         return;
     }
 
+    // Inputs are already mapped to screen space: +X is right and +Y is down.
     const float accel_x =
-        clamp_float(apparent_x, -18.0f, 18.0f) * kAccelerationScale;
+        clamp_float(apparent_x, -kMoveClamp, kMoveClamp) * kAccelerationScale;
     const float accel_y =
-        clamp_float(apparent_y, -18.0f, 18.0f) * kAccelerationScale;
+        clamp_float(apparent_y, -kMoveClamp, kMoveClamp) * kAccelerationScale;
     velocity_x_ = (velocity_x_ + accel_x * kSubstepDt) * kDampingPerSubstep;
     velocity_y_ = (velocity_y_ + accel_y * kSubstepDt) * kDampingPerSubstep;
-    velocity_x_ = clamp_float(velocity_x_, -kMaximumSpeed, kMaximumSpeed);
-    velocity_y_ = clamp_float(velocity_y_, -kMaximumSpeed, kMaximumSpeed);
+    const float speed =
+        std::sqrt(velocity_x_ * velocity_x_ + velocity_y_ * velocity_y_);
+    if (speed > kMaximumSpeed) {
+        const float scale = kMaximumSpeed / speed;
+        velocity_x_ *= scale;
+        velocity_y_ *= scale;
+    }
     if (std::fabs(velocity_x_) < kRestSpeed && std::fabs(accel_x) < kRestAcceleration) {
         velocity_x_ = 0.0f;
     }
@@ -406,7 +415,7 @@ esp_err_t TiltMazeApp::update(float dt)
         portEXIT_CRITICAL(&motion_mux_);
 
         for (int step = 0; step < kSubstepsPerUpdate; ++step) {
-            step_substep(apparent.x, apparent.y);
+            step_substep(apparent.x, -apparent.y);
         }
     }
 
