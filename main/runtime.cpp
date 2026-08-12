@@ -16,6 +16,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "attitude_app.hpp"
 #include "board.hpp"
 #include "console_service.hpp"
 #include "display_service.hpp"
@@ -23,6 +24,7 @@
 #include "input_service.hpp"
 #include "launcher.hpp"
 #include "motion_service.hpp"
+#include "orient_cube_app.hpp"
 #include "ragdoll_avalanche_app.hpp"
 #include "tilt_maze_app.hpp"
 
@@ -36,6 +38,8 @@ constexpr RegistryEntry kRegistry[] = {
     {"fluid_box", "Fluid Box", &s_fluid_app},
     {"tilt_maze", "Task Maze", &s_tilt_maze_app},
     {"ragdoll_avalanche", "Avalanche", &s_ragdoll_avalanche_app},
+    {"orient_cube", "Cube", &s_orient_cube_app},
+    {"attitude", "Horizon", &s_attitude_app},
 };
 constexpr size_t kRegistryCount = sizeof(kRegistry) / sizeof(kRegistry[0]);
 
