@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 
 #include "app_shell.hpp"
+#include "frame_exchange.hpp"
 #include "motion.hpp"
 
 namespace fluid_demo {
@@ -36,7 +37,6 @@ public:
     void leave() override;
 
 private:
-    static constexpr std::size_t kSnapshotSlotCount = 3;
     static constexpr int kMaxSpikes = 24;
     static constexpr int kPanelWidth = 240;
     static constexpr int kPanelHeight = 240;
@@ -147,13 +147,6 @@ private:
         std::array<SpikeRender, kMaxSpikes> spikes{};
     };
 
-    enum class SlotState : uint8_t {
-        Free,
-        Writing,
-        Ready,
-        Reading,
-    };
-
     struct SharedMotion {
         Vec3 apparent{0.0f, 0.0f, 6.0f};
         Vec3 raw{0.0f, 0.0f, 0.0f};
@@ -172,11 +165,6 @@ private:
     void load_highscores();
     void save_highscore(int32_t score);
 
-    AvalancheFrame *begin_snapshot();
-    void publish_snapshot(AvalancheFrame *snapshot);
-    const AvalancheFrame *acquire_snapshot();
-    void release_snapshot(const AvalancheFrame *snapshot);
-    void drain_snapshots();
     void fill_snapshot(AvalancheFrame &snapshot);
 
     // Stripe-aware pixel drawing (screen coordinates).
@@ -233,10 +221,7 @@ private:
     int32_t best_score_ = 0;
     std::array<int32_t, kMaxHighscores> top_scores_{};
 
-    std::array<AvalancheFrame, kSnapshotSlotCount> snapshots_{};
-    std::array<std::atomic<SlotState>, kSnapshotSlotCount> snapshot_states_{};
-    std::array<std::atomic<uint32_t>, kSnapshotSlotCount> snapshot_sequences_{};
-    AvalancheFrame *write_snapshot_ = nullptr;
+    LatestFrameExchange<AvalancheFrame, 3> frames_;
 
     std::atomic<uint32_t> published_epoch_{0};
     std::atomic<uint32_t> active_count_{0};

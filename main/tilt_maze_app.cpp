@@ -15,8 +15,7 @@ constexpr const char *kTag = "tilt_maze";
 constexpr int kPanelWidth = 240;
 constexpr int kPanelHeight = 240;
 
-// Logical RGB565 design tokens. Composition stays in logical order; the sole
-// conversion to RGB565BE happens at the final stripe store.
+// Logical RGB565 colors; render() converts each stripe to wire order.
 constexpr uint16_t kBackground = 0x1103;  // deep blue-black surround
 constexpr uint16_t kFloor = 0xE6F9;       // warm, high-contrast maze floor
 constexpr uint16_t kWall = 0x3227;        // dense indigo wall mass
@@ -122,11 +121,6 @@ inline bool finite_vec(const Vec3 &value)
     return std::isfinite(value.x) && std::isfinite(value.y) &&
            std::isfinite(value.z);
 }
-inline bool sequence_newer(uint32_t candidate, uint32_t reference)
-{
-    return static_cast<int32_t>(candidate - reference) > 0;
-}
-
 bool circle_overlaps(float cx, float cy, const WallRect &wall)
 {
     const float closest_x = clamp_float(cx, wall.left, wall.right);
@@ -147,10 +141,6 @@ const LauncherVisual *TiltMazeApp::launcher_visual() const
 
 void TiltMazeApp::on_system_telemetry(const SystemTelemetry &telemetry)
 {
-    // The shell calls on the render lane at most once per second. Copy only
-    // the pointer-free value contract while holding this dedicated short mux.
-    // A round that began before its first valid sample latches exactly once;
-    // subsequent samples update the live overlays without moving its target.
     portENTER_CRITICAL(&telemetry_mux_);
     latest_system_telemetry_ = telemetry;
     if (frozen_telemetry_generation_ == 0u && telemetry.generation != 0u) {
@@ -168,11 +158,6 @@ esp_err_t TiltMazeApp::setup_once()
         return ESP_OK;
     }
 
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        snapshot_states_[i].store(SlotState::Free, std::memory_order_relaxed);
-        snapshot_sequences_[i].store(0, std::memory_order_relaxed);
-    }
-    write_snapshot_ = nullptr;
     completed_rounds_ = 0;
     reset_maze(false);
     published_epoch_.store(epoch_, std::memory_order_relaxed);
@@ -186,18 +171,13 @@ esp_err_t TiltMazeApp::enter()
         return ESP_ERR_INVALID_STATE;
     }
 
-    // The shell's generation barrier makes both model fields safe here. Home
-    // deliberately preserves the round and ball pose; re-entry retires stale
-    // render data and kinetic/input energy only.
-    drain_snapshots();
+    // Re-entry preserves the round and pose but discards stale motion/render data.
+    frames_.drain();
     velocity_x_ = 0.0f;
     velocity_y_ = 0.0f;
     portENTER_CRITICAL(&motion_mux_);
     motion_.valid = false;
     portEXIT_CRITICAL(&motion_mux_);
-    // Samples belong to one committed run generation. Preserve this round's
-    // already-frozen target, but never let an immediate post-re-entry reset
-    // mistake the previous run's heap inventory for a current one.
     portENTER_CRITICAL(&telemetry_mux_);
     latest_system_telemetry_ = {};
     portEXIT_CRITICAL(&telemetry_mux_);
@@ -206,8 +186,6 @@ esp_err_t TiltMazeApp::enter()
 
 void TiltMazeApp::leave()
 {
-    // Preserve the maze model exactly. Invalidate only a live acceleration so
-    // an inactive app cannot resume under an old pose on its next entry.
     portENTER_CRITICAL(&motion_mux_);
     motion_.valid = false;
     portEXIT_CRITICAL(&motion_mux_);
@@ -229,21 +207,16 @@ void TiltMazeApp::on_touch(const TouchEvent &event)
 
 bool TiltMazeApp::on_motion(const MotionTick &tick)
 {
-    // MotionFilter assumes finite dt before its one-pole advance, so reject the
-    // entire physical sample up front rather than allowing NaN state to enter.
-    const bool physical_candidate =
+    const bool physical_valid =
         tick.fresh && std::isfinite(tick.dt) && tick.dt > 0.0f &&
         finite_vec(tick.accel_mps2) && finite_vec(tick.gyro_rads);
     bool physical_accepted = false;
     Vec3 filtered{};
-    if (physical_candidate) {
+    if (physical_valid) {
         filtered = filter_.update(tick.accel_mps2, tick.gyro_rads, tick.dt);
         physical_accepted = filter_.last_sample_accepted() && finite_vec(filtered);
     }
 
-    // A console override is a deliberate deterministic source rather than a
-    // stale physical sample. It may publish while the IMU has no fresh report,
-    // but a non-finite override is ignored exactly like a bad physical read.
     const bool override_valid = tick.override_active && finite_vec(tick.apparent_accel);
     if (!physical_accepted && !override_valid) {
         portENTER_CRITICAL(&motion_mux_);
@@ -266,8 +239,6 @@ bool TiltMazeApp::on_motion(const MotionTick &tick)
 
 void TiltMazeApp::freeze_memory_target()
 {
-    // The goal describes one observed allocator fact at the round boundary.
-    // Gameplay itself never probes, allocates, or frees heap storage.
     portENTER_CRITICAL(&telemetry_mux_);
     frozen_telemetry_generation_ = latest_system_telemetry_.generation;
     frozen_internal_free_bytes_ = latest_system_telemetry_.internal_free_bytes;
@@ -392,10 +363,10 @@ void TiltMazeApp::step_substep(float apparent_x, float apparent_y)
         return;
     }
 
-    // Apparent +X is screen-right and apparent +Y is screen-down. Axis speed
-    // is bounded before the <=1.6 px substep, preventing wall tunnelling.
-    const float accel_x = clamp_float(apparent_x, -18.0f, 18.0f) * kAccelerationScale;
-    const float accel_y = clamp_float(apparent_y, -18.0f, 18.0f) * kAccelerationScale;
+    const float accel_x =
+        clamp_float(apparent_x, -18.0f, 18.0f) * kAccelerationScale;
+    const float accel_y =
+        clamp_float(apparent_y, -18.0f, 18.0f) * kAccelerationScale;
     velocity_x_ = (velocity_x_ + accel_x * kSubstepDt) * kDampingPerSubstep;
     velocity_y_ = (velocity_y_ + accel_y * kSubstepDt) * kDampingPerSubstep;
     velocity_x_ = clamp_float(velocity_x_, -kMaximumSpeed, kMaximumSpeed);
@@ -424,8 +395,7 @@ esp_err_t TiltMazeApp::update(float dt)
     const int64_t update_start = esp_timer_get_time();
     const bool reset = reset_requested_.exchange(false, std::memory_order_acq_rel);
     if (reset) {
-        // Publish the exact start pose this update; a held tilt begins acting on
-        // the following fixed update rather than perturbing the reset frame.
+        // Publish the reset pose before applying any held tilt.
         reset_maze(true);
     } else {
         Vec3 apparent{};
@@ -446,130 +416,15 @@ esp_err_t TiltMazeApp::update(float dt)
         reset_maze(true);
     }
 
-    MazeFrame *snapshot = begin_snapshot();
+    MazeFrame *snapshot = frames_.begin_write();
     if (snapshot != nullptr) {
         fill_snapshot(*snapshot);
-        publish_snapshot(snapshot);
+        frames_.publish(snapshot);
     }
     published_epoch_.store(epoch_, std::memory_order_relaxed);
     physics_us_.store(static_cast<uint32_t>(esp_timer_get_time() - update_start),
                       std::memory_order_relaxed);
     return ESP_OK;
-}
-
-TiltMazeApp::MazeFrame *TiltMazeApp::begin_snapshot()
-{
-    if (write_snapshot_ != nullptr) {
-        return nullptr;
-    }
-
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        SlotState expected = SlotState::Free;
-        if (snapshot_states_[i].compare_exchange_strong(
-                expected, SlotState::Writing, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            write_snapshot_ = &snapshots_[i];
-            return write_snapshot_;
-        }
-    }
-
-    // If rendering lags, reclaim only the oldest READY slot. A READING slot is
-    // never touched, so neither lane blocks and the consumer always sees a
-    // complete immutable frame.
-    std::size_t oldest = kSnapshotSlotCount;
-    uint32_t oldest_sequence = 0;
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        if (snapshot_states_[i].load(std::memory_order_acquire) != SlotState::Ready) {
-            continue;
-        }
-        const uint32_t sequence =
-            snapshot_sequences_[i].load(std::memory_order_relaxed);
-        if (oldest == kSnapshotSlotCount || sequence_newer(oldest_sequence, sequence)) {
-            oldest = i;
-            oldest_sequence = sequence;
-        }
-    }
-    if (oldest < kSnapshotSlotCount) {
-        SlotState expected = SlotState::Ready;
-        if (snapshot_states_[oldest].compare_exchange_strong(
-                expected, SlotState::Writing, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            write_snapshot_ = &snapshots_[oldest];
-            return write_snapshot_;
-        }
-    }
-    return nullptr;
-}
-
-void TiltMazeApp::publish_snapshot(MazeFrame *snapshot)
-{
-    if (snapshot == nullptr || snapshot != write_snapshot_) {
-        return;
-    }
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        if (snapshot == &snapshots_[i]) {
-            snapshot_sequences_[i].store(snapshot->sequence, std::memory_order_relaxed);
-            snapshot_states_[i].store(SlotState::Ready, std::memory_order_release);
-            write_snapshot_ = nullptr;
-            return;
-        }
-    }
-}
-
-const TiltMazeApp::MazeFrame *TiltMazeApp::acquire_snapshot()
-{
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        std::size_t newest = kSnapshotSlotCount;
-        uint32_t newest_sequence = 0;
-        for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-            if (snapshot_states_[i].load(std::memory_order_acquire) != SlotState::Ready) {
-                continue;
-            }
-            const uint32_t sequence =
-                snapshot_sequences_[i].load(std::memory_order_relaxed);
-            if (newest == kSnapshotSlotCount || sequence_newer(sequence, newest_sequence)) {
-                newest = i;
-                newest_sequence = sequence;
-            }
-        }
-        if (newest == kSnapshotSlotCount) {
-            return nullptr;
-        }
-        SlotState expected = SlotState::Ready;
-        if (snapshot_states_[newest].compare_exchange_strong(
-                expected, SlotState::Reading, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            return &snapshots_[newest];
-        }
-    }
-    return nullptr;
-}
-
-void TiltMazeApp::release_snapshot(const MazeFrame *snapshot)
-{
-    if (snapshot == nullptr) {
-        return;
-    }
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        if (snapshot == &snapshots_[i]) {
-            SlotState expected = SlotState::Reading;
-            static_cast<void>(snapshot_states_[i].compare_exchange_strong(
-                expected, SlotState::Free, std::memory_order_release,
-                std::memory_order_relaxed));
-            return;
-        }
-    }
-}
-
-void TiltMazeApp::drain_snapshots()
-{
-    for (std::size_t i = 0; i < kSnapshotSlotCount; ++i) {
-        const MazeFrame *stale = acquire_snapshot();
-        if (stale == nullptr) {
-            break;
-        }
-        release_snapshot(stale);
-    }
 }
 
 void TiltMazeApp::fill_snapshot(MazeFrame &snapshot)
@@ -951,9 +806,9 @@ bool TiltMazeApp::render(DisplayFrame &frame)
         return false;
     }
 
-    const MazeFrame *maze = acquire_snapshot();
+    const MazeFrame *maze = frames_.acquire_latest();
     if (maze == nullptr) {
-        return false;  // Blank pass: no transport operation is touched.
+        return false;
     }
 
     const int64_t frame_start = esp_timer_get_time();
@@ -972,7 +827,6 @@ bool TiltMazeApp::render(DisplayFrame &frame)
             raster_stripe(*maze, pixels, frame.width, stripe_y, stripe_rows);
             const int pixel_count = frame.width * stripe_rows;
             for (int pixel = 0; pixel < pixel_count; ++pixel) {
-                // Sole logical RGB565 -> RGB565BE wire-order conversion.
                 pixels[pixel] = __builtin_bswap16(pixels[pixel]);
             }
             raster_total +=
@@ -988,7 +842,7 @@ bool TiltMazeApp::render(DisplayFrame &frame)
         }
     }
 
-    release_snapshot(maze);
+    frames_.release(maze);
     if (result != ESP_OK) {
         ESP_LOGW(kTag, "render transport failed: %s", esp_err_to_name(result));
         return false;
