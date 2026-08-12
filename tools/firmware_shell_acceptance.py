@@ -46,11 +46,16 @@ POWER_OFF_POST_MARKER_RELEASE_SECONDS = 1.1
 FREEZE_DRIFT_CALIBRATION_FRAMES = 3
 PORT_POLL_SECONDS = 0.05
 
-MODE_LAUNCHER = "@DEV MODE launcher"
-MODE_FLUID = "@DEV MODE fluid_box"
+MODE_NAMES = ("launcher", "fluid_box", "tilt_maze", "ragdoll_avalanche")
+MODE_MARKERS = {mode: "@DEV MODE {}".format(mode) for mode in MODE_NAMES}
+MODE_LAUNCHER = MODE_MARKERS["launcher"]
+MODE_FLUID = MODE_MARKERS["fluid_box"]
+MODE_MAZE = MODE_MARKERS["tilt_maze"]
+MODE_AVALANCHE = MODE_MARKERS["ragdoll_avalanche"]
+RUNNING_MODES = MODE_NAMES[1:]
 CORE_CHECKS = ("launcher", "once", "cycles", "freeze", "reboot")
 ALL_CHECKS = CORE_CHECKS + ("soak",)
-CHECK_CHOICES = ALL_CHECKS + ("touch",)
+CHECK_CHOICES = ALL_CHECKS + ("touch", "apps")
 COMMAND_FAILURE_MARKERS = (
     "unrecognized command",
     "unknown command",
@@ -68,7 +73,7 @@ STATUS_VALUE_PATTERNS = {
     "override": re.compile(r"[01]"),
     "accel": re.compile(r"-?\d+\.\d{3},-?\d+\.\d{3},-?\d+\.\d{3}"),
     "capture_ready": re.compile(r"[01]"),
-    "mode": re.compile(r"launcher|fluid_box"),
+    "mode": re.compile("|".join(MODE_NAMES)),
     "battery_hold": re.compile(r"[01]"),
 }
 STATUS_VALUE_DESCRIPTIONS = {
@@ -76,7 +81,7 @@ STATUS_VALUE_DESCRIPTIONS = {
     "override": "0 or 1",
     "accel": "three comma-separated fixed-point values with three decimals",
     "capture_ready": "0 or 1",
-    "mode": "launcher or fluid_box",
+    "mode": ", ".join(MODE_NAMES),
     "battery_hold": "0 or 1",
 }
 
@@ -496,7 +501,7 @@ class FirmwareShellAcceptance:
                 reboot_sequence = sequence
                 launcher_sequence = None
             elif stripped.startswith("@DEV MODE "):
-                if stripped not in (MODE_LAUNCHER, MODE_FLUID):
+                if stripped not in MODE_MARKERS.values():
                     raise UserError(
                         "{} emitted unknown mode marker {!r}".format(label, stripped)
                     )
@@ -538,12 +543,15 @@ class FirmwareShellAcceptance:
             observed_markers = {
                 candidate.strip()
                 for _, candidate in self.dev.lines_since(0)
-                if candidate.strip() in (MODE_LAUNCHER, MODE_FLUID)
+                if candidate.strip() in MODE_MARKERS.values()
             }
-            if MODE_FLUID in observed_markers:
+            unexpected = observed_markers - {MODE_LAUNCHER}
+            if unexpected:
                 raise UserError(
-                    "{} emitted a fluid_box MODE marker while reconnect status "
-                    "reported launcher".format(label)
+                    "{} emitted running MODE marker(s) {} while reconnect status "
+                    "reported launcher".format(
+                        label, ", ".join(sorted(unexpected))
+                    )
                 )
             self.mode = status.mode
             print(
@@ -771,7 +779,7 @@ class FirmwareShellAcceptance:
         label: str,
         timeout: float | None = None,
     ) -> int:
-        if expected not in ("launcher", "fluid_box"):
+        if expected not in MODE_NAMES:
             raise UserError(
                 "{} requested an unsupported mode probe: {}"
                 .format(label, expected)
@@ -803,13 +811,19 @@ class FirmwareShellAcceptance:
 
     def _transition(self, command: str, marker: str):
         sequence, _ = self._send_wait_exact(command, marker)
-        self.mode = "launcher" if marker == MODE_LAUNCHER else "fluid_box"
+        try:
+            self.mode = next(
+                mode for mode, known_marker in MODE_MARKERS.items()
+                if known_marker == marker
+            )
+        except StopIteration as exc:
+            raise UserError("unsupported transition marker: {}".format(marker)) from exc
         return sequence
 
     def _boot_to_launcher(self):
         baseline_uptime_ms = self._aged_reboot_baseline(
             "short BOOT pre-command status",
-            ("launcher", "fluid_box"),
+            MODE_NAMES,
         )
         checkpoint = self.dev.checkpoint()
         self.dev.echo_send("input boot 150")
@@ -861,7 +875,7 @@ class FirmwareShellAcceptance:
     def _ensure_launcher(self):
         if self.mode == "launcher":
             return
-        if self.mode == "fluid_box":
+        if self.mode in RUNNING_MODES:
             self._transition("input pwr 120", MODE_LAUNCHER)
             return
         self._boot_to_launcher()
@@ -1284,6 +1298,58 @@ class FirmwareShellAcceptance:
 
         run_touch_round(1)
         self.fluid_frame = run_touch_round(2)
+
+    def check_apps(self):
+        self._boot_to_launcher()
+        self._probe_mode("launcher", "apps check launcher")
+        self._send_wait_exact("reset", "reset: no running app")
+
+        apps = (
+            (1, "Task Maze", "tilt_maze", MODE_MAZE),
+            (2, "Avalanche", "ragdoll_avalanche", MODE_AVALANCHE),
+        )
+        for selection, label, mode, marker in apps:
+            checkpoint = self.dev.checkpoint()
+            print(
+                "[accept] ACTION: swipe left once to select {}".format(label)
+            )
+            expected_selection = (
+                "swipe left - launcher selection {}: {}"
+                .format(selection, label)
+            )
+            self.dev.wait_line(
+                lambda line, expected=expected_selection: expected in line,
+                checkpoint,
+                self.args.touch_timeout,
+                "a physical left swipe selecting {}".format(label),
+            )
+
+            launch_sequence = self._transition("input plus", marker)
+            self._probe_mode(mode, "{} launch".format(label))
+            baseline = self._wait_epoch(
+                launch_sequence,
+                lambda sample: sample.epoch is not None,
+                "{} epoch after launch".format(label),
+            )
+
+            reset_checkpoint = self.dev.checkpoint()
+            self._send_wait_exact("reset", "@DEV RESET_REQUESTED")
+            reset = self._wait_epoch(
+                reset_checkpoint,
+                lambda sample, initial=baseline.epoch: (
+                    sample.epoch is not None and sample.epoch != initial
+                ),
+                "{} epoch after reset".format(label),
+            )
+            if reset.epoch != baseline.epoch + 1:
+                raise UserError(
+                    "{} reset changed epoch from {} to {}; expected one increment"
+                    .format(label, baseline.epoch, reset.epoch)
+                )
+
+            self._capture("{}-after-reset".format(mode))
+            self._transition("input pwr 120", MODE_LAUNCHER)
+            self._probe_mode("launcher", "{} home".format(label))
 
 
     def check_once(self):
@@ -1849,8 +1915,8 @@ def build_arg_parser():
         choices=CHECK_CHOICES + ("all",),
         metavar="CHECK",
         help=(
-            "subset: launcher once cycles freeze reboot soak touch all "
-            "(touch is interactive and excluded from all)"
+            "subset: launcher once cycles freeze reboot soak touch apps all "
+            "(touch and apps are interactive and excluded from all)"
         ),
     )
     parser.add_argument("--port", default=None, metavar="DEV")

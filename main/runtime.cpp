@@ -1,65 +1,3 @@
-// runtime.cpp — persistent app dispatch and generation-barrier coordinator.
-//
-// Ownership moved out of app_main: this file owns the compile-time app
-// registry, the shell
-// service instances, the packed dispatch word, the per-lane acknowledgement
-// bits, the launcher selection, the three pinned lanes (created exactly once)
-// and the coordinator loop that runs on the ESP main task. app_main is
-// startup wiring only: it calls runtime_run(), which boots (board -> display
-// -> console -> setup_once for every registered app; the launcher stable
-// mode boots WITHOUT calling any app's enter()), spawns the lanes, then
-// never returns.
-//
-// Packed dispatch word (one std::atomic<uint32_t>, one acquire load per lane
-// iteration): low 4 bits = registry index (kNoAppIndex while no app runs),
-// bits 4-5 = the published AppMode (Transition while quiescing; Launcher or
-// Running once committed), high 26 bits = the monotonic quiesce/run
-// generation. A lane can never observe a torn (app, mode, generation) triple.
-//
-// Transition protocol (Launch/Home, both directions, committed mode change
-// emitted as "@DEV MODE <registry-id>|launcher"):
-//   1. Quiesce: clear the per-lane ack mask, set mode=Transition, bump the
-//      generation and publish the packed (kNoAppIndex, Transition, gen) word
-//      (one release store).
-//   2. Wait for all three lane ack bits within 500 ms; on timeout the system
-//      fails CLOSED with esp_restart(). Each lane acks exactly once per
-//      transition, after its last old-generation app callback has returned;
-//      Transition mode parks every lane, so no display work happens mid-
-//      transition and no app callback runs after a lane acks.
-//   3. Mandatory DisplayService::drain() before any leave — retire the
-//      carried final stripe so the incoming app starts on a drained panel;
-//      a failure also fails closed (esp_restart, never reused).
-//   4. leave() the outgoing app (no allocation).
-//   5. mode=Entering, enter() the incoming app (no allocation; drains stale
-//      snapshots, opens the first-frame gate, leaves a pending reset alone),
-//      then the committed stable mode (Running or Launcher). enter() failure
-//      fails closed.
-//   6. Publish the run generation with the committed mode; each lane rebases
-//      its vTaskDelayUntil anchor (last_wake = xTaskGetTickCount()) on a new
-//      Running generation before resuming callbacks, so resume never
-//      bursts/catches up and the cadence is 30/30/100 Hz on the immediate
-//      next iteration. A Launcher generation parks physics and makes the
-//      render lane draw the launcher.
-//   7. Emit "@DEV MODE <id|launcher>" (additive host protocol line) and
-//      publish the stable-mode name for status telemetry.
-//
-// While the launcher is committed, the sensor lane keeps polling the shell
-// InputService so BOOT-reboot/PWR-off/PLUS stay live: PLUS and a non-swipe
-// release inside the selected entry request Launch, a swipe moves the
-// selection once at release (left -> next, right -> previous, wrapping the
-// registry), and short PWR is a no-op (while an app runs it still routes
-// Home through the request queue); motion/on_motion stop; the render lane
-// draws the selected entry's launcher frame at the 30 Hz render cadence
-// through the same bound DisplayFrame transport, and vanishes entirely
-// during a Transition (only the coordinator's mandatory drain touches the
-// display then). No task is recreated and no hardware is re-initialized
-// after boot; enter/leave allocate nothing.
-//
-// Constants here (cores, priorities, stacks, 100/30/30 cadences, dump gate,
-// telemetry line, motion acceptance ack, capture sequencing, reset trampoline
-// and legacy console commands) are preserved verbatim from the pre-split
-// app_main/dev_console behavior.
-
 #include "runtime.hpp"
 
 #include <atomic>
@@ -93,11 +31,6 @@ namespace fluid_demo {
 namespace {
 
 constexpr char kTag[] = "fluid_demo";
-
-// ---------------------------------------------------------------------------
-// Compile-time registry — Fluid Box remains first as the boot-selected
-// default; additional bundled apps follow it in launcher order.
-// ---------------------------------------------------------------------------
 
 constexpr RegistryEntry kRegistry[] = {
     {"fluid_box", "Fluid Box", &s_fluid_app},
@@ -139,10 +72,6 @@ AppMode word_mode(uint32_t word)
 
 static_assert(static_cast<uint32_t>(AppMode::Transition) < (1u << 2),
               "AppMode must fit the packed 2-bit mode field");
-
-// ---------------------------------------------------------------------------
-// Coordinator state (main-task-owned; the lanes only load s_active_selection).
-// ---------------------------------------------------------------------------
 
 /// Packed dispatch word: app index (low 4) + AppMode (bits 4-5) +
 /// quiesce/run generation (high 26). One acquire load per lane iteration =>
@@ -213,10 +142,6 @@ esp_err_t enqueue_request(const RuntimeRequest &request)
     return xQueueSend(queue, &request, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
-// ---------------------------------------------------------------------------
-// Shell service instances + transport binding (moved out of app_main).
-// ---------------------------------------------------------------------------
-
 BoardHandles s_board;
 DisplayService s_display;
 InputService s_input;
@@ -262,11 +187,19 @@ void bind_display_frame()
     s_display_frame.ops.capture_copy_us = frame_capture_copy_us;
 }
 
-// Reset trampoline consumed by the console; the app owns the atomic. Bound
-// exactly once at console start and never rebound (non-lifecycle callback).
-void app_reset_trampoline()
+esp_err_t app_reset_trampoline()
 {
-    s_fluid_app.request_fluid_reset();
+    const uint32_t selection =
+        s_active_selection.load(std::memory_order_acquire);
+    if (word_mode(selection) != AppMode::Running) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    App *app = app_at_index(selection & kAppIndexMask);
+    if (app == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    static_cast<void>(app->handle_event(AppEvent::PlusPress));
+    return ESP_OK;
 }
 
 // Power-off marker trampoline consumed by InputService: the console's
@@ -289,16 +222,7 @@ void emit_reboot_marker()
 // measured around the app's render(), printed by the telemetry line.
 uint32_t s_last_frame_dma_us = 0;
 
-// ---------------------------------------------------------------------------
-// Live system telemetry — cached persistent handles + <=1 Hz render-lane
-// sampling. No new task and no allocation: each sample performs the exact
-// ESP-IDF heap inventory required for largest-allocatable-block metrics, then
-// reaches the running app through App::on_system_telemetry().
-// ---------------------------------------------------------------------------
-
-/// Persistent task handles, cached exactly once at boot. Each slot is written
-/// by its owner (or resolved by name right after console startup) before the
-/// first 1 Hz sample; a null slot marks that task invalid/unresolved.
+// Persistent task handles sampled by the render lane.
 std::atomic<TaskHandle_t> s_coordinator_task{nullptr};  ///< ESP main task (runtime_run).
 std::atomic<TaskHandle_t> s_sensor_task{nullptr};       ///< sensor lane.
 std::atomic<TaskHandle_t> s_update_task{nullptr};       ///< physics/update lane.
@@ -365,10 +289,6 @@ void sample_system_telemetry(App *app, uint32_t generation)
     app->on_system_telemetry(telemetry);
 }
 
-// ---------------------------------------------------------------------------
-// Utilities.
-// ---------------------------------------------------------------------------
-
 void log_startup_info()
 {
     esp_chip_info_t chip{};
@@ -404,10 +324,6 @@ void log_startup_info()
     ESP_LOGE(kTag, "TRANSITION BARRIER: %s - fail-closed esp_restart()", what);
     esp_restart();
 }
-
-// ---------------------------------------------------------------------------
-// Lane parameters — exactly the pre-split task topology.
-// ---------------------------------------------------------------------------
 
 constexpr uint32_t kSensorHz = 100;
 constexpr uint32_t kPhysicsHz = 30;
@@ -454,20 +370,7 @@ uint32_t dispatch_step(uint32_t *seen_gen, TickType_t *last_wake, uint32_t ack_b
     return word;
 }
 
-// ---------------------------------------------------------------------------
-// Sensor/control task — core0, prio 7, 100 Hz. A thin poll/router: the IMU
-// poll, dt clamp and override live in MotionService; its dt anchor advances
-// only through the app's acceptance acknowledgement. InputService owns the
-// dev-console synthetic gesture FIFO plus physical button and IRQ-latched
-// touch polling in every mode. Motion ticks and app callbacks stop when the
-// committed mode is Launcher or a transition is parked. PLUS routes to the
-// app while Running or to Launch from the launcher. At the launcher one
-// contact is tracked Begin -> End: a swipe changes the selection exactly
-// once, after release, and a non-swipe release inside the selected entry
-// requests Launch; short PWR routes Home while Running and is a no-op at the
-// launcher. Running apps receive exactly one Begin per contact.
-// ---------------------------------------------------------------------------
-
+// Sensor/control lane: motion, buttons, touch, and launcher routing.
 void sensor_task(void *arg)
 {
     static_cast<void>(arg);
@@ -656,11 +559,7 @@ void sensor_task(void *arg)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Physics task — core1, prio 8, ~30 Hz. Owns the fixed simulation clock and
-// publishes the newest frame. Parks (no app callbacks) while no app runs.
-// ---------------------------------------------------------------------------
-
+// Fixed-step update lane.
 void physics_task(void *arg)
 {
     static_cast<void>(arg);
@@ -697,12 +596,6 @@ void physics_task(void *arg)
         vTaskDelay(1);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Render task — core0, prio 5, ~30 Hz. The app internally holds a snapshot
-// only through render. Parks on a 10 ms vTaskDelay while idle so IDLE0 keeps
-// feeding the task watchdog, exactly like the dump gate.
-// ---------------------------------------------------------------------------
 
 void log_telemetry(App *app, size_t app_index)
 {
@@ -829,10 +722,6 @@ void render_task(void *arg)
         vTaskDelay(1);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Coordinator — runs on the ESP main task.
-// ---------------------------------------------------------------------------
 
 void emit_mode_line(const char *name)
 {

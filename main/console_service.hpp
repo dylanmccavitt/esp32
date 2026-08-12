@@ -11,36 +11,17 @@ class DisplayService;
 class InputService;
 class MotionService;
 
-/// USB Serial/JTAG development REPL owning all firmware debug commands.
-/// Replaces dev_console.* with the identical command surface, @DEV/@FB
-/// framing, s_dumping stdout dump gate, prompt and REPL parameters.
-///
-/// Bindings are fixed once for the process lifetime at start(): the shell's
-/// DisplayService (capture), the shell's MotionService (motion/release/
-/// status), the shell's InputService (`input` synthetic gestures) and a
-/// ResetTrampoline — a one-time bound, non-lifecycle callback into the Fluid
-/// app's reset atomic — never rebound.
+/// USB Serial/JTAG development console and framebuffer protocol endpoint.
 class ConsoleService {
 public:
-    /// One-time bound, non-lifecycle callback into the active app's reset.
-    using ResetTrampoline = void (*)();
+    using ResetTrampoline = esp_err_t (*)();
 
-    /// Start the REPL (priority 2, core 0, 6144-byte stack, USB Serial/JTAG).
-    /// ESP_ERR_INVALID_STATE if already started, ESP_ERR_INVALID_ARG on a null
-    /// binding, ESP_ERR_NOT_SUPPORTED without USB Serial/JTAG console.
     esp_err_t start(DisplayService *display, MotionService *motion,
                     InputService *input, ResetTrampoline reset_callback);
 
-    /// True while an exclusive console transfer owns stdout; render telemetry
-    /// must stay quiet so bounded protocol lines cannot be dropped.
     bool dump_active() const { return dumping_.load(std::memory_order_acquire); }
 
-    /// Emit and flush the @DEV POWEROFF wire marker. Invoked by InputService
-    /// through its bound trampoline immediately before board_power_off().
     void emit_poweroff();
-
-    /// Emit and flush the @DEV REBOOTING wire marker. Invoked by both the
-    /// legacy reboot command and InputService immediately before esp_restart().
     void emit_rebooting();
 
 private:
@@ -55,21 +36,16 @@ private:
     static int command_release(int argc, char **argv);
     static int command_reset(int argc, char **argv);
     static int command_reboot(int argc, char **argv);
-    /// Enqueue a synthetic `input <plus|pwr|boot> [hold_ms]` gesture into
-    /// InputService's bounded FIFO; the sensor lane replays it through the
-    /// physical debounce/classification pipeline. Enqueue only — no lifecycle
-    /// work happens on the REPL task.
     static int command_input(int argc, char **argv);
 
-    /// The single running instance (esp_console commands are plain function
-    /// pointers without user context).
+    // esp_console callbacks do not carry user context.
     static ConsoleService *s_active;
 
     DisplayService *display_ = nullptr;
     MotionService *motion_ = nullptr;
     InputService *input_ = nullptr;
     ResetTrampoline reset_callback_ = nullptr;
-    void *repl_ = nullptr;  // esp_console_repl_t*, owned by the console component
+    void *repl_ = nullptr;
     std::atomic<bool> dumping_{false};
     uint32_t capture_sequence_ = 0;
 };
