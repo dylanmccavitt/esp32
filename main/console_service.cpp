@@ -50,6 +50,21 @@ bool parse_float(const char *text, float *value)
     return true;
 }
 
+bool parse_sign(const char *text, int *value)
+{
+    if (text == nullptr || value == nullptr) {
+        return false;
+    }
+    errno = 0;
+    char *end = nullptr;
+    const long parsed = std::strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || (parsed != 1 && parsed != -1)) {
+        return false;
+    }
+    *value = static_cast<int>(parsed);
+    return true;
+}
+
 bool parse_duration_ms(const char *text, uint32_t *duration_ms)
 {
     if (text == nullptr || duration_ms == nullptr || text[0] == '-') {
@@ -152,7 +167,13 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
                                 "<plus|pwr|boot|swipe-left|swipe-right> [hold_ms]",
                                 command_input)) != ESP_OK ||
         (err = register_command("yaw", "Apply a one-shot body yaw to the attitude filter",
-                                "<radians>", command_yaw)) != ESP_OK) {
+                                "<radians>", command_yaw)) != ESP_OK ||
+        (err = register_command("axes", "Set IMU axis signs for Cube/Level (each ±1)",
+                                "<sx> <sy> <sz>", command_axes)) != ESP_OK ||
+        (err = register_command("gain", "Scale Level rotation (Cube stays one-to-one)",
+                                "<scale>", command_gain)) != ESP_OK ||
+        (err = register_command("tau", "Set Cube/Level complementary-filter time constant",
+                                "<seconds>", command_tau)) != ESP_OK) {
         return err;
     }
 
@@ -176,7 +197,7 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
     if (err != ESP_OK) {
         return err;
     }
-    ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot/input/yaw");
+    ESP_LOGI(kTag, "USB dev console ready: ping/status/fb/motion/release/reset/reboot/input/yaw/axes/gain/tau");
     return ESP_OK;
 #else
     return ESP_ERR_NOT_SUPPORTED;
@@ -241,11 +262,15 @@ int ConsoleService::command_status(int argc, char **argv)
     AppStats stats{};
     static_cast<void>(runtime_active_stats(&stats));
     const uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
+    int sx = 0;
+    int sy = 0;
+    int sz = 0;
+    AttitudeFilter::axes(&sx, &sy, &sz);
     std::printf("@DEV STATUS uptime_ms=%" PRIu64
                 " override=%u accel=%.3f,%.3f,%.3f capture_ready=%u"
                 " battery_hold=%u mode=%s"
                 " raw=%.3f,%.3f,%.3f apparent=%.3f,%.3f,%.3f"
-                " euler=%.3f,%.3f,%.3f\r\n",
+                " euler=%.3f,%.3f,%.3f axes=%d,%d,%d gain=%.3f tau=%.3f\r\n",
                 uptime_ms, snapshot.active ? 1u : 0u,
                 static_cast<double>(snapshot.acceleration.x),
                 static_cast<double>(snapshot.acceleration.y),
@@ -261,7 +286,10 @@ int ConsoleService::command_status(int argc, char **argv)
                 static_cast<double>(stats.apparent[2]),
                 static_cast<double>(stats.pitch),
                 static_cast<double>(stats.roll),
-                static_cast<double>(stats.yaw));
+                static_cast<double>(stats.yaw),
+                sx, sy, sz,
+                static_cast<double>(AttitudeFilter::gain()),
+                static_cast<double>(AttitudeFilter::tau()));
     s_active->end_protocol_output();
     return 0;
 }
@@ -392,6 +420,57 @@ int ConsoleService::command_yaw(int argc, char **argv)
     }
     AttitudeFilter::request_yaw(radians);
     std::printf("@DEV YAW %.3f\r\n", static_cast<double>(radians));
+    return 0;
+}
+
+int ConsoleService::command_axes(int argc, char **argv)
+{
+    if (argc != 4) {
+        std::printf("usage: axes <sx> <sy> <sz>\r\n");
+        return 1;
+    }
+    int sx = 0;
+    int sy = 0;
+    int sz = 0;
+    if (!parse_sign(argv[1], &sx) || !parse_sign(argv[2], &sy) ||
+        !parse_sign(argv[3], &sz)) {
+        std::printf("axes: each sign must be -1 or 1\r\n");
+        return 1;
+    }
+    AttitudeFilter::set_axes(sx, sy, sz);
+    std::printf("@DEV AXES %d %d %d\r\n", sx, sy, sz);
+    return 0;
+}
+
+int ConsoleService::command_gain(int argc, char **argv)
+{
+    if (argc != 2) {
+        std::printf("usage: gain <scale>\r\n");
+        return 1;
+    }
+    float gain = 0.0f;
+    if (!parse_float(argv[1], &gain) || gain < 0.0f || gain > 4.0f) {
+        std::printf("gain: finite scale must be within [0,4]\r\n");
+        return 1;
+    }
+    AttitudeFilter::set_gain(gain);
+    std::printf("@DEV GAIN %.3f\r\n", static_cast<double>(AttitudeFilter::gain()));
+    return 0;
+}
+
+int ConsoleService::command_tau(int argc, char **argv)
+{
+    if (argc != 2) {
+        std::printf("usage: tau <seconds>\r\n");
+        return 1;
+    }
+    float seconds = 0.0f;
+    if (!parse_float(argv[1], &seconds) || seconds < 0.05f || seconds > 2.0f) {
+        std::printf("tau: finite seconds must be within [0.05,2]\r\n");
+        return 1;
+    }
+    AttitudeFilter::set_tau(seconds);
+    std::printf("@DEV TAU %.3f\r\n", static_cast<double>(AttitudeFilter::tau()));
     return 0;
 }
 

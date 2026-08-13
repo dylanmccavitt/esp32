@@ -19,7 +19,6 @@ constexpr int kPanelWidth = 240;
 constexpr int kPanelHeight = 240;
 
 constexpr uint16_t kBackground = rgb24(0x101418);
-constexpr uint16_t kWell = rgb24(0x212431);
 constexpr uint16_t kBand = rgb24(0x294542);
 constexpr uint16_t kMuted = rgb24(0x7B8A7B);
 constexpr uint16_t kAccent = rgb24(0xF7A252);
@@ -47,8 +46,6 @@ constexpr float kHalf = 1.00f;
 constexpr float kCam = 5.5f;
 constexpr float kFocal = 400.0f;
 constexpr float kCenter = 120.0f;
-constexpr int kDiscRadius = 118;
-constexpr int kDiscRadiusSq = kDiscRadius * kDiscRadius;
 constexpr float kLightX = 0.42f;
 constexpr float kLightY = 0.74f;
 constexpr float kLightZ = 0.53f;
@@ -339,11 +336,8 @@ void OrientCubeApp::raster_stripe(const float projected[8][3], const float cam[8
 {
     for (int local_y = 0; local_y < rows; ++local_y) {
         uint16_t *row = pixels + local_y * width;
-        const int y = y0 + local_y;
-        const int dy = y - static_cast<int>(kCenter);
         for (int x = 0; x < width; ++x) {
-            const int dx = x - static_cast<int>(kCenter);
-            row[x] = (dx * dx + dy * dy <= kDiscRadiusSq) ? kWell : kBackground;
+            row[x] = kBackground;
         }
     }
 
@@ -392,17 +386,6 @@ void OrientCubeApp::raster_stripe(const float projected[8][3], const float cam[8
         draw_edges(xy, pixels, width, y0, rows);
     }
 
-    for (int local_y = 0; local_y < rows; ++local_y) {
-        uint16_t *row = pixels + local_y * width;
-        const int y = y0 + local_y;
-        const int dy = y - static_cast<int>(kCenter);
-        for (int x = 0; x < width; ++x) {
-            const int dx = x - static_cast<int>(kCenter);
-            if (dx * dx + dy * dy > kDiscRadiusSq) {
-                row[x] = kBackground;
-            }
-        }
-    }
 }
 
 bool OrientCubeApp::render(DisplayFrame &frame)

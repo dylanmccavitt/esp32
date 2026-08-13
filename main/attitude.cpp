@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 
 namespace fluid_demo {
 namespace {
@@ -15,14 +16,26 @@ constexpr float kComplementaryTau = 0.35f;
 constexpr float kOverrideTau = 0.04f;
 constexpr float kGyroBiasStill = 0.12f;
 constexpr float kGyroBiasTau = 1.5f;
+constexpr float kGainMin = 0.0f;
+constexpr float kGainMax = 4.0f;
+constexpr float kTauMin = 0.05f;
+constexpr float kTauMax = 2.0f;
 
 std::atomic<float> s_yaw_request{0.0f};
+std::atomic<int> s_sx{1};
+std::atomic<int> s_sy{-1};
+std::atomic<int> s_sz{-1};
+std::atomic<float> s_gain{1.0f};
+std::atomic<float> s_tau{kComplementaryTau};
+std::atomic<uint32_t> s_axes_gen{1};
 
 }  // namespace
 
 Vec3 AttitudeFilter::map_box(const Vec3 &v)
 {
-    return {v.x, -v.y, -v.z};
+    return {static_cast<float>(s_sx.load(std::memory_order_relaxed)) * v.x,
+            static_cast<float>(s_sy.load(std::memory_order_relaxed)) * v.y,
+            static_cast<float>(s_sz.load(std::memory_order_relaxed)) * v.z};
 }
 
 bool AttitudeFilter::finite_vec(const Vec3 &v)
@@ -117,23 +130,60 @@ Vec3 AttitudeFilter::rotate(const Quat &q, const Vec3 &v)
 
 AttitudeFilter::Quat AttitudeFilter::quat_between(const Vec3 &from, const Vec3 &to)
 {
-    const float d = vec_dot(from, to);
+    const float d = clampf(vec_dot(from, to), -1.0f, 1.0f);
     const Vec3 c = vec_cross(from, to);
-    if (d < -0.999999f) {
-        Vec3 axis = vec_cross(from, {1.0f, 0.0f, 0.0f});
-        if (vec_length(axis) < 1e-3f) {
-            axis = vec_cross(from, {0.0f, 1.0f, 0.0f});
-        }
-        if (!vec_normalize(axis)) {
-            return {};
-        }
-        return {0.0f, axis.x, axis.y, axis.z};
-    }
     Quat q{d + 1.0f, c.x, c.y, c.z};
-    if (!quat_normalize(q)) {
+    if (quat_normalize(q)) {
+        return q;
+    }
+
+    Vec3 axis = vec_cross(from, {1.0f, 0.0f, 0.0f});
+    if (vec_length(axis) < 1e-3f) {
+        axis = vec_cross(from, {0.0f, 1.0f, 0.0f});
+    }
+    if (!vec_normalize(axis)) {
         return {};
     }
-    return q;
+    return {0.0f, axis.x, axis.y, axis.z};
+}
+
+AttitudeFilter::Quat AttitudeFilter::scale_rotation(const Quat &q, float gain)
+{
+    const float w = clampf(q.w, -1.0f, 1.0f);
+    const float half = std::acos(w);
+    const float mag = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+    if (mag < kEps || half < 1e-6f) {
+        return {};
+    }
+    const float new_half = gain * half;
+    const float s = std::sin(new_half) / mag;
+    Quat out{std::cos(new_half), q.x * s, q.y * s, q.z * s};
+    if (!quat_normalize(out)) {
+        return {};
+    }
+    return out;
+}
+
+void AttitudeFilter::quat_to_matrix(const Quat &q, float out[9])
+{
+    const float xx = q.x * q.x;
+    const float yy = q.y * q.y;
+    const float zz = q.z * q.z;
+    const float xy = q.x * q.y;
+    const float xz = q.x * q.z;
+    const float yz = q.y * q.z;
+    const float wx = q.w * q.x;
+    const float wy = q.w * q.y;
+    const float wz = q.w * q.z;
+    out[0] = 1.0f - 2.0f * (yy + zz);
+    out[1] = 2.0f * (xy - wz);
+    out[2] = 2.0f * (xz + wy);
+    out[3] = 2.0f * (xy + wz);
+    out[4] = 1.0f - 2.0f * (xx + zz);
+    out[5] = 2.0f * (yz - wx);
+    out[6] = 2.0f * (xz - wy);
+    out[7] = 2.0f * (yz + wx);
+    out[8] = 1.0f - 2.0f * (xx + yy);
 }
 
 bool AttitudeFilter::valid_gravity(const Vec3 &v) const
@@ -213,6 +263,56 @@ void AttitudeFilter::request_yaw(float radians)
     s_yaw_request.store(radians, std::memory_order_release);
 }
 
+void AttitudeFilter::set_axes(int sx, int sy, int sz)
+{
+    if ((sx != 1 && sx != -1) || (sy != 1 && sy != -1) || (sz != 1 && sz != -1)) {
+        return;
+    }
+    s_sx.store(sx, std::memory_order_relaxed);
+    s_sy.store(sy, std::memory_order_relaxed);
+    s_sz.store(sz, std::memory_order_relaxed);
+    s_axes_gen.fetch_add(1, std::memory_order_release);
+}
+
+void AttitudeFilter::set_gain(float gain)
+{
+    if (!std::isfinite(gain)) {
+        return;
+    }
+    s_gain.store(clampf(gain, kGainMin, kGainMax), std::memory_order_relaxed);
+}
+
+void AttitudeFilter::set_tau(float seconds)
+{
+    if (!std::isfinite(seconds)) {
+        return;
+    }
+    s_tau.store(clampf(seconds, kTauMin, kTauMax), std::memory_order_relaxed);
+}
+
+void AttitudeFilter::axes(int *sx, int *sy, int *sz)
+{
+    if (sx != nullptr) {
+        *sx = s_sx.load(std::memory_order_relaxed);
+    }
+    if (sy != nullptr) {
+        *sy = s_sy.load(std::memory_order_relaxed);
+    }
+    if (sz != nullptr) {
+        *sz = s_sz.load(std::memory_order_relaxed);
+    }
+}
+
+float AttitudeFilter::gain()
+{
+    return s_gain.load(std::memory_order_relaxed);
+}
+
+float AttitudeFilter::tau()
+{
+    return s_tau.load(std::memory_order_relaxed);
+}
+
 void AttitudeFilter::apply_yaw(float radians)
 {
     const float half = 0.5f * radians;
@@ -237,6 +337,15 @@ void AttitudeFilter::consume_yaw_request()
     apply_yaw(yaw);
 }
 
+void AttitudeFilter::maybe_axes_realign()
+{
+    const uint32_t gen = s_axes_gen.load(std::memory_order_acquire);
+    if (gen != axes_gen_) {
+        axes_gen_ = gen;
+        align_pending_.store(true, std::memory_order_release);
+    }
+}
+
 void AttitudeFilter::recompute()
 {
     Quat q_disp = quat_mul(quat_conj(q_ref_), q_);
@@ -245,24 +354,21 @@ void AttitudeFilter::recompute()
         return;
     }
 
-    const float xx = q_disp.x * q_disp.x;
-    const float yy = q_disp.y * q_disp.y;
-    const float zz = q_disp.z * q_disp.z;
-    const float xy = q_disp.x * q_disp.y;
-    const float xz = q_disp.x * q_disp.z;
-    const float yz = q_disp.y * q_disp.z;
-    const float wx = q_disp.w * q_disp.x;
-    const float wy = q_disp.w * q_disp.y;
-    const float wz = q_disp.w * q_disp.z;
-    R_[0] = 1.0f - 2.0f * (yy + zz);
-    R_[1] = 2.0f * (xy - wz);
-    R_[2] = 2.0f * (xz + wy);
-    R_[3] = 2.0f * (xy + wz);
-    R_[4] = 1.0f - 2.0f * (xx + zz);
-    R_[5] = 2.0f * (yz - wx);
-    R_[6] = 2.0f * (xz - wy);
-    R_[7] = 2.0f * (yz + wx);
-    R_[8] = 1.0f - 2.0f * (xx + yy);
+    // Gravity-aligned attitude must remain a one-to-one physical pose. Scaling
+    // a full orientation aliases ordinary 90-degree turns (gain 4 => 360
+    // degrees), so gain is intentionally limited to relative displays.
+    if (reference_mode_ == ReferenceMode::Relative) {
+        const float gain = s_gain.load(std::memory_order_relaxed);
+        if (std::fabs(gain - 1.0f) > 1e-6f) {
+            q_disp = scale_rotation(q_disp, gain);
+            if (!quat_normalize(q_disp)) {
+                hard_reset();
+                return;
+            }
+        }
+    }
+
+    quat_to_matrix(q_disp, R_);
 
     // Board +Y is screen-up (USB at -Y). Relative identity => up = (0,1,0).
     up_ = rotate(q_disp, {0.0f, 1.0f, 0.0f});
@@ -289,9 +395,24 @@ void AttitudeFilter::recompute()
 
 void AttitudeFilter::init_world(const Vec3 &g_meas)
 {
-    q_ = {};
     q_ref_ = {};
-    g_world_ = g_meas;
+    if (reference_mode_ == ReferenceMode::Relative) {
+        q_ = {};
+        g_world_ = g_meas;
+    } else {
+        Vec3 measured = g_meas;
+        Vec3 gravity{0.0f, -1.0f, 0.0f};
+        if (!vec_normalize(measured) || !vec_normalize(gravity)) {
+            hard_reset();
+            return;
+        }
+        q_ = quat_between(measured, gravity);
+        if (!quat_normalize(q_)) {
+            hard_reset();
+            return;
+        }
+        g_world_ = {0.0f, -kOneG, 0.0f};
+    }
     have_ref_ = true;
     gyro_abs_ = 0.0f;
     recompute();
@@ -299,11 +420,9 @@ void AttitudeFilter::init_world(const Vec3 &g_meas)
 
 void AttitudeFilter::pull_toward_gravity(const Vec3 &g_meas, float alpha)
 {
-    // Tilt-only: rotate world so estimated gravity matches the gravity stored
-    // at the last zero. quat_between is the shortest arc, so it has no
-    // component around gravity and yaw stays gyro-only. After align/init,
-    // g_world is the current sample and q is identity, so a still hold does
-    // not crawl off the bullseye.
+    // Tilt-only: rotate world so estimated gravity matches the active
+    // reference. The shortest-arc correction has no component around gravity,
+    // so yaw stays gyro-only.
     Vec3 meas = g_meas;
     Vec3 g_world = g_world_;
     if (!vec_normalize(meas) || !vec_normalize(g_world)) {
@@ -336,6 +455,7 @@ void AttitudeFilter::pull_toward_gravity(const Vec3 &g_meas, float alpha)
 bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float dt)
 {
     accepted_last_ = false;
+    maybe_axes_realign();
     if (!valid_gravity(accel_mps2) || !finite_vec(gyro_rads) || !std::isfinite(dt) ||
         dt <= 0.0f) {
         return false;
@@ -392,7 +512,8 @@ bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float
     const float mag = vec_length(mapped);
     const float g_err = std::fabs(mag - kOneG) / kOneG;
     const float trust = 1.0f / (1.0f + 8.0f * g_err * g_err);
-    const float alpha = (1.0f - std::exp(-clamped_dt / kComplementaryTau)) * trust;
+    const float tau = s_tau.load(std::memory_order_relaxed);
+    const float alpha = (1.0f - std::exp(-clamped_dt / tau)) * trust;
     pull_toward_gravity(mapped, clampf(alpha, 0.0f, 1.0f));
     consume_yaw_request();
     recompute();
@@ -406,6 +527,7 @@ bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float
 bool AttitudeFilter::apply_override(const Vec3 &apparent_accel)
 {
     accepted_last_ = false;
+    maybe_axes_realign();
     if (!valid_gravity(apparent_accel)) {
         return false;
     }

@@ -8,25 +8,34 @@
 namespace fluid_demo {
 
 /// Board-frame attitude from gyro integration plus accelerometer tilt.
-/// USB-at-bottom axis map matches MotionFilter. `matrix()` is the display
-/// pose `q_ref^{-1} * q_body` (body-to-world relative to the last zero).
-/// Plus/reset re-inits that world from the current sample so relative R is
-/// identity and stays there while held still. Accel corrects tilt of
-/// `q_body` only; yaw around gravity is gyro-only. Gyro bias is captured at
-/// zero so a still hold does not crawl. `request_yaw` is a one-shot body yaw
-/// for host captures.
+/// Relative mode treats the current pose as identity at reset and supports
+/// display gain. GravityAligned mode keeps a one-to-one physical pose:
+/// roll/pitch stay tied to gravity and yaw is gyro-relative. USB-at-bottom
+/// axis mapping matches MotionFilter.
 class AttitudeFilter {
 public:
+    enum class ReferenceMode : uint8_t {
+        Relative,
+        GravityAligned,
+    };
+
     static constexpr float kOneG = 9.807f;
 
-    AttitudeFilter() = default;
+    explicit AttitudeFilter(ReferenceMode reference_mode = ReferenceMode::Relative)
+        : reference_mode_(reference_mode) {}
 
     void reset();
     void request_align();
     static void request_yaw(float radians);
+    static void set_axes(int sx, int sy, int sz);
+    static void set_gain(float gain);  ///< Relative-mode display gain only.
+    static void set_tau(float seconds);
+    static void axes(int *sx, int *sy, int *sz);
+    static float gain();
+    static float tau();
 
-    /// Physical IMU sample. `gyro_rads` is ignored when `freeze_gyro`.
-    /// Override gravity is supplied via `apply_override` instead.
+    /// Integrate one physical IMU sample. Override gravity is supplied through
+    /// `apply_override` instead.
     bool update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float dt);
 
     /// Treat `apparent_accel` as gravity in box frame and freeze gyro.
@@ -66,14 +75,19 @@ private:
     static bool quat_normalize(Quat &q);
     static Vec3 rotate(const Quat &q, const Vec3 &v);
     static Quat quat_between(const Vec3 &from, const Vec3 &to);
+    static Quat scale_rotation(const Quat &q, float gain);
+    static void quat_to_matrix(const Quat &q, float out[9]);
 
     bool valid_gravity(const Vec3 &v) const;
     void init_world(const Vec3 &g_meas);
     void pull_toward_gravity(const Vec3 &g_meas, float alpha);
     void apply_yaw(float radians);
     void consume_yaw_request();
+    void maybe_axes_realign();
     void recompute();
     void hard_reset();
+
+    const ReferenceMode reference_mode_;
 
     Quat q_{};
     Quat q_ref_{};
@@ -90,6 +104,7 @@ private:
     bool have_ref_ = false;
     bool accepted_last_ = false;
     uint32_t nonfinite_resets_ = 0;
+    uint32_t axes_gen_ = 1;
     std::atomic<bool> align_pending_{true};
 };
 

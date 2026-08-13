@@ -50,7 +50,7 @@ private:
                               const int order[6], const bool visible[6],
                               uint16_t *pixels, int width, int y0, int rows);
 
-    AttitudeFilter filter_;
+    AttitudeFilter filter_{AttitudeFilter::ReferenceMode::GravityAligned};
     portMUX_TYPE motion_mux_ = portMUX_INITIALIZER_UNLOCKED;
     SharedMotion motion_{};
     std::atomic<bool> reset_requested_{false};
