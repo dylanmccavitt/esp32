@@ -10,8 +10,11 @@ namespace fluid_demo {
 /// Board-frame attitude from gyro integration plus accelerometer tilt.
 /// USB-at-bottom axis map matches MotionFilter. `matrix()` is the display
 /// pose `q_ref^{-1} * q_body` (body-to-world relative to the last zero).
-/// Accel corrects tilt of `q_body` only; yaw around gravity is gyro-only
-/// and drifts. `request_yaw` is a one-shot body yaw for host captures.
+/// Plus/reset re-inits that world from the current sample so relative R is
+/// identity and stays there while held still. Accel corrects tilt of
+/// `q_body` only; yaw around gravity is gyro-only. Gyro bias is captured at
+/// zero so a still hold does not crawl. `request_yaw` is a one-shot body yaw
+/// for host captures.
 class AttitudeFilter {
 public:
     static constexpr float kOneG = 9.807f;
@@ -79,6 +82,7 @@ private:
     Vec3 up_{0.0f, 1.0f, 0.0f};
     Vec3 mapped_{};
     Vec3 raw_accel_{};
+    Vec3 gyro_bias_{};
     float pitch_ = 0.0f;
     float roll_ = 0.0f;
     float yaw_ = 0.0f;

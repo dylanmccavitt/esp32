@@ -13,6 +13,8 @@ constexpr float kMaxAccelMag = 5.0f * AttitudeFilter::kOneG;
 constexpr float kEps = 1e-6f;
 constexpr float kComplementaryTau = 0.35f;
 constexpr float kOverrideTau = 0.04f;
+constexpr float kGyroBiasStill = 0.12f;
+constexpr float kGyroBiasTau = 1.5f;
 
 std::atomic<float> s_yaw_request{0.0f};
 
@@ -164,6 +166,7 @@ void AttitudeFilter::hard_reset()
     roll_ = 0.0f;
     yaw_ = 0.0f;
     gyro_abs_ = 0.0f;
+    gyro_bias_ = {};
     have_ref_ = false;
     accepted_last_ = false;
     ++nonfinite_resets_;
@@ -191,6 +194,7 @@ void AttitudeFilter::reset()
     roll_ = 0.0f;
     yaw_ = 0.0f;
     gyro_abs_ = 0.0f;
+    gyro_bias_ = {};
     have_ref_ = false;
     accepted_last_ = false;
     align_pending_.store(true, std::memory_order_release);
@@ -295,10 +299,11 @@ void AttitudeFilter::init_world(const Vec3 &g_meas)
 
 void AttitudeFilter::pull_toward_gravity(const Vec3 &g_meas, float alpha)
 {
-    // Tilt-only: rotate world so estimated gravity matches the stored world
-    // gravity. The shortest quat_between has no component around gravity, so
-    // yaw is left to the gyro. Display pose is q_ref^{-1} * q, so this cannot
-    // pin the cube at identity after zero.
+    // Tilt-only: rotate world so estimated gravity matches the gravity stored
+    // at the last zero. quat_between is the shortest arc, so it has no
+    // component around gravity and yaw stays gyro-only. After align/init,
+    // g_world is the current sample and q is identity, so a still hold does
+    // not crawl off the bullseye.
     Vec3 meas = g_meas;
     Vec3 g_world = g_world_;
     if (!vec_normalize(meas) || !vec_normalize(g_world)) {
@@ -349,17 +354,31 @@ bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float
     accepted_last_ = true;
 
     const bool align = align_pending_.exchange(false, std::memory_order_acq_rel);
-    if (!have_ref_) {
+    if (!have_ref_ || align) {
+        // Re-zero: current pose is identity and current gravity is world.
+        // Skip gyro/tilt on this sample so rest cannot jump off the snapshot.
         init_world(mapped);
+        gyro_bias_ = gyro;
         consume_yaw_request();
         return true;
     }
-    if (align) {
-        q_ref_ = q_;
+
+    Vec3 gyro_corr{gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
+                   gyro.z - gyro_bias_.z};
+    float corr_abs = vec_length(gyro_corr);
+    if (corr_abs < kGyroBiasStill) {
+        const float blend = 1.0f - std::exp(-clamped_dt / kGyroBiasTau);
+        gyro_bias_.x += blend * (gyro.x - gyro_bias_.x);
+        gyro_bias_.y += blend * (gyro.y - gyro_bias_.y);
+        gyro_bias_.z += blend * (gyro.z - gyro_bias_.z);
+        gyro_corr = {gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
+                     gyro.z - gyro_bias_.z};
+        corr_abs = vec_length(gyro_corr);
     }
+    gyro_abs_ = corr_abs;
 
     const float half = 0.5f * clamped_dt;
-    Quat dq{1.0f, gyro.x * half, gyro.y * half, gyro.z * half};
+    Quat dq{1.0f, gyro_corr.x * half, gyro_corr.y * half, gyro_corr.z * half};
     if (!quat_normalize(dq)) {
         hard_reset();
         return false;
@@ -396,13 +415,11 @@ bool AttitudeFilter::apply_override(const Vec3 &apparent_accel)
     accepted_last_ = true;
 
     const bool align = align_pending_.exchange(false, std::memory_order_acq_rel);
-    if (!have_ref_) {
+    if (!have_ref_ || align) {
         init_world(apparent_accel);
+        gyro_bias_ = {};
         consume_yaw_request();
         return true;
-    }
-    if (align) {
-        q_ref_ = q_;
     }
 
     const float alpha = 1.0f - std::exp(-0.01f / kOverrideTau);
