@@ -13,6 +13,8 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#include "launcher_icons.hpp"
+
 namespace fluid_demo {
 
 namespace {
@@ -47,36 +49,12 @@ constexpr uint8_t kDigitBitmap[10][5] = {
     {0b111, 0b101, 0b111, 0b001, 0b111},  // 9
 };
 
-// Launcher visual — snowflake (flake) over falling drop (meteor).
-constexpr uint8_t kLauncherFlakeBitmap[8] = {
-    0b00011000,
-    0b00100100,
-    0b01000010,
-    0b11111111,
-    0b11111111,
-    0b01000010,
-    0b00100100,
-    0b00011000,
-};
-constexpr uint8_t kLauncherDropBitmap[8] = {
-    0b00000000,
-    0b00000000,
-    0b00011000,
-    0b00111100,
-    0b01111110,
-    0b01111110,
-    0b00111100,
-    0b00011000,
-};
 constexpr LauncherVisual kLauncherVisual{
-    kBackground,     // background
-    kBody,           // band color
-    0x6B4D,          // affordance (muted steel)
-    kScoreColor,     // accent
-    kHead,           // primary glyph
-    kBody,           // secondary glyph
-    kLauncherDropBitmap,
-    kLauncherFlakeBitmap,
+    kBackground,
+    kBody,
+    0x6B4D,
+    kScoreColor,
+    kIconAvalanche,
 };
 
 inline int min_int(int a, int b) { return a < b ? a : b; }

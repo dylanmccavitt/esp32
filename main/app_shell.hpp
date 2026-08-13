@@ -147,16 +147,13 @@ struct DisplayFrame {
     } ops;
 };
 
-/// Palette and fixed 8x8 glyphs for one launcher entry.
+/// Palette and 64x64 RGB565 icon for one launcher entry.
 struct LauncherVisual {
     uint16_t background_rgb565 = 0;  ///< Full-frame fill outside the band.
     uint16_t band_rgb565 = 0;        ///< Sole selected-entry band color.
     uint16_t affordance_rgb565 = 0;  ///< Left chevron and unselected dot color.
     uint16_t accent_rgb565 = 0;      ///< Right PLUS and selected dot color.
-    uint16_t primary_rgb565 = 0;     ///< Primary glyph bitmap color.
-    uint16_t secondary_rgb565 = 0;   ///< Secondary glyph bitmap (overlay) color.
-    const uint8_t *primary_bitmap = nullptr;    ///< Fixed 8-byte 8x8 glyph bitmap.
-    const uint8_t *secondary_bitmap = nullptr;  ///< Fixed 8-byte 8x8 overlay bitmap.
+    const uint16_t *icon_rgb565 = nullptr;  ///< kLauncherIconPixels logical RGB565.
 };
 
 /// App lifecycle and lane callbacks.
@@ -194,7 +191,7 @@ public:
     /// Launcher entry visual descriptor (app-owned static-lifetime data).
     /// nullptr (the default) renders the exact built-in Fluid Box launcher;
     /// a non-null descriptor supplies the generic launcher's palette and
-    /// fixed glyph bitmaps for this entry.
+    /// 64x64 RGB565 icon for this entry.
     virtual const LauncherVisual *launcher_visual() const { return nullptr; }
 
     /// Advance simulation + publish one frame (update lane, fixed dt).

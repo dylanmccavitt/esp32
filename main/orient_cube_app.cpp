@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 
 #include "draw.hpp"
+#include "launcher_icons.hpp"
 
 namespace fluid_demo {
 
@@ -17,52 +18,29 @@ constexpr const char *kTag = "orient_cube";
 constexpr int kPanelWidth = 240;
 constexpr int kPanelHeight = 240;
 
-constexpr uint16_t kBackground = 0x10A3;
-constexpr uint16_t kWell = 0x2126;
-constexpr uint16_t kBand = 0x2A28;
-constexpr uint16_t kMuted = 0x7C4F;
-constexpr uint16_t kAccent = 0xF50A;
-constexpr uint16_t kFront = 0x2A96;
-constexpr uint16_t kFrontInset = 0x12B0;
-constexpr uint16_t kFrontGlass = 0x45D9;
-constexpr uint16_t kBack = 0x3A49;
-constexpr uint16_t kBackMark = 0x632C;
-constexpr uint16_t kRight = 0x4C8E;
-constexpr uint16_t kLeft = 0x5AAB;
-constexpr uint16_t kTop = 0xC638;
-constexpr uint16_t kUsb = 0xC4A0;
-constexpr uint16_t kUsbMark = 0xFEE0;
-constexpr uint16_t kEdge = 0x0000;
+constexpr uint16_t kBackground = rgb24(0x101418);
+constexpr uint16_t kWell = rgb24(0x212431);
+constexpr uint16_t kBand = rgb24(0x294542);
+constexpr uint16_t kMuted = rgb24(0x7B8A7B);
+constexpr uint16_t kAccent = rgb24(0xF7A252);
+constexpr uint16_t kFront = rgb24(0x2951B5);
+constexpr uint16_t kFrontInset = rgb24(0x105584);
+constexpr uint16_t kFrontGlass = rgb24(0x42BACE);
+constexpr uint16_t kBack = rgb24(0x39494A);
+constexpr uint16_t kBackMark = rgb24(0x636563);
+constexpr uint16_t kRight = rgb24(0x4A9273);
+constexpr uint16_t kLeft = rgb24(0x5A555A);
+constexpr uint16_t kTop = rgb24(0xC6C7C6);
+constexpr uint16_t kUsb = rgb24(0xC69600);
+constexpr uint16_t kUsbMark = rgb24(0xFFDF00);
+constexpr uint16_t kEdge = rgb24(0x000000);
 
-constexpr uint8_t kLauncherCubeBitmap[8] = {
-    0b00011100,
-    0b00110110,
-    0b01100011,
-    0b01100011,
-    0b00110110,
-    0b00011100,
-    0b00001000,
-    0b00000000,
-};
-constexpr uint8_t kLauncherCubeTopBitmap[8] = {
-    0b00011100,
-    0b00100010,
-    0b01000001,
-    0b01000001,
-    0b00100010,
-    0b00011100,
-    0b00000000,
-    0b00000000,
-};
 constexpr LauncherVisual kLauncherVisual{
     kBackground,
     kBand,
     kMuted,
     kAccent,
-    kFront,
-    kUsbMark,
-    kLauncherCubeBitmap,
-    kLauncherCubeTopBitmap,
+    kIconCube,
 };
 
 constexpr float kHalf = 1.00f;

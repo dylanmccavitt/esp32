@@ -12,6 +12,7 @@ idf_component_register(
          "attitude_app.cpp"
          "input_service.cpp"
          "launcher.cpp"
+         "launcher_icons.cpp"
          "motion_service.cpp"
          "runtime.cpp"
          "motion.cpp"

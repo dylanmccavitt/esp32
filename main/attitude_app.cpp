@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 
 #include "draw.hpp"
+#include "launcher_icons.hpp"
 
 namespace fluid_demo {
 
@@ -44,35 +45,12 @@ constexpr float kBubbleGain = 70.0f / (15.0f * kDeg);
 constexpr int kBubbleRadius = 22;
 constexpr int kBubbleTravel = 78;
 
-constexpr uint8_t kLauncherVialBitmap[8] = {
-    0b00111100,
-    0b01111110,
-    0b11111111,
-    0b11111111,
-    0b11111111,
-    0b11111111,
-    0b01111110,
-    0b00111100,
-};
-constexpr uint8_t kLauncherBubbleBitmap[8] = {
-    0b00000000,
-    0b00000000,
-    0b00011000,
-    0b00111100,
-    0b00111100,
-    0b00011000,
-    0b00000000,
-    0b00000000,
-};
 constexpr LauncherVisual kLauncherVisual{
     kBezel,
     kBand,
     kMuted,
     kAccent,
-    kFluid,
-    kSnapBubble,
-    kLauncherVialBitmap,
-    kLauncherBubbleBitmap,
+    kIconAttitude,
 };
 
 inline int min_int(int a, int b) { return a < b ? a : b; }

@@ -7,6 +7,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "launcher_icons.hpp"
+
 namespace fluid_demo {
 
 namespace {
@@ -81,35 +83,12 @@ constexpr float kRestAcceleration = 0.025f;
 constexpr uint8_t kProgressPipCount = 6;
 constexpr uint8_t kRoundPipCount = 4;
 
-constexpr uint8_t kLauncherGoalBitmap[8] = {
-    0b00000110,
-    0b00001001,
-    0b00001001,
-    0b00000110,
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b00000000,
-};
-constexpr uint8_t kLauncherBallBitmap[8] = {
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b00000000,
-    0b01110000,
-    0b11111000,
-    0b01110000,
-};
 constexpr LauncherVisual kLauncherVisual{
     kBackground,
     kWall,
     kMuted,
     kGoal,
-    kGoal,
-    kBall,
-    kLauncherGoalBitmap,
-    kLauncherBallBitmap,
+    kIconMaze,
 };
 
 inline int min_int(int a, int b) { return a < b ? a : b; }

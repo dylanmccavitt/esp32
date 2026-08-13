@@ -23,4 +23,17 @@ void fill_triangle(uint16_t *pixels, int width, int y0, int rows, float x0, floa
 
 uint16_t shade_rgb565(uint16_t color, float light);
 
+constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return static_cast<uint16_t>((static_cast<uint16_t>(r & 0xF8) << 8) |
+                                 (static_cast<uint16_t>(g & 0xFC) << 3) |
+                                 (static_cast<uint16_t>(b) >> 3));
+}
+
+constexpr uint16_t rgb24(uint32_t hex)
+{
+    return rgb565(static_cast<uint8_t>(hex >> 16), static_cast<uint8_t>(hex >> 8),
+                  static_cast<uint8_t>(hex));
+}
+
 }  // namespace fluid_demo

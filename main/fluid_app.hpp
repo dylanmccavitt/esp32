@@ -30,6 +30,8 @@ public:
 
     ShellAction handle_event(AppEvent) override;
 
+    const LauncherVisual *launcher_visual() const override;
+
     esp_err_t update(float dt = kPhysicsDt) override;
 
     bool render(DisplayFrame &frame) override;
