@@ -12,9 +12,8 @@ constexpr char kTag[] = "launcher";
 // visible (left swipe = next entry, right swipe = previous). The "<" sits
 // just inside the band's left edge, the ">" sits between the glyph box and
 // the PLUS, and the dots occupy one row below the band. Chevrons, dots and
-// the right plus stay secondary to the centered selected-entry glyph (built-
-// in Fluid Box vessel or the selected descriptor's bitmaps) and use only
-// fixed, allocation-free geometry.
+// the right plus stay secondary to the centered selected-entry icon and use
+// only fixed, allocation-free geometry.
 constexpr int kChevronCenterY = 120;  // band vertical center
 constexpr int kChevronArm = 12;       // chevron half-width
 constexpr int kChevronStroke = 2;
@@ -139,8 +138,7 @@ constexpr bool plus_pixel(int x, int y)
 /// `selected_index` and `registry_count` drive the page-dot highlight.
 /// A null `visual` keeps the exact built-in Fluid Box launcher colors,
 /// glyph and capture probes byte-for-byte; a non-null descriptor supplies its
-/// palette and fixed glyph bitmaps with the secondary bitmap drawn with
-/// priority over the primary.
+/// palette and 64x64 icon.
 constexpr uint16_t logical_color_at(const LauncherVisual *visual, int x, int y,
                                     uint32_t selected_index,
                                     uint32_t registry_count)
@@ -164,13 +162,17 @@ constexpr uint16_t logical_color_at(const LauncherVisual *visual, int x, int y,
             color = visual != nullptr ? visual->accent_rgb565 : kLauncherAccentRgb565;
         }
     }
-    if (visual != nullptr) {
-        if (glyph_cell_set(visual->secondary_bitmap, x, y)) {
-            color = visual->secondary_rgb565;
-        } else if (glyph_cell_set(visual->primary_bitmap, x, y)) {
-            color = visual->primary_rgb565;
+    if (visual != nullptr && visual->icon_rgb565 != nullptr) {
+        if (x >= kLauncherGlyphLeft && x < kLauncherGlyphLeft + kLauncherIconSize &&
+            y >= kLauncherGlyphTop && y < kLauncherGlyphTop + kLauncherIconSize) {
+            const uint16_t pixel =
+                visual->icon_rgb565[(y - kLauncherGlyphTop) * kLauncherIconSize +
+                                    (x - kLauncherGlyphLeft)];
+            if (pixel != kLauncherIconTransparent) {
+                color = pixel;
+            }
         }
-    } else if (glyph_pixel(x, y)) {
+    } else if (visual == nullptr && glyph_pixel(x, y)) {
         color = kLauncherGlyphRgb565;
     }
     return color;

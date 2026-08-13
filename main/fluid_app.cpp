@@ -9,6 +9,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "launcher.hpp"
+#include "launcher_icons.hpp"
+
 namespace fluid_demo {
 
 namespace {
@@ -116,6 +119,14 @@ inline int16_t sat16(int32_t v)
 }
 
 inline int abs_int(int v) { return v < 0 ? -v : v; }
+
+constexpr LauncherVisual kLauncherVisual{
+    kLauncherBackgroundRgb565,
+    kLauncherBandRgb565,
+    kLauncherAffordanceRgb565,
+    kLauncherAccentRgb565,
+    kIconFluid,
+};
 
 }  // namespace
 
@@ -233,6 +244,11 @@ ShellAction FluidBoxApp::handle_event(AppEvent event)
         request_fluid_reset();
     }
     return ShellAction::None;
+}
+
+const LauncherVisual *FluidBoxApp::launcher_visual() const
+{
+    return &kLauncherVisual;
 }
 
 void FluidBoxApp::request_fluid_reset()

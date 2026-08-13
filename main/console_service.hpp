@@ -37,6 +37,10 @@ private:
     static int command_reset(int argc, char **argv);
     static int command_reboot(int argc, char **argv);
     static int command_input(int argc, char **argv);
+    static int command_yaw(int argc, char **argv);
+    static int command_axes(int argc, char **argv);
+    static int command_gain(int argc, char **argv);
+    static int command_tau(int argc, char **argv);
 
     // esp_console callbacks do not carry user context.
     static ConsoleService *s_active;

@@ -26,8 +26,61 @@ esp_err_t InputService::enqueue_gesture(const ButtonId button, const uint32_t ho
     return full ? ESP_ERR_NO_MEM : ESP_OK;
 }
 
+esp_err_t InputService::enqueue_swipe(const TouchGesture gesture)
+{
+    if (gesture != TouchGesture::SwipeLeft && gesture != TouchGesture::SwipeRight) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&fifo_mux_);
+    const bool busy = swipe_pending_;
+    if (!busy) {
+        swipe_pending_ = true;
+        swipe_began_ = false;
+        swipe_gesture_ = gesture;
+        swipe_y0_ = 120;
+        swipe_y1_ = 120;
+        if (gesture == TouchGesture::SwipeLeft) {
+            swipe_x0_ = 200;
+            swipe_x1_ = 40;
+        } else {
+            swipe_x0_ = 40;
+            swipe_x1_ = 200;
+        }
+    }
+    portEXIT_CRITICAL(&fifo_mux_);
+    return busy ? ESP_ERR_NO_MEM : ESP_OK;
+}
+
 bool InputService::poll_touch(TouchEvent *out)
 {
+    bool emit_swipe = false;
+    TouchEvent swipe_event{};
+    portENTER_CRITICAL(&fifo_mux_);
+    if (swipe_pending_ && !touch_contact_active_ && !touch_contact_cancelled_) {
+        emit_swipe = true;
+        if (!swipe_began_) {
+            swipe_event.x = swipe_x0_;
+            swipe_event.y = swipe_y0_;
+            swipe_event.phase = TouchPhase::Begin;
+            swipe_event.gesture = TouchGesture::None;
+            swipe_began_ = true;
+        } else {
+            swipe_event.x = swipe_x1_;
+            swipe_event.y = swipe_y1_;
+            swipe_event.phase = TouchPhase::End;
+            swipe_event.gesture = swipe_gesture_;
+            swipe_pending_ = false;
+            swipe_began_ = false;
+        }
+    }
+    portEXIT_CRITICAL(&fifo_mux_);
+    if (emit_swipe) {
+        if (out != nullptr) {
+            *out = swipe_event;
+        }
+        return true;
+    }
+
     TouchSample sample{};
     last_touch_error_ = fluid_demo::board_read_touch(&sample);
     if (last_touch_error_ != ESP_OK) {

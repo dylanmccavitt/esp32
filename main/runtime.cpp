@@ -16,6 +16,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "attitude_app.hpp"
 #include "board.hpp"
 #include "console_service.hpp"
 #include "display_service.hpp"
@@ -23,6 +24,7 @@
 #include "input_service.hpp"
 #include "launcher.hpp"
 #include "motion_service.hpp"
+#include "orient_cube_app.hpp"
 #include "ragdoll_avalanche_app.hpp"
 #include "tilt_maze_app.hpp"
 
@@ -36,6 +38,8 @@ constexpr RegistryEntry kRegistry[] = {
     {"fluid_box", "Fluid Box", &s_fluid_app},
     {"tilt_maze", "Task Maze", &s_tilt_maze_app},
     {"ragdoll_avalanche", "Avalanche", &s_ragdoll_avalanche_app},
+    {"orient_cube", "Cube", &s_orient_cube_app},
+    {"attitude", "Level", &s_attitude_app},
 };
 constexpr size_t kRegistryCount = sizeof(kRegistry) / sizeof(kRegistry[0]);
 
@@ -79,6 +83,22 @@ static_assert(static_cast<uint32_t>(AppMode::Transition) < (1u << 2),
 /// mode (runtime_run() republishes the same value before the lanes start).
 std::atomic<uint32_t> s_active_selection{
     pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0)};
+// Render-lane-owned AppStats snapshot for cross-task console status. App
+// implementations keep their telemetry ownership model; only the render lane
+// calls stats(), then publishes a bounded copy under this mux.
+portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+AppStats s_stats_snapshot{};
+uint32_t s_stats_selection =
+    pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0);
+
+void publish_active_stats(uint32_t selection, const AppStats &stats)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats_snapshot = stats;
+    s_stats_selection = selection;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
 
 /// Coordinator-side committed stable-mode name mirrored for any-task status
 /// telemetry; updated once per committed transition and at boot.
@@ -704,6 +724,7 @@ void render_task(void *arg)
         const uint32_t dma_wait_begin = s_display.dma_wait_us();
         if (app->render(s_display_frame)) {
             s_last_frame_dma_us = s_display.dma_wait_us() - dma_wait_begin;
+            publish_active_stats(word, app->stats());
         }
 
         // Once-a-second telemetry (only while an app runs; the line itself is
@@ -844,6 +865,33 @@ const RegistryEntry *registry()
 const char *runtime_mode_name()
 {
     return s_mode_name.load(std::memory_order_acquire);
+}
+
+bool runtime_active_stats(AppStats *out)
+{
+    if (out == nullptr) {
+        return false;
+    }
+    const uint32_t before =
+        s_active_selection.load(std::memory_order_acquire);
+    AppStats snapshot{};
+    bool valid = false;
+    if (word_mode(before) == AppMode::Running) {
+        portENTER_CRITICAL(&s_stats_mux);
+        if (s_stats_selection == before) {
+            snapshot = s_stats_snapshot;
+            valid = true;
+        }
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
+    const uint32_t after =
+        s_active_selection.load(std::memory_order_acquire);
+    if (!valid || after != before) {
+        *out = {};
+        return false;
+    }
+    *out = snapshot;
+    return true;
 }
 
 [[noreturn]] void runtime_run()

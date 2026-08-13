@@ -431,7 +431,7 @@ class Device:
         if not self.reader.is_alive():
             raise DeviceGone("serial reader is not running; the device is "
                              "unplugged or the port failed")
-        payload = (command.rstrip("\r\n") + self.cmd_eol).encode("utf-8")
+        payload = ("\x15" + command.rstrip("\r\n") + self.cmd_eol).encode("utf-8")
         try:
             self.ser.write(payload)
         except (serial.SerialException,   # type: ignore[union-attr]
@@ -616,7 +616,8 @@ def build_arg_parser():
             "  down=(0,-6,0)  front=(0,0,-6) back=(0,0,6)\n\n"
             "firmware commands (pass-through):\n"
             "  ping, status, motion <ax> <ay> <az> [duration_ms],\n"
-            "  release, reset, reboot (use 'screenshot' for framebuffers)\n\n"
+            "  release, reset, reboot, yaw <rad>, axes <sx> <sy> <sz>,\n"
+            "  gain <0..4> (Level only), tau <0.05..2> (use 'screenshot' for framebuffers)\n\n"
             "each saved capture is printed as:  [capture] saved: <path>\n"
             "dependencies: Python 3 standard library + pyserial (in `eim run`)."
         ),
@@ -741,7 +742,7 @@ def cmd_session(dev: Device, args):
         "[device_dev] connected to {} @ {} baud; logs stream below.\n"
         "  commands: 'screenshot [path]', 'pose <name> [duration_ms]',\n"
         "  or any other line is sent to the board verbatim (ping, status,\n"
-        "  motion, release, reset, reboot). Ctrl-C exits.\n"
+        "  motion, release, reset, reboot, yaw, axes, gain, tau). Ctrl-C exits.\n"
         .format(dev.port, dev.baudrate))
 
     stdin_events = queue.Queue()

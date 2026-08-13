@@ -81,13 +81,15 @@ static_assert(launcher_swipe_gesture(TouchGesture::None, 10, 10, 60, 60) ==
               TouchGesture::None,  // diagonal: |dx| == |dy|, not dominant
               "non-dominant horizontal travel must stay a tap");
 
-/// Centered 8x8 Fluid Box vessel glyph. Each set bit is an 8x8 pixel cell, so
-/// the exact glyph bounding box is [88, 152) x [88, 152). Bit 7 is the left
-/// cell. Unset cells show the band color.
+/// Centered 64x64 icon box [88, 152) x [88, 152). Null visuals still use the
+/// 8x8 vessel glyph below. Transparent icon pixels show the band.
 inline constexpr int kLauncherGlyphLeft = 88;
 inline constexpr int kLauncherGlyphTop = 88;
 inline constexpr int kLauncherGlyphScale = 8;
 inline constexpr int kLauncherGlyphExtent = 8 * kLauncherGlyphScale;
+inline constexpr int kLauncherIconSize = kLauncherGlyphExtent;
+inline constexpr int kLauncherIconPixels = kLauncherIconSize * kLauncherIconSize;
+inline constexpr uint16_t kLauncherIconTransparent = 0xF81F;
 inline constexpr uint8_t kLauncherGlyphBitmap[8] = {
     0b11111111,
     0b10000001,
@@ -124,15 +126,13 @@ inline constexpr LauncherProbeBox kLauncherGlyphProbe{
 /// transport for the selected app's launcher visual. `selected_index` and
 /// `registry_count` drive the fixed page dots (how many entries exist and
 /// which one is selected); `visual` supplies the selected entry's palette and
-/// fixed 8x8 glyph bitmaps (null renders the exact built-in Fluid Box
-/// launcher: logical colors, glyph, capture probes untouched; a non-null
-/// descriptor renders at the same geometry with the secondary bitmap drawn
-/// with priority over the primary). Fixed left/right swipe chevrons and the
-/// page-dot row make swipeability visible for every selection without text or
-/// allocation, so capture probes and touch geometry stay meaningful. Transport
-/// order is identical for every visual. Returns false (and logs the
-/// transport/configuration error) if the frame cannot be completed. No
-/// allocation or panel-handle access occurs.
+/// 64x64 RGB565 icon (null renders the exact built-in Fluid Box launcher:
+/// logical colors, glyph, capture probes untouched). Fixed left/right swipe
+/// chevrons and the page-dot row make swipeability visible for every selection
+/// without text or allocation, so capture probes and touch geometry stay
+/// meaningful. Transport order is identical for every visual. Returns false
+/// (and logs the transport/configuration error) if the frame cannot be
+/// completed. No allocation or panel-handle access occurs.
 bool render_launcher(DisplayFrame &frame, const LauncherVisual *visual,
                      uint32_t selected_index, uint32_t registry_count);
 
