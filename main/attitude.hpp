@@ -61,7 +61,7 @@ private:
         float z = 0.0f;
     };
 
-    static Vec3 map_box(const Vec3 &v);
+    static Vec3 map_box(const Vec3 &v, uint32_t axes_config);
     static bool finite_vec(const Vec3 &v);
     static bool finite_quat(const Quat &q);
     static float clampf(float v, float lo, float hi);
@@ -83,7 +83,7 @@ private:
     void pull_toward_gravity(const Vec3 &g_meas, float alpha);
     void apply_yaw(float radians);
     void consume_yaw_request();
-    void maybe_axes_realign();
+    void maybe_axes_realign(uint32_t axes_config);
     void recompute();
     void hard_reset();
 
@@ -104,7 +104,7 @@ private:
     bool have_ref_ = false;
     bool accepted_last_ = false;
     uint32_t nonfinite_resets_ = 0;
-    uint32_t axes_gen_ = 1;
+    uint32_t axes_gen_ = 1u << 3;
     std::atomic<bool> align_pending_{true};
 };
 

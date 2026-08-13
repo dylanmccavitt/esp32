@@ -21,21 +21,31 @@ constexpr float kGainMax = 4.0f;
 constexpr float kTauMin = 0.05f;
 constexpr float kTauMax = 2.0f;
 
+constexpr uint32_t kAxisXPositive = 1u << 0;
+constexpr uint32_t kAxisYPositive = 1u << 1;
+constexpr uint32_t kAxisZPositive = 1u << 2;
+constexpr uint32_t kAxisSignMask =
+    kAxisXPositive | kAxisYPositive | kAxisZPositive;
+constexpr uint32_t kAxisGenerationStep = 1u << 3;
+constexpr uint32_t kAxisGenerationMask = ~kAxisSignMask;
+
+constexpr int axis_sign(uint32_t config, uint32_t positive_bit)
+{
+    return (config & positive_bit) != 0u ? 1 : -1;
+}
+
 std::atomic<float> s_yaw_request{0.0f};
-std::atomic<int> s_sx{1};
-std::atomic<int> s_sy{-1};
-std::atomic<int> s_sz{-1};
+std::atomic<uint32_t> s_axes_config{kAxisGenerationStep | kAxisXPositive};
 std::atomic<float> s_gain{1.0f};
 std::atomic<float> s_tau{kComplementaryTau};
-std::atomic<uint32_t> s_axes_gen{1};
 
 }  // namespace
 
-Vec3 AttitudeFilter::map_box(const Vec3 &v)
+Vec3 AttitudeFilter::map_box(const Vec3 &v, uint32_t axes_config)
 {
-    return {static_cast<float>(s_sx.load(std::memory_order_relaxed)) * v.x,
-            static_cast<float>(s_sy.load(std::memory_order_relaxed)) * v.y,
-            static_cast<float>(s_sz.load(std::memory_order_relaxed)) * v.z};
+    return {static_cast<float>(axis_sign(axes_config, kAxisXPositive)) * v.x,
+            static_cast<float>(axis_sign(axes_config, kAxisYPositive)) * v.y,
+            static_cast<float>(axis_sign(axes_config, kAxisZPositive)) * v.z};
 }
 
 bool AttitudeFilter::finite_vec(const Vec3 &v)
@@ -268,10 +278,22 @@ void AttitudeFilter::set_axes(int sx, int sy, int sz)
     if ((sx != 1 && sx != -1) || (sy != 1 && sy != -1) || (sz != 1 && sz != -1)) {
         return;
     }
-    s_sx.store(sx, std::memory_order_relaxed);
-    s_sy.store(sy, std::memory_order_relaxed);
-    s_sz.store(sz, std::memory_order_relaxed);
-    s_axes_gen.fetch_add(1, std::memory_order_release);
+    const uint32_t signs =
+        (sx > 0 ? kAxisXPositive : 0u) |
+        (sy > 0 ? kAxisYPositive : 0u) |
+        (sz > 0 ? kAxisZPositive : 0u);
+    uint32_t current = s_axes_config.load(std::memory_order_relaxed);
+    for (;;) {
+        const uint32_t generation =
+            ((current & kAxisGenerationMask) + kAxisGenerationStep) &
+            kAxisGenerationMask;
+        const uint32_t next = generation | signs;
+        if (s_axes_config.compare_exchange_weak(
+                current, next, std::memory_order_release,
+                std::memory_order_relaxed)) {
+            return;
+        }
+    }
 }
 
 void AttitudeFilter::set_gain(float gain)
@@ -292,14 +314,15 @@ void AttitudeFilter::set_tau(float seconds)
 
 void AttitudeFilter::axes(int *sx, int *sy, int *sz)
 {
+    const uint32_t config = s_axes_config.load(std::memory_order_acquire);
     if (sx != nullptr) {
-        *sx = s_sx.load(std::memory_order_relaxed);
+        *sx = axis_sign(config, kAxisXPositive);
     }
     if (sy != nullptr) {
-        *sy = s_sy.load(std::memory_order_relaxed);
+        *sy = axis_sign(config, kAxisYPositive);
     }
     if (sz != nullptr) {
-        *sz = s_sz.load(std::memory_order_relaxed);
+        *sz = axis_sign(config, kAxisZPositive);
     }
 }
 
@@ -337,11 +360,11 @@ void AttitudeFilter::consume_yaw_request()
     apply_yaw(yaw);
 }
 
-void AttitudeFilter::maybe_axes_realign()
+void AttitudeFilter::maybe_axes_realign(uint32_t axes_config)
 {
-    const uint32_t gen = s_axes_gen.load(std::memory_order_acquire);
-    if (gen != axes_gen_) {
-        axes_gen_ = gen;
+    const uint32_t generation = axes_config & kAxisGenerationMask;
+    if (generation != axes_gen_) {
+        axes_gen_ = generation;
         align_pending_.store(true, std::memory_order_release);
     }
 }
@@ -455,46 +478,46 @@ void AttitudeFilter::pull_toward_gravity(const Vec3 &g_meas, float alpha)
 bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float dt)
 {
     accepted_last_ = false;
-    maybe_axes_realign();
+    const uint32_t axes_config =
+        s_axes_config.load(std::memory_order_acquire);
+    maybe_axes_realign(axes_config);
     if (!valid_gravity(accel_mps2) || !finite_vec(gyro_rads) || !std::isfinite(dt) ||
         dt <= 0.0f) {
         return false;
     }
 
-    const Vec3 mapped = map_box(accel_mps2);
-    const Vec3 gyro = map_box(gyro_rads);
+    const Vec3 mapped = map_box(accel_mps2, axes_config);
+    const Vec3 gyro = map_box(gyro_rads, axes_config);
     if (!valid_gravity(mapped) || !finite_vec(gyro)) {
         return false;
     }
 
     const float clamped_dt = clampf(dt, kDtMin, kDtMax);
-    gyro_abs_ = vec_length(gyro);
+    const float raw_gyro_abs = vec_length(gyro);
+    gyro_abs_ = raw_gyro_abs;
     mapped_ = mapped;
     raw_accel_ = accel_mps2;
     accepted_last_ = true;
 
     const bool align = align_pending_.exchange(false, std::memory_order_acq_rel);
     if (!have_ref_ || align) {
-        // Re-zero: current pose is identity and current gravity is world.
-        // Skip gyro/tilt on this sample so rest cannot jump off the snapshot.
+        // A rotation sample is real motion, not bias. Start without bias and
+        // let the stationary path below converge once the device stops.
         init_world(mapped);
-        gyro_bias_ = gyro;
+        gyro_bias_ = raw_gyro_abs < kGyroBiasStill ? gyro : Vec3{};
         consume_yaw_request();
         return true;
     }
 
-    Vec3 gyro_corr{gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
-                   gyro.z - gyro_bias_.z};
-    float corr_abs = vec_length(gyro_corr);
-    if (corr_abs < kGyroBiasStill) {
+    if (raw_gyro_abs < kGyroBiasStill) {
         const float blend = 1.0f - std::exp(-clamped_dt / kGyroBiasTau);
         gyro_bias_.x += blend * (gyro.x - gyro_bias_.x);
         gyro_bias_.y += blend * (gyro.y - gyro_bias_.y);
         gyro_bias_.z += blend * (gyro.z - gyro_bias_.z);
-        gyro_corr = {gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
-                     gyro.z - gyro_bias_.z};
-        corr_abs = vec_length(gyro_corr);
     }
+    const Vec3 gyro_corr{gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
+                         gyro.z - gyro_bias_.z};
+    const float corr_abs = vec_length(gyro_corr);
     gyro_abs_ = corr_abs;
 
     const float half = 0.5f * clamped_dt;
@@ -527,7 +550,9 @@ bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float
 bool AttitudeFilter::apply_override(const Vec3 &apparent_accel)
 {
     accepted_last_ = false;
-    maybe_axes_realign();
+    const uint32_t axes_config =
+        s_axes_config.load(std::memory_order_acquire);
+    maybe_axes_realign(axes_config);
     if (!valid_gravity(apparent_accel)) {
         return false;
     }

@@ -83,6 +83,22 @@ static_assert(static_cast<uint32_t>(AppMode::Transition) < (1u << 2),
 /// mode (runtime_run() republishes the same value before the lanes start).
 std::atomic<uint32_t> s_active_selection{
     pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0)};
+// Render-lane-owned AppStats snapshot for cross-task console status. App
+// implementations keep their telemetry ownership model; only the render lane
+// calls stats(), then publishes a bounded copy under this mux.
+portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+AppStats s_stats_snapshot{};
+uint32_t s_stats_selection =
+    pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0);
+
+void publish_active_stats(uint32_t selection, const AppStats &stats)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats_snapshot = stats;
+    s_stats_selection = selection;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
 
 /// Coordinator-side committed stable-mode name mirrored for any-task status
 /// telemetry; updated once per committed transition and at boot.
@@ -708,6 +724,7 @@ void render_task(void *arg)
         const uint32_t dma_wait_begin = s_display.dma_wait_us();
         if (app->render(s_display_frame)) {
             s_last_frame_dma_us = s_display.dma_wait_us() - dma_wait_begin;
+            publish_active_stats(word, app->stats());
         }
 
         // Once-a-second telemetry (only while an app runs; the line itself is
@@ -855,17 +872,25 @@ bool runtime_active_stats(AppStats *out)
     if (out == nullptr) {
         return false;
     }
-    const uint32_t word = s_active_selection.load(std::memory_order_acquire);
-    if (word_mode(word) != AppMode::Running) {
+    const uint32_t before =
+        s_active_selection.load(std::memory_order_acquire);
+    AppStats snapshot{};
+    bool valid = false;
+    if (word_mode(before) == AppMode::Running) {
+        portENTER_CRITICAL(&s_stats_mux);
+        if (s_stats_selection == before) {
+            snapshot = s_stats_snapshot;
+            valid = true;
+        }
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
+    const uint32_t after =
+        s_active_selection.load(std::memory_order_acquire);
+    if (!valid || after != before) {
         *out = {};
         return false;
     }
-    App *app = app_at_index(word & kAppIndexMask);
-    if (app == nullptr) {
-        *out = {};
-        return false;
-    }
-    *out = app->stats();
+    *out = snapshot;
     return true;
 }
 
