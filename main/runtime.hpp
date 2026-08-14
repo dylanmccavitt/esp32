@@ -26,7 +26,7 @@ constexpr uint32_t kNoAppIndex = 0x0Fu;
 const char *runtime_mode_name();
 /// Copy the latest render-lane telemetry for the current run generation.
 /// Returns false until that generation has completed a rendered frame.
-bool runtime_active_stats(AppStats *out);
+bool runtime_active_stats(AppStats &stats);
 
 [[noreturn]] void runtime_run();
 
