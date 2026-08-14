@@ -268,7 +268,7 @@ bool FluidBoxApp::on_motion(const MotionTick &tick)
         return false;
     }
 
-    const Vec3 apparent = filter_.update(tick.accel_mps2, tick.gyro_rads, tick.dt);
+    const Vec3 apparent = filter_.update(tick.accel_mps2, tick.dt);
     const bool accepted = filter_.last_sample_accepted();
     if (!accepted) {
         if (tick.override_active) {

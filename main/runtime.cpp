@@ -444,7 +444,7 @@ void sensor_task(void *arg)
 
         if (app_active && app != nullptr) {
             // --- raw motion via MotionService: poll + dt clamp + override ---
-            const MotionTick tick = s_motion.motion_tick();
+            const MotionTick tick = s_motion.poll();
             const esp_err_t motion_err = s_motion.last_read_error();
             if (motion_err != ESP_OK) {
                 const uint32_t now_s = static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
@@ -457,7 +457,7 @@ void sensor_task(void *arg)
             // its IMU time anchor only when the app accepts a fresh physical
             // sample; a rejected sample re-clamps against the previous
             // accepted anchor. An active override still publishes verbatim.
-            s_motion.acknowledge(app->on_motion(tick));
+            s_motion.acknowledge_sample(app->on_motion(tick));
         }
 
 
@@ -910,7 +910,7 @@ bool runtime_active_stats(AppStats *out)
 
     // Board: direct ST7789 display, QMI8658 IMU, PLUS/BOOT inputs.
     ESP_LOGI(kTag, "board_init (ESP32-S3-Touch-LCD-1.54)");
-    esp_err_t err = board_init(&s_board);
+    esp_err_t err = board_init(s_board);
     if (err != ESP_OK) {
         fatal_startup("board init", err);
     }

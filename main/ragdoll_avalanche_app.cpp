@@ -171,7 +171,7 @@ bool RagdollAvalancheApp::on_motion(const MotionTick &tick)
     bool physical_accepted = false;
     Vec3 filtered{};
     if (physical) {
-        filtered = filter_.update(tick.accel_mps2, tick.gyro_rads, tick.dt);
+        filtered = filter_.update(tick.accel_mps2, tick.dt);
         physical_accepted = filter_.last_sample_accepted() && finite_vec(filtered);
     }
 

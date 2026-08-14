@@ -82,7 +82,7 @@ bool InputService::poll_touch(TouchEvent *out)
     }
 
     TouchSample sample{};
-    last_touch_error_ = fluid_demo::board_read_touch(&sample);
+    last_touch_error_ = fluid_demo::board_read_touch(sample);
     if (last_touch_error_ != ESP_OK) {
         // Fail closed when the controller's short report window is lost.
         // The missing report could be any phase. Drop the retained contact
