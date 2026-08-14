@@ -14,68 +14,70 @@ namespace fluid_demo {
 
 namespace {
 
-constexpr const char *kTag = "display_service";
+constexpr char kTag[] = "display_service";
 
-}  // namespace
+}
 
 DisplayService::~DisplayService()
 {
     free_buffers();
 }
 
-esp_err_t DisplayService::init(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t io)
+esp_err_t DisplayService::init(esp_lcd_panel_handle_t panel,
+                               esp_lcd_panel_io_handle_t io)
 {
     if (panel == nullptr || io == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
     if (initialized_) {
-        return ESP_OK;  // idempotent: the callback is registered once per boot
+        return ESP_OK;
     }
 
     const size_t stripe_bytes =
         static_cast<size_t>(kWidth) * kStripeRows * sizeof(uint16_t);
-    const size_t capture_bytes = kCaptureBytes;
-    uint16_t *stripe_a = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, stripe_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-    uint16_t *stripe_b = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, stripe_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-    uint16_t *capture = static_cast<uint16_t *>(
-        heap_caps_aligned_alloc(16, capture_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    SemaphoreHandle_t semaphore = xSemaphoreCreateBinary();
+    uint16_t *first_stripe_buffer =
+        static_cast<uint16_t *>(heap_caps_aligned_alloc(
+            16, stripe_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    uint16_t *second_stripe_buffer =
+        static_cast<uint16_t *>(heap_caps_aligned_alloc(
+            16, stripe_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    uint16_t *capture_buffer = static_cast<uint16_t *>(heap_caps_aligned_alloc(
+        16, kCaptureBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    SemaphoreHandle_t transfer_done_semaphore = xSemaphoreCreateBinary();
 
-    if (stripe_a == nullptr || stripe_b == nullptr || capture == nullptr ||
-        semaphore == nullptr) {
-        heap_caps_free(stripe_a);
-        heap_caps_free(stripe_b);
-        heap_caps_free(capture);
-        if (semaphore != nullptr) {
-            vSemaphoreDelete(semaphore);
+    if (first_stripe_buffer == nullptr || second_stripe_buffer == nullptr ||
+        capture_buffer == nullptr || transfer_done_semaphore == nullptr) {
+        heap_caps_free(first_stripe_buffer);
+        heap_caps_free(second_stripe_buffer);
+        heap_caps_free(capture_buffer);
+        if (transfer_done_semaphore != nullptr) {
+            vSemaphoreDelete(transfer_done_semaphore);
         }
         ESP_LOGE(kTag, "display transport allocation failed");
         return ESP_ERR_NO_MEM;
     }
 
-    stripe_[0] = stripe_a;
-    stripe_[1] = stripe_b;
-    capture_ = capture;
-    sem_ = semaphore;
+    stripe_buffers_[0] = first_stripe_buffer;
+    stripe_buffers_[1] = second_stripe_buffer;
+    capture_buffer_ = capture_buffer;
+    transfer_done_semaphore_ = transfer_done_semaphore;
 
-    esp_lcd_panel_io_callbacks_t callbacks = {};
-    callbacks.on_color_trans_done = &DisplayService::on_color_trans_done;
-    const esp_err_t result =
+    esp_lcd_panel_io_callbacks_t callbacks{};
+    callbacks.on_color_trans_done = &DisplayService::on_color_transfer_done;
+    const esp_err_t callback_result =
         esp_lcd_panel_io_register_event_callbacks(io, &callbacks, this);
-    if (result != ESP_OK) {
+    if (callback_result != ESP_OK) {
         ESP_LOGE(kTag, "register on_color_trans_done failed: %s",
-                 esp_err_to_name(result));
+                 esp_err_to_name(callback_result));
         free_buffers();
-        return result;
+        return callback_result;
     }
 
     panel_ = panel;
-    io_ = io;
     initialized_ = true;
-    ESP_LOGI(kTag, "init: %dx%d, %d stripes x %d rows, %u B PSRAM capture, "
-                   "on_color_trans_done registered",
+    ESP_LOGI(kTag,
+             "init: %dx%d, %d stripes x %d rows, "
+             "%u B PSRAM capture",
              kWidth, kHeight, kStripeCount, kStripeRows,
              static_cast<unsigned>(kCaptureBytes));
     return ESP_OK;
@@ -83,22 +85,24 @@ esp_err_t DisplayService::init(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_ha
 
 void DisplayService::free_buffers()
 {
-    if (sem_ != nullptr) {
-        vSemaphoreDelete(static_cast<SemaphoreHandle_t>(sem_));
-        sem_ = nullptr;
+    if (transfer_done_semaphore_ != nullptr) {
+        vSemaphoreDelete(
+            static_cast<SemaphoreHandle_t>(transfer_done_semaphore_));
+        transfer_done_semaphore_ = nullptr;
     }
-    heap_caps_free(stripe_[0]);
-    heap_caps_free(stripe_[1]);
-    heap_caps_free(capture_);
-    stripe_[0] = stripe_[1] = nullptr;
-    capture_ = nullptr;
+    heap_caps_free(stripe_buffers_[0]);
+    heap_caps_free(stripe_buffers_[1]);
+    heap_caps_free(capture_buffer_);
+    stripe_buffers_[0] = nullptr;
+    stripe_buffers_[1] = nullptr;
+    capture_buffer_ = nullptr;
     transfer_in_flight_ = false;
     initialized_ = false;
 }
 
-uint16_t *DisplayService::stripe_buffer(int s)
+uint16_t *DisplayService::stripe_buffer(int stripe_index)
 {
-    return stripe_[s & 1];
+    return stripe_buffers_[stripe_index & 1];
 }
 
 esp_err_t DisplayService::wait_previous_transfer()
@@ -106,62 +110,69 @@ esp_err_t DisplayService::wait_previous_transfer()
     if (!transfer_in_flight_) {
         return ESP_OK;
     }
-    SemaphoreHandle_t sem = static_cast<SemaphoreHandle_t>(sem_);
-    const int64_t t0 = esp_timer_get_time();
-    const bool ok = xSemaphoreTake(sem, pdMS_TO_TICKS(kDmaWaitTimeoutMs)) == pdTRUE;
-    dma_wait_us_ += static_cast<uint32_t>(esp_timer_get_time() - t0);
-    if (!ok) {
-        missed_transfers_++;
-        return ESP_ERR_TIMEOUT;  // in_flight stays set: a later retry waits again
+
+    const SemaphoreHandle_t transfer_done_semaphore =
+        static_cast<SemaphoreHandle_t>(transfer_done_semaphore_);
+    const int64_t wait_start_us = esp_timer_get_time();
+    const bool transfer_completed =
+        xSemaphoreTake(transfer_done_semaphore,
+                       pdMS_TO_TICKS(kDmaWaitTimeoutMs)) == pdTRUE;
+    dma_wait_us_ += static_cast<uint32_t>(esp_timer_get_time() - wait_start_us);
+    if (!transfer_completed) {
+        ++missed_transfers_;
+        // Keep the transfer pending so a later retry waits.
+        return ESP_ERR_TIMEOUT;
     }
     transfer_in_flight_ = false;
     return ESP_OK;
 }
 
-void DisplayService::disarm_capture()
+void DisplayService::requeue_capture()
 {
-    // A failed frame never emits a partial capture: drop the armed latch and
-    // re-arm the request so the next frame retries in full.
     capture_armed_ = false;
     capture_requested_.store(true, std::memory_order_release);
 }
 
-esp_err_t DisplayService::submit_stripe(int s, int y0, int rows, const uint16_t *pixels)
+esp_err_t DisplayService::submit_stripe(int stripe_index, int stripe_y,
+                                        int stripe_rows, const uint16_t *pixels)
 {
-    // Mirror the wire-order stripe while the previous stripe's DMA still runs,
-    // matching the original capture-mirror -> wait -> draw_bitmap ordering.
+    // Copy while the previous stripe's DMA transfer is running.
     if (capture_armed_) {
         const int64_t copy_start_us = esp_timer_get_time();
-        std::memcpy(capture_ + static_cast<size_t>(y0) * kWidth, pixels,
-                    static_cast<size_t>(kWidth) * rows * sizeof(uint16_t));
+        std::memcpy(
+            capture_buffer_ + static_cast<size_t>(stripe_y) * kWidth, pixels,
+            static_cast<size_t>(kWidth) * stripe_rows * sizeof(uint16_t));
         capture_copy_us_ +=
             static_cast<uint32_t>(esp_timer_get_time() - copy_start_us);
     }
 
-    esp_err_t ret = wait_previous_transfer();
-    if (ret != ESP_OK) {
+    esp_err_t transfer_result = wait_previous_transfer();
+    if (transfer_result != ESP_OK) {
         if (capture_armed_) {
-            disarm_capture();
+            requeue_capture();
         }
-        return ret;
+        return transfer_result;
     }
 
-    ret = esp_lcd_panel_draw_bitmap(panel_, 0, y0, kWidth, y0 + rows, pixels);
-    if (ret != ESP_OK) {
+    transfer_result = esp_lcd_panel_draw_bitmap(panel_, 0, stripe_y, kWidth,
+                                                stripe_y + stripe_rows, pixels);
+    if (transfer_result != ESP_OK) {
         if (capture_armed_) {
-            disarm_capture();
+            requeue_capture();
         }
-        ESP_LOGE(kTag, "draw_bitmap stripe %d failed: %s", s, esp_err_to_name(ret));
-        return ret;
+        ESP_LOGE(kTag, "draw_bitmap stripe %d failed: %s", stripe_index,
+                 esp_err_to_name(transfer_result));
+        return transfer_result;
     }
-    transfer_in_flight_ = true;  // exactly one outstanding rectangle now
+    transfer_in_flight_ = true;
     return ESP_OK;
 }
 
 void DisplayService::latch_capture()
 {
     capture_copy_us_ = 0;
-    capture_armed_ = capture_requested_.exchange(false, std::memory_order_acq_rel);
+    capture_armed_ =
+        capture_requested_.exchange(false, std::memory_order_acq_rel);
 }
 
 esp_err_t DisplayService::finish_frame()
@@ -175,7 +186,7 @@ esp_err_t DisplayService::finish_frame()
 
 esp_err_t DisplayService::request_capture()
 {
-    if (!initialized_ || capture_ == nullptr) {
+    if (!initialized_ || capture_buffer_ == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
     if (capture_requested_.load(std::memory_order_acquire)) {
@@ -184,7 +195,8 @@ esp_err_t DisplayService::request_capture()
     capture_ready_.store(false, std::memory_order_release);
     bool expected = false;
     if (!capture_requested_.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;
@@ -197,7 +209,7 @@ bool DisplayService::capture_ready() const
 
 const uint8_t *DisplayService::capture_data() const
 {
-    return reinterpret_cast<const uint8_t *>(capture_);
+    return reinterpret_cast<const uint8_t *>(capture_buffer_);
 }
 
 esp_err_t DisplayService::drain()
@@ -220,23 +232,23 @@ uint32_t DisplayService::missed_transfers() const
     return missed_transfers_;
 }
 
-bool DisplayService::on_color_trans_done(esp_lcd_panel_io_handle_t io,
-                                         esp_lcd_panel_io_event_data_t *edata,
-                                         void *user_ctx)
+bool DisplayService::on_color_transfer_done(esp_lcd_panel_io_handle_t,
+                                            esp_lcd_panel_io_event_data_t *,
+                                            void *user_context)
 {
-    (void)io;
-    (void)edata;
-    DisplayService *self = static_cast<DisplayService *>(user_ctx);
-    return self->trans_done_isr();
+    auto *display = static_cast<DisplayService *>(user_context);
+    return display->color_transfer_done_isr();
 }
 
-bool DisplayService::trans_done_isr()
+bool DisplayService::color_transfer_done_isr()
 {
-    BaseType_t hpw = pdFALSE;
-    if (sem_ != nullptr) {
-        xSemaphoreGiveFromISR(static_cast<SemaphoreHandle_t>(sem_), &hpw);
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    if (transfer_done_semaphore_ != nullptr) {
+        xSemaphoreGiveFromISR(
+            static_cast<SemaphoreHandle_t>(transfer_done_semaphore_),
+            &higher_priority_task_woken);
     }
-    return hpw == pdTRUE;
+    return higher_priority_task_woken == pdTRUE;
 }
 
-}  // namespace fluid_demo
+}
