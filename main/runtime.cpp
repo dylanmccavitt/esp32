@@ -34,6 +34,18 @@ namespace {
 
 constexpr char kTag[] = "fluid_demo";
 
+struct RegistryEntry {
+    const char *id;
+    const char *label;
+    App *app;
+};
+
+constexpr uint32_t kAppIndexMask = 0x0Fu;
+constexpr uint32_t kAppModeShift = 4;
+constexpr uint32_t kAppModeMask = 0x3u << kAppModeShift;
+constexpr uint32_t kAppGenerationShift = kAppModeShift + 2;
+constexpr uint32_t kNoAppIndex = 0x0Fu;
+
 constexpr RegistryEntry kRegistry[] = {
     {"fluid_box", "Fluid Box", &s_fluid_app},
     {"tilt_maze", "Task Maze", &s_tilt_maze_app},
@@ -41,55 +53,37 @@ constexpr RegistryEntry kRegistry[] = {
     {"orient_cube", "Cube", &s_orient_cube_app},
     {"attitude", "Level", &s_attitude_app},
 };
-constexpr size_t kRegistryCount = sizeof(kRegistry) / sizeof(kRegistry[0]);
+constexpr uint32_t kRegistryCount = sizeof(kRegistry) / sizeof(kRegistry[0]);
 
-// The packed selection stores the index in the low 4 bits; the reserved
-// kNoAppIndex must never collide with a real registry index.
-static_assert(kRegistryCount <= kNoAppIndex,
-              "registry must fit below the reserved kNoAppIndex slot");
+static_assert(kRegistryCount <= kNoAppIndex);
 
-constexpr uint32_t kAppGenMask = ~(kAppIndexMask | kAppModeMask);
+constexpr uint32_t kAppGenerationMask = ~(kAppIndexMask | kAppModeMask);
 
-uint32_t pack_selection(uint32_t index, uint32_t mode, uint32_t generation)
+uint32_t pack_selection(uint32_t index, AppMode mode, uint32_t generation)
 {
-    return ((generation << kAppGenShift) & kAppGenMask) |
-           ((mode << kAppModeShift) & kAppModeMask) |
+    return ((generation << kAppGenerationShift) & kAppGenerationMask) |
+           ((static_cast<uint32_t>(mode) << kAppModeShift) & kAppModeMask) |
            (index & kAppIndexMask);
 }
 
-/// Bounded registry lookup: map the app index carried in a lane's one
-/// dispatched word to its app instance. The word only carries a real registry
-/// index while Running; kNoAppIndex (parked/launcher/transition) and any
-/// out-of-range value resolve to nullptr, never out of bounds.
 App *app_at_index(uint32_t index)
 {
     return index < kRegistryCount ? kRegistry[index].app : nullptr;
 }
 
-/// AppMode published in the packed word. Entering is coordinator-side only
-/// and never appears in the word: between the quiesce and run publishes every
-/// lane parks on the Transition mode.
-AppMode word_mode(uint32_t word)
+AppMode selection_mode(uint32_t selection)
 {
-    return static_cast<AppMode>((word >> kAppModeShift) & 0x3u);
+    return static_cast<AppMode>((selection & kAppModeMask) >> kAppModeShift);
 }
 
-static_assert(static_cast<uint32_t>(AppMode::Transition) < (1u << 2),
-              "AppMode must fit the packed 2-bit mode field");
+static_assert(static_cast<uint32_t>(AppMode::Transition) < (1u << 2));
 
-/// Packed dispatch word: app index (low 4) + AppMode (bits 4-5) +
-/// quiesce/run generation (high 26). One acquire load per lane iteration =>
-/// no torn (app, mode, generation) triple. Boots into the Launcher stable
-/// mode (runtime_run() republishes the same value before the lanes start).
+// Loaded once per lane iteration to keep app, mode, and generation coherent.
 std::atomic<uint32_t> s_active_selection{
-    pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0)};
-// Render-lane-owned AppStats snapshot for cross-task console status. App
-// implementations keep their telemetry ownership model; only the render lane
-// calls stats(), then publishes a bounded copy under this mux.
+    pack_selection(kNoAppIndex, AppMode::Launcher, 0)};
 portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 AppStats s_stats_snapshot{};
-uint32_t s_stats_selection =
-    pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0);
+uint32_t s_stats_selection = pack_selection(kNoAppIndex, AppMode::Launcher, 0);
 
 void publish_active_stats(uint32_t selection, const AppStats &stats)
 {
@@ -99,47 +93,34 @@ void publish_active_stats(uint32_t selection, const AppStats &stats)
     portEXIT_CRITICAL(&s_stats_mux);
 }
 
+std::atomic<const char *> s_active_name{"launcher"};
 
-/// Coordinator-side committed stable-mode name mirrored for any-task status
-/// telemetry; updated once per committed transition and at boot.
-std::atomic<const char *> s_mode_name{"launcher"};
-
-/// Launcher selection shown by the render lane and changed by the sensor lane
-/// once per released swipe. A Launch intent copies this index before it enters
-/// the coordinator queue, so later swipes cannot retarget an already-requested
-/// launch. Defaults to 0 (Fluid Box).
 std::atomic<uint32_t> s_launcher_index{0};
 
-/// Per-lane quiesce acknowledgement bits (never an ambiguous counter): each
-/// lane sets its own bit exactly once per transition, after its last old-
-/// generation app callback returned. The coordinator clears the mask before
-/// every quiesce publish, so a stale bit can never complete a wait early; an
-/// already-parked lane re-acks harmlessly on the next generation.
-constexpr uint32_t kAckSensor = 1u << 0;
-constexpr uint32_t kAckPhysics = 1u << 1;
-constexpr uint32_t kAckRender = 1u << 2;
-constexpr uint32_t kAckAll = kAckSensor | kAckPhysics | kAckRender;
-std::atomic<uint32_t> s_lane_acks{0};
+// Each lane sets its bit after its last old-generation callback.
+constexpr uint32_t kSensorAcknowledgement = 1u << 0;
+constexpr uint32_t kUpdateAcknowledgement = 1u << 1;
+constexpr uint32_t kRenderAcknowledgement = 1u << 2;
+constexpr uint32_t kAllLaneAcknowledgements =
+    kSensorAcknowledgement | kUpdateAcknowledgement | kRenderAcknowledgement;
+std::atomic<uint32_t> s_lane_acknowledgements{0};
 
 AppMode s_mode = AppMode::Running;
-const RegistryEntry *s_active_app = nullptr;  // coordinator-side mirror of the word
+const RegistryEntry *s_active_entry = nullptr;
 uint32_t s_generation = 0;
 
-constexpr uint32_t kBarrierTimeoutMs = 500;  // fail-closed quiesce deadline
+constexpr uint32_t kQuiesceTimeoutMs = 500;
 
 enum class RuntimeRequestKind : uint8_t {
     Launch = 0,
     Home = 1,
 };
 
-/// Queue payload binds a Launch to the page selected when the input was
-/// classified. `app_index` is ignored for Home.
 struct RuntimeRequest {
     RuntimeRequestKind kind;
     uint32_t app_index;
 };
 
-/// Small bounded request queue; consumed exclusively on the ESP main task.
 QueueHandle_t s_request_queue = nullptr;
 
 RuntimeRequest selected_launch_request()
@@ -174,15 +155,16 @@ esp_err_t frame_wait_previous(void *transport)
     return static_cast<DisplayService *>(transport)->wait_previous_transfer();
 }
 
-bool frame_latch_capture(void *transport)
+void frame_latch_capture(void *transport)
 {
     static_cast<DisplayService *>(transport)->latch_capture();
-    return true;
 }
 
-esp_err_t frame_submit(void *transport, int s, int y0, int rows, const uint16_t *pixels)
+esp_err_t frame_submit(void *transport, int stripe_index, int stripe_y,
+                       int stripe_rows, const uint16_t *pixels)
 {
-    return static_cast<DisplayService *>(transport)->submit_stripe(s, y0, rows, pixels);
+    return static_cast<DisplayService *>(transport)->submit_stripe(
+        stripe_index, stripe_y, stripe_rows, pixels);
 }
 
 esp_err_t frame_finish(void *transport)
@@ -211,100 +193,97 @@ esp_err_t app_reset_trampoline()
 {
     const uint32_t selection =
         s_active_selection.load(std::memory_order_acquire);
-    if (word_mode(selection) != AppMode::Running) {
+    if (selection_mode(selection) != AppMode::Running) {
         return ESP_ERR_INVALID_STATE;
     }
     App *app = app_at_index(selection & kAppIndexMask);
     if (app == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
-    static_cast<void>(app->handle_event(AppEvent::PlusPress));
+    app->on_plus_press();
     return ESP_OK;
 }
 
-// Power-off marker trampoline consumed by InputService: the console's
-// @DEV POWEROFF line, emitted and flushed immediately before
-// board_power_off(), from the sensor lane. Bound exactly once at startup.
 void emit_poweroff_marker()
 {
     s_console.emit_poweroff();
 }
 
-// Reboot marker trampoline consumed by InputService: the console's
-// @DEV REBOOTING line, emitted and flushed immediately before esp_restart()
-// from the sensor lane. Bound exactly once at startup.
 void emit_reboot_marker()
 {
     s_console.emit_rebooting();
 }
 
-// Per-frame display DMA wait (render task only): cumulative counter delta
-// measured around the app's render(), printed by the telemetry line.
 uint32_t s_last_frame_dma_us = 0;
 
-// Persistent task handles sampled by the render lane.
-std::atomic<TaskHandle_t> s_coordinator_task{nullptr};  ///< ESP main task (runtime_run).
-std::atomic<TaskHandle_t> s_sensor_task{nullptr};       ///< sensor lane.
-std::atomic<TaskHandle_t> s_update_task{nullptr};       ///< physics/update lane.
-std::atomic<TaskHandle_t> s_render_task{nullptr};       ///< render lane.
-std::atomic<TaskHandle_t> s_console_task{nullptr};      ///< USB dev REPL ("console_repl").
+std::atomic<TaskHandle_t> s_coordinator_task{nullptr};
+std::atomic<TaskHandle_t> s_sensor_task{nullptr};
+std::atomic<TaskHandle_t> s_update_task{nullptr};
+std::atomic<TaskHandle_t> s_render_task{nullptr};
+std::atomic<TaskHandle_t> s_console_task{nullptr};
 
-/// Fill one fixed-roster slot from its cached persistent handle. A null
-/// handle leaves the slot invalid-marked. The uxTaskGetStackHighWaterMark2
-/// result is in words (the kernel divides by sizeof(StackType_t)).
-void fill_task_telemetry(SystemTaskTelemetry &out, SystemTaskKind kind,
-                         std::atomic<TaskHandle_t> &handle)
+void fill_task_telemetry(SystemTaskTelemetry &telemetry, SystemTaskKind kind,
+                         std::atomic<TaskHandle_t> &task_handle)
 {
-    out.kind = kind;
-    const TaskHandle_t task = handle.load(std::memory_order_acquire);
+    telemetry.kind = kind;
+    const TaskHandle_t task = task_handle.load(std::memory_order_acquire);
     if (task == nullptr) {
-        out.state = SystemTaskState::Unknown;
-        out.core_id = -1;
-        out.stack_high_water_words = 0;
-        out.valid = false;
+        telemetry.state = SystemTaskState::Unknown;
+        telemetry.core_id = -1;
+        telemetry.stack_high_water_words = 0;
+        telemetry.available = false;
         return;
     }
-    out.valid = true;
-    // Conservative FreeRTOS state mapping; eDeleted/eInvalid -> Unknown.
+
+    telemetry.available = true;
     switch (eTaskGetState(task)) {
-        case eRunning: out.state = SystemTaskState::Running; break;
-        case eReady: out.state = SystemTaskState::Ready; break;
-        case eBlocked: out.state = SystemTaskState::Blocked; break;
-        case eSuspended: out.state = SystemTaskState::Suspended; break;
-        default: out.state = SystemTaskState::Unknown; break;
+    case eRunning:
+        telemetry.state = SystemTaskState::Running;
+        break;
+    case eReady:
+        telemetry.state = SystemTaskState::Ready;
+        break;
+    case eBlocked:
+        telemetry.state = SystemTaskState::Blocked;
+        break;
+    case eSuspended:
+        telemetry.state = SystemTaskState::Suspended;
+        break;
+    default:
+        telemetry.state = SystemTaskState::Unknown;
+        break;
     }
     const BaseType_t core = xTaskGetCoreID(task);
-    out.core_id = core == tskNO_AFFINITY ? -1 : static_cast<int8_t>(core);
-    out.stack_high_water_words =
+    telemetry.core_id = core == tskNO_AFFINITY ? -1 : static_cast<int8_t>(core);
+    telemetry.stack_high_water_words =
         static_cast<uint32_t>(uxTaskGetStackHighWaterMark2(task));
 }
 
-/// Sample the aggregate INTERNAL|8BIT heap exactly (including the largest
-/// currently allocatable block), read the constant-time SPIRAM|8BIT free
-/// counter, and map the fixed 5-slot task roster into one stack-local
-/// SystemTelemetry. Render lane only, at the 1 Hz telemetry gate, after the
-/// frame callback and outside console dumps.
 void sample_system_telemetry(App *app, uint32_t generation)
 {
     SystemTelemetry telemetry{};
     telemetry.generation = generation;
 
-    multi_heap_info_t info{};
-    heap_caps_get_info(&info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    telemetry.internal_free_bytes = static_cast<uint32_t>(info.total_free_bytes);
+    multi_heap_info_t heap_info{};
+    heap_caps_get_info(&heap_info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    telemetry.internal_free_bytes =
+        static_cast<uint32_t>(heap_info.total_free_bytes);
     telemetry.internal_largest_free_block =
-        static_cast<uint32_t>(info.largest_free_block);
+        static_cast<uint32_t>(heap_info.largest_free_block);
 
     telemetry.psram_free_bytes = static_cast<uint32_t>(
         heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
-    // Fixed roster order: Coordinator, Sensor, Update, Render, Console.
     fill_task_telemetry(telemetry.tasks[0], SystemTaskKind::Coordinator,
                         s_coordinator_task);
-    fill_task_telemetry(telemetry.tasks[1], SystemTaskKind::Sensor, s_sensor_task);
-    fill_task_telemetry(telemetry.tasks[2], SystemTaskKind::Update, s_update_task);
-    fill_task_telemetry(telemetry.tasks[3], SystemTaskKind::Render, s_render_task);
-    fill_task_telemetry(telemetry.tasks[4], SystemTaskKind::Console, s_console_task);
+    fill_task_telemetry(telemetry.tasks[1], SystemTaskKind::Sensor,
+                        s_sensor_task);
+    fill_task_telemetry(telemetry.tasks[2], SystemTaskKind::Update,
+                        s_update_task);
+    fill_task_telemetry(telemetry.tasks[3], SystemTaskKind::Render,
+                        s_render_task);
+    fill_task_telemetry(telemetry.tasks[4], SystemTaskKind::Console,
+                        s_console_task);
 
     app->on_system_telemetry(telemetry);
 }
@@ -320,28 +299,27 @@ void log_startup_info()
     ESP_LOGI(kTag,
              "ESP32-S3 rev %u, %d cores, %u MB flash, %u MB PSRAM, tick %u Hz",
              chip.revision, chip.cores, static_cast<unsigned>(flash_mb),
-             static_cast<unsigned>(psram_mb), static_cast<unsigned>(configTICK_RATE_HZ));
-    ESP_LOGI(kTag,
-             "free heap %u B internal, %u B PSRAM",
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+             static_cast<unsigned>(psram_mb),
+             static_cast<unsigned>(configTICK_RATE_HZ));
+    ESP_LOGI(
+        kTag, "free heap %u B internal, %u B PSRAM",
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 }
 
-[[noreturn]] void fatal_startup(const char *what, esp_err_t err)
+[[noreturn]] void fatal_startup(const char *operation, esp_err_t error)
 {
-    ESP_LOGE(kTag, "FATAL: %s failed: %s - entering recovery idle",
-             what, esp_err_to_name(err));
+    ESP_LOGE(kTag, "FATAL: %s failed: %s - entering recovery idle", operation,
+             esp_err_to_name(error));
     for (;;) {
-        // Keep USB/ROM recovery available instead of entering a reboot loop.
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-/// Fail-closed: any barrier/drain/enter failure restarts instead of letting
-/// the shell continue with a torn transition. Called from the main task.
-[[noreturn]] void fail_closed(const char *what)
+[[noreturn]] void fail_closed(const char *reason)
 {
-    ESP_LOGE(kTag, "TRANSITION BARRIER: %s - fail-closed esp_restart()", what);
+    ESP_LOGE(kTag, "TRANSITION BARRIER: %s - fail-closed esp_restart()",
+             reason);
     esp_restart();
 }
 
@@ -349,642 +327,479 @@ constexpr uint32_t kSensorHz = 100;
 constexpr uint32_t kPhysicsHz = 30;
 constexpr uint32_t kRenderHz = 30;
 
-constexpr TickType_t kSensorPeriodTicks =
-    static_cast<TickType_t>((1000000ULL / kSensorHz * configTICK_RATE_HZ + 999999ULL) / 1000000ULL);
-constexpr TickType_t kPhysicsPeriodTicks =
-    static_cast<TickType_t>((1000000ULL / kPhysicsHz * configTICK_RATE_HZ + 999999ULL) / 1000000ULL);
-constexpr TickType_t kRenderPeriodTicks =
-    static_cast<TickType_t>((1000000ULL / kRenderHz * configTICK_RATE_HZ + 999999ULL) / 1000000ULL);
+constexpr TickType_t kSensorPeriodTicks = static_cast<TickType_t>(
+    (1000000ULL / kSensorHz * configTICK_RATE_HZ + 999999ULL) / 1000000ULL);
+constexpr TickType_t kPhysicsPeriodTicks = static_cast<TickType_t>(
+    (1000000ULL / kPhysicsHz * configTICK_RATE_HZ + 999999ULL) / 1000000ULL);
+constexpr TickType_t kRenderPeriodTicks = static_cast<TickType_t>(
+    (1000000ULL / kRenderHz * configTICK_RATE_HZ + 999999ULL) / 1000000ULL);
 
-// Bounded task stacks; all heavy objects live in the app / shell services.
 constexpr uint32_t kSensorStackBytes = 4096;
 constexpr uint32_t kPhysicsStackBytes = 4096;
 constexpr uint32_t kRenderStackBytes = 4096;
 
-/// The dispatch check shared by every lane: exactly ONE acquire load per
-/// iteration (returned to the caller), then react to the generation once
-/// (Transition -> park + ack; Running -> rebase the cadence anchor; Launcher
-/// -> park without ack). Callers use the returned word for all gating so no
-/// lane ever branches on a second, possibly newer observation — a torn (app,
-/// mode, generation) triple is impossible.
-uint32_t dispatch_step(uint32_t *seen_gen, TickType_t *last_wake, uint32_t ack_bit)
+// Return one coherent selection and acknowledge each generation once.
+uint32_t synchronize_lane_generation(uint32_t &observed_generation,
+                                     TickType_t &cadence_anchor,
+                                     uint32_t acknowledgement_bit)
 {
-    const uint32_t word = s_active_selection.load(std::memory_order_acquire);
-    const uint32_t gen = word >> kAppGenShift;
-    if (gen != *seen_gen) {
-        if (word_mode(word) == AppMode::Transition) {
-            // New quiesce generation: this lane's old-generation app
-            // callbacks are done. Ack exactly once per transition (an
-            // already-parked lane re-acks harmlessly — the coordinator clears
-            // the mask before publishing). Because the same word also gates
-            // app callbacks to off, no app callback can run after this ack.
-            s_lane_acks.fetch_or(ack_bit, std::memory_order_release);
-        } else if (word_mode(word) == AppMode::Running) {
-            // New run generation: rebase before resuming so the cadence is
-            // exact on the next iteration — never a catch-up burst.
-            *last_wake = xTaskGetTickCount();
+    const uint32_t selection =
+        s_active_selection.load(std::memory_order_acquire);
+    const uint32_t generation = selection >> kAppGenerationShift;
+    if (generation != observed_generation) {
+        const AppMode mode = selection_mode(selection);
+        if (mode == AppMode::Transition) {
+            s_lane_acknowledgements.fetch_or(acknowledgement_bit,
+                                             std::memory_order_release);
+        } else if (mode == AppMode::Running) {
+            cadence_anchor = xTaskGetTickCount();
         }
-        // Launcher: stable park mode — no app callbacks, no ack.
-        *seen_gen = gen;
+        observed_generation = generation;
     }
-    return word;
+    return selection;
 }
 
-// Sensor/control lane: motion, buttons, touch, and launcher routing.
-void sensor_task(void *arg)
+void sensor_task(void *)
 {
-    static_cast<void>(arg);
-
-    // Cache this lane's persistent handle for the live telemetry sampler.
     s_sensor_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
-
-    // Sentinel forces the first observed generation through dispatch_step:
-    // a boot-time queued transition cannot make this lane miss its quiesce ack.
-    uint32_t seen_gen = UINT32_MAX;
-
-    uint32_t last_err_log_s = 0;
-    uint32_t last_touch_err_log_s = UINT32_MAX;
-    // Sensor-originated target requests are never dropped on coordinator
-    // queue backpressure. The retained payload includes the selected launcher
-    // index, so a later swipe cannot retarget an older Launch intent.
+    uint32_t observed_generation = UINT32_MAX;
+    uint32_t last_motion_error_log_second = UINT32_MAX;
+    uint32_t last_touch_error_log_second = UINT32_MAX;
     RuntimeRequest pending_request{RuntimeRequestKind::Launch, 0};
-    bool request_pending = false;
-    auto enqueue_or_retain = [&](RuntimeRequest request) {
-        if (request_pending) {
+    bool has_pending_request = false;
+    auto enqueue_or_replace_pending = [&](RuntimeRequest request) {
+        if (has_pending_request) {
             pending_request = request;
             return;
         }
         if (enqueue_request(request) != ESP_OK) {
             pending_request = request;
-            request_pending = true;
+            has_pending_request = true;
         }
     };
-    // Launcher swipe/tap tracking: one contact from its Begin to its End, so
-    // a swipe changes the selection exactly once and only after the release.
-    // Any non-Launcher generation clears it before that generation's touch
-    // report is consumed, so contacts can never cross a lifecycle boundary.
-    bool launcher_contact_ = false;
-    uint16_t launcher_contact_x_ = 0;
-    uint16_t launcher_contact_y_ = 0;
-    TickType_t last_wake = xTaskGetTickCount();
+    bool launcher_contact_active = false;
+    uint16_t launcher_contact_start_x = 0;
+    uint16_t launcher_contact_start_y = 0;
+    TickType_t cadence_anchor = xTaskGetTickCount();
     for (;;) {
-        vTaskDelayUntil(&last_wake, kSensorPeriodTicks);
-        const uint32_t word = dispatch_step(&seen_gen, &last_wake, kAckSensor);
-        const AppMode mode = word_mode(word);
+        vTaskDelayUntil(&cadence_anchor, kSensorPeriodTicks);
+        const uint32_t selection = synchronize_lane_generation(
+            observed_generation, cadence_anchor, kSensorAcknowledgement);
+        const AppMode mode = selection_mode(selection);
         if (mode != AppMode::Launcher) {
-            launcher_contact_ = false;
+            launcher_contact_active = false;
         }
-        const bool app_active = mode == AppMode::Running;
-        // Decode the running app from this lane's one acquired dispatch word;
-        // valid whenever the word mode is Running.
-        App *app = app_at_index(word & kAppIndexMask);
-        if (request_pending && enqueue_request(pending_request) == ESP_OK) {
-            request_pending = false;
+        App *app = app_at_index(selection & kAppIndexMask);
+        if (has_pending_request && enqueue_request(pending_request) == ESP_OK) {
+            has_pending_request = false;
         }
 
-        if (app_active && app != nullptr) {
-            // --- raw motion via MotionService: poll + dt clamp + override ---
-            const MotionTick tick = s_motion.poll();
-            const esp_err_t motion_err = s_motion.last_read_error();
-            if (motion_err != ESP_OK) {
-                const uint32_t now_s = static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
-                if (now_s != last_err_log_s &&
+        if (mode == AppMode::Running && app != nullptr) {
+            const MotionTick motion_tick = s_motion.poll();
+            const esp_err_t motion_error = s_motion.last_read_error();
+            if (motion_error != ESP_OK) {
+                const uint32_t current_second =
+                    static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
+                if (current_second != last_motion_error_log_second &&
                     !s_console.protocol_output_active()) {
-                    last_err_log_s = now_s;
-                    ESP_LOGW(kTag, "board_read_motion failed: %s", esp_err_to_name(motion_err));
+                    last_motion_error_log_second = current_second;
+                    ESP_LOGW(kTag, "board_read_motion failed: %s",
+                             esp_err_to_name(motion_error));
                 }
             }
-            // Feed the app's on_motion() result back so the service advances
-            // its IMU time anchor only when the app accepts a fresh physical
-            // sample; a rejected sample re-clamps against the previous
-            // accepted anchor. An active override still publishes verbatim.
-            s_motion.acknowledge_sample(app->on_motion(tick));
+            s_motion.acknowledge_sample(app->on_motion(motion_tick));
         }
 
-
-        TouchEvent touch;
-        if (s_input.poll_touch(touch)) {
-            // Every contact-qualified report is forwarded independently of
-            // simultaneous button emission: while Running the decoded app
-            // receives exactly one Begin per physical contact (Move/End are
-            // shell-internal), even when the same poll also fired a button.
-            // At the launcher, one contact is tracked from its Begin to its
-            // End so a swipe changes the selection exactly once, after
-            // release; only a non-swipe release inside the selected entry
-            // requests Launch. Duplicate Launch intents (button + touch in
-            // one poll) are harmless: the retained-slot coalescing plus the
-            // same-target no-op in commit_transition make them idempotent.
+        TouchEvent touch_event;
+        if (s_input.poll_touch(touch_event)) {
             if (mode == AppMode::Running && app != nullptr) {
-                if (touch.phase == TouchPhase::Begin) {
-                    app->on_touch(touch);
+                if (touch_event.phase == TouchPhase::Begin) {
+                    app->on_touch_begin(touch_event);
                 }
             } else if (mode == AppMode::Launcher) {
-                if (touch.phase == TouchPhase::Begin) {
-                    launcher_contact_ = true;
-                    launcher_contact_x_ = touch.x;
-                    launcher_contact_y_ = touch.y;
-                } else if (touch.phase == TouchPhase::End) {
-                    if (launcher_contact_) {
-                        launcher_contact_ = false;
-                        // Controller gesture wins; dominant horizontal travel
-                        // >= kLauncherSwipeMinPx is the software fallback.
-                        // Swipe maps: left -> next, right -> previous,
-                        // wrapping around the registry.
+                if (touch_event.phase == TouchPhase::Begin) {
+                    launcher_contact_active = true;
+                    launcher_contact_start_x = touch_event.x;
+                    launcher_contact_start_y = touch_event.y;
+                } else if (touch_event.phase == TouchPhase::End) {
+                    if (launcher_contact_active) {
+                        launcher_contact_active = false;
                         const TouchGesture gesture = launcher_swipe_gesture(
-                            touch.gesture, launcher_contact_x_,
-                            launcher_contact_y_, touch.x, touch.y);
+                            touch_event.gesture, launcher_contact_start_x,
+                            launcher_contact_start_y, touch_event.x,
+                            touch_event.y);
                         if (gesture == TouchGesture::SwipeLeft) {
-                            const uint32_t next =
-                                (s_launcher_index.load(std::memory_order_relaxed) + 1) %
-                                static_cast<uint32_t>(kRegistryCount);
-                            s_launcher_index.store(next, std::memory_order_release);
-                            ESP_LOGI(kTag, "swipe left - launcher selection %u: %s",
-                                     static_cast<unsigned>(next),
-                                     kRegistry[next].label);
+                            const uint32_t next_index =
+                                (s_launcher_index.load(
+                                     std::memory_order_relaxed) +
+                                 1) %
+                                kRegistryCount;
+                            s_launcher_index.store(next_index,
+                                                   std::memory_order_release);
+                            ESP_LOGI(kTag,
+                                     "swipe left - launcher selection %u: %s",
+                                     static_cast<unsigned>(next_index),
+                                     kRegistry[next_index].label);
                         } else if (gesture == TouchGesture::SwipeRight) {
-                            const uint32_t prev =
-                                (s_launcher_index.load(std::memory_order_relaxed) +
-                                 static_cast<uint32_t>(kRegistryCount) - 1u) %
-                                static_cast<uint32_t>(kRegistryCount);
-                            s_launcher_index.store(prev, std::memory_order_release);
-                            ESP_LOGI(kTag, "swipe right - launcher selection %u: %s",
-                                     static_cast<unsigned>(prev),
-                                     kRegistry[prev].label);
-                        } else if (launcher_accepts_launch_touch(touch.x, touch.y)) {
+                            const uint32_t previous_index =
+                                (s_launcher_index.load(
+                                     std::memory_order_relaxed) +
+                                 kRegistryCount - 1u) %
+                                kRegistryCount;
+                            s_launcher_index.store(previous_index,
+                                                   std::memory_order_release);
+                            ESP_LOGI(kTag,
+                                     "swipe right - launcher selection %u: %s",
+                                     static_cast<unsigned>(previous_index),
+                                     kRegistry[previous_index].label);
+                        } else if (launcher_accepts_launch_touch(
+                                       touch_event.x, touch_event.y)) {
                             ESP_LOGI(kTag, "touch launch x=%u y=%u",
-                                     static_cast<unsigned>(touch.x),
-                                     static_cast<unsigned>(touch.y));
-                            enqueue_or_retain(selected_launch_request());
+                                     static_cast<unsigned>(touch_event.x),
+                                     static_cast<unsigned>(touch_event.y));
+                            enqueue_or_replace_pending(
+                                selected_launch_request());
                         }
                     }
                 }
-                // Move: only exercises the contact; End classifies the whole
-                // contact, so selection never moves mid-drag.
             }
         } else {
-            const esp_err_t touch_err = s_input.last_touch_error();
-            if (touch_err != ESP_OK) {
-                // InputService quarantines its retained contact until a
-                // confirmed release after a lost report. Cancel the
-                // independent launcher classifier in the same iteration so
-                // neither state machine can act on an uncertain fragment.
-                launcher_contact_ = false;
-                const uint32_t now_s =
+            const esp_err_t touch_error = s_input.last_touch_error();
+            if (touch_error != ESP_OK) {
+                launcher_contact_active = false;
+                const uint32_t current_second =
                     static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
-                if (now_s != last_touch_err_log_s &&
+                if (current_second != last_touch_error_log_second &&
                     !s_console.protocol_output_active()) {
-                    last_touch_err_log_s = now_s;
+                    last_touch_error_log_second = current_second;
                     ESP_LOGW(kTag, "board_read_touch failed: %s",
-                             esp_err_to_name(touch_err));
+                             esp_err_to_name(touch_error));
                 }
             }
         }
-        // --- shell input: buttons preserve their existing launch/reset/home
-        // --- behavior. PlusPress while Running resets the decoded app; short
-        // --- PWR at the launcher is a no-op. Touch reports are consumed in
-        // --- every mode: while Running only the Begin of each contact reaches
-        // --- the decoded app (on_touch, a default no-op); at the launcher one
-        // --- contact is tracked to its End, where a swipe moves the selection
-        // --- once and a non-swipe release inside the selected entry requests
-        // --- Launch. No lifecycle/transition work runs directly from this
-        // --- lane.
-        const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
-        ButtonEvent event;
-        const bool button_emitted = s_input.poll(now_ms, event);
-        if (button_emitted) {
-            if (event == ButtonEvent::PlusPress) {
+        const uint32_t current_milliseconds =
+            static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+        ButtonEvent button_event;
+        const bool have_button_event =
+            s_input.poll(current_milliseconds, button_event);
+        if (have_button_event) {
+            if (button_event == ButtonEvent::PlusPress) {
                 if (mode == AppMode::Running && app != nullptr) {
-                    // PLUS while an app runs requests its app-defined reset.
-                    static_cast<void>(app->handle_event(AppEvent::PlusPress));
+                    app->on_plus_press();
                 } else if (mode == AppMode::Launcher) {
-                    // Touch is classified before buttons in this iteration,
-                    // so a simultaneous swipe deterministically selects the
-                    // page copied into this Launch intent. During Transition
-                    // the event is dropped (no lifecycle work).
-                    enqueue_or_retain(selected_launch_request());
+                    enqueue_or_replace_pending(selected_launch_request());
                 }
-            } else if (event == ButtonEvent::PowerShort) {
+            } else if (button_event == ButtonEvent::PowerShort) {
                 if (mode == AppMode::Running) {
-                    // Short PWR while an app runs returns to the launcher;
-                    // InputService guarantees this is never a leftover of a
-                    // long hold (poweroff_sent suppression).
-                    enqueue_or_retain(home_request());
+                    enqueue_or_replace_pending(home_request());
                 }
-                // Short PWR at the launcher is a deliberate no-op: selection
-                // is moved by swipes only; a long hold still powers off.
             }
         }
-        // Always give the watched idle task a scheduling window, even if an
-        // I2C timeout made this periodic iteration overrun. While parked, this
-        // polling plus the yield is the whole sensor-lane body.
+        // Always yield for idle and watchdog service after overruns.
         vTaskDelay(1);
     }
 }
 
-// Fixed-step update lane.
-void physics_task(void *arg)
+void physics_task(void *)
 {
-    static_cast<void>(arg);
-
-    // Cache this lane's persistent handle for the live telemetry sampler.
     s_update_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
-
-    // Sentinel forces the first observed generation through dispatch_step.
-    uint32_t seen_gen = UINT32_MAX;
-
-    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t observed_generation = UINT32_MAX;
+    TickType_t cadence_anchor = xTaskGetTickCount();
     for (;;) {
-        vTaskDelayUntil(&last_wake, kPhysicsPeriodTicks);
-        const uint32_t word = dispatch_step(&seen_gen, &last_wake, kAckPhysics);
-        if (word_mode(word) != AppMode::Running) {
-            // Parked: no app callbacks during a Transition or the launcher.
+        vTaskDelayUntil(&cadence_anchor, kPhysicsPeriodTicks);
+        const uint32_t selection = synchronize_lane_generation(
+            observed_generation, cadence_anchor, kUpdateAcknowledgement);
+        if (selection_mode(selection) != AppMode::Running) {
             vTaskDelay(1);
             continue;
         }
-        // Decode the running app from this lane's one acquired dispatch word;
-        // a Running word always carries a valid registry index.
-        App *app = app_at_index(word & kAppIndexMask);
+        App *app = app_at_index(selection & kAppIndexMask);
         if (app == nullptr) {
             vTaskDelay(1);
             continue;
         }
 
-        // Pending reset consumption, motion read, PBF step and snapshot
-        // publish all live inside the app (update lane).
         static_cast<void>(app->update(fluid_demo::App::kPhysicsDt));
 
-        // vTaskDelayUntil() does not block after an overrun. One tick here
-        // guarantees idle/watchdog service without changing on-time cadence.
         vTaskDelay(1);
     }
 }
 
-void log_telemetry(App *app, size_t app_index)
+void log_telemetry(App *app, uint32_t app_index)
 {
-    const AppStats st = app->stats();
-    const uint64_t current_checks = st.candidate_checks;
+    const AppStats stats = app->stats();
+    const uint64_t current_checks = stats.candidate_checks;
     static uint64_t last_candidate_checks[kRegistryCount] = {};
     uint64_t &last_checks = last_candidate_checks[app_index];
-    const uint64_t candidate_delta =
-        current_checks >= last_checks
-            ? current_checks - last_checks
-            : current_checks;  // reset() clears the per-run counter
+    const uint64_t candidate_delta = current_checks >= last_checks
+                                         ? current_checks - last_checks
+                                         : current_checks;
     last_checks = current_checks;
-    ESP_LOGI(kTag,
-             "count=%u epoch=%u phys=%uus raster=%uus dma=%uus frame=%uus "
-             "cand/s=%llu raw=(%.2f,%.2f,%.2f) sim=(%.2f,%.2f,%.2f) "
-             "heap_int_min=%u heap_psram_min=%u missed=%u nonfinite=%u",
-             static_cast<unsigned>(st.count),
-             static_cast<unsigned>(st.epoch),
-             static_cast<unsigned>(st.physics_us),
-             static_cast<unsigned>(st.raster_us),
-             static_cast<unsigned>(s_last_frame_dma_us),
-             static_cast<unsigned>(st.frame_us),
-             static_cast<unsigned long long>(candidate_delta),
-             static_cast<double>(st.raw[0]),
-             static_cast<double>(st.raw[1]),
-             static_cast<double>(st.raw[2]),
-             static_cast<double>(st.apparent[0]),
-             static_cast<double>(st.apparent[1]),
-             static_cast<double>(st.apparent[2]),
-             static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
-             static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)),
-             static_cast<unsigned>(s_display.missed_transfers()),
-             static_cast<unsigned>(st.nonfinite_resets));
+    ESP_LOGI(
+        kTag,
+        "count=%u epoch=%u phys=%uus raster=%uus dma=%uus frame=%uus "
+        "cand/s=%llu raw=(%.2f,%.2f,%.2f) sim=(%.2f,%.2f,%.2f) "
+        "heap_int_min=%u heap_psram_min=%u missed=%u nonfinite=%u "
+        "governed=%u",
+        static_cast<unsigned>(stats.count), static_cast<unsigned>(stats.epoch),
+        static_cast<unsigned>(stats.physics_us),
+        static_cast<unsigned>(stats.raster_us),
+        static_cast<unsigned>(s_last_frame_dma_us),
+        static_cast<unsigned>(stats.frame_us),
+        static_cast<unsigned long long>(candidate_delta),
+        static_cast<double>(stats.raw[0]), static_cast<double>(stats.raw[1]),
+        static_cast<double>(stats.raw[2]),
+        static_cast<double>(stats.apparent[0]),
+        static_cast<double>(stats.apparent[1]),
+        static_cast<double>(stats.apparent[2]),
+        static_cast<unsigned>(
+            heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+        static_cast<unsigned>(
+            heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)),
+        static_cast<unsigned>(s_display.missed_transfers()),
+        static_cast<unsigned>(stats.nonfinite_resets),
+        static_cast<unsigned>(stats.governor_hits));
 }
 
-void render_task(void *arg)
+void render_task(void *)
 {
-    static_cast<void>(arg);
-
-    // Cache this lane's persistent handle for the live telemetry sampler
-    // (written before the 1 Hz gate, so it is always valid when sampled).
     s_render_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
-
-    // Sentinel forces the first observed generation through dispatch_step.
-    uint32_t seen_gen = UINT32_MAX;
-
-    uint32_t last_log_s = 0;
-    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t observed_generation = UINT32_MAX;
+    uint32_t last_log_second = 0;
+    TickType_t cadence_anchor = xTaskGetTickCount();
     for (;;) {
-        vTaskDelayUntil(&last_wake, kRenderPeriodTicks);
-        const uint32_t word = dispatch_step(&seen_gen, &last_wake, kAckRender);
-        if (word_mode(word) == AppMode::Transition) {
-            // Mid-transition: no display work at all — the coordinator's
-            // mandatory drain retires the carried stripe once all lanes ack.
-            // Park on 10 ms so IDLE0 keeps feeding the task watchdog.
+        vTaskDelayUntil(&cadence_anchor, kRenderPeriodTicks);
+        const uint32_t selection = synchronize_lane_generation(
+            observed_generation, cadence_anchor, kRenderAcknowledgement);
+        if (selection_mode(selection) == AppMode::Transition) {
+            // The coordinator drains after every lane acknowledges.
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        if (word_mode(word) == AppMode::Launcher) {
+        if (selection_mode(selection) == AppMode::Launcher) {
             if (s_console.protocol_output_active()) {
-                // The console owns stdout; park raster work so protocol lines
-                // stay intact and IDLE0 services the WDT (same rule as Fluid).
                 vTaskDelay(pdMS_TO_TICKS(10));
-                last_wake = xTaskGetTickCount();
+                cadence_anchor = xTaskGetTickCount();
                 continue;
             }
-            // Launcher stable mode: draw the selected entry's launcher frame
-            // through the same bound DisplayFrame transport at the 30 Hz
-            // render cadence. Load the selection exactly once, bounds-resolve
-            // its App, and pass that app's launcher visual descriptor with
-            // the selection and registry count for the page-dot highlight;
-            // null (the default, or an out-of-range selection) renders the
-            // exact built-in Fluid launcher. No app telemetry exists here.
-            const uint32_t selected =
+            const uint32_t selected_index =
                 s_launcher_index.load(std::memory_order_acquire);
-            App *const app = app_at_index(selected);
+            App *const app = app_at_index(selected_index);
             static_cast<void>(render_launcher(
-                s_display_frame, app != nullptr ? app->launcher_visual() : nullptr,
-                selected, static_cast<uint32_t>(kRegistryCount)));
+                s_display_frame,
+                app != nullptr ? app->launcher_visual() : nullptr,
+                selected_index, kRegistryCount));
             vTaskDelay(1);
             continue;
         }
         if (s_console.protocol_output_active()) {
-            // The console also runs on core 0. Park raster work while it owns
-            // stdout so protocol lines stay intact and IDLE0 services the WDT.
             vTaskDelay(pdMS_TO_TICKS(10));
-            last_wake = xTaskGetTickCount();
+            cadence_anchor = xTaskGetTickCount();
             continue;
         }
 
-        // Decode the running app from this lane's one acquired dispatch word;
-        // a Running word always carries a valid registry index.
-        const uint32_t app_index = word & kAppIndexMask;
+        const uint32_t app_index = selection & kAppIndexMask;
         App *app = app_at_index(app_index);
         if (app == nullptr) {
             vTaskDelay(1);
             continue;
         }
 
-        // Per-frame display DMA wait: cumulative counter delta across the
-        // app's render call. The delta is stored only when a frame was
-        // actually rendered — a blank pass (no new snapshot) or a failed
-        // pass touches no/incomplete transport, so the last completed
-        // frame's coherent timing tuple is preserved. Kept in sync with the
-        // app's own last-frame raster/frame telemetry for the composed line.
-        const uint32_t dma_wait_begin = s_display.dma_wait_us();
+        const uint32_t dma_wait_start_us = s_display.dma_wait_us();
         if (app->render(s_display_frame)) {
-            s_last_frame_dma_us = s_display.dma_wait_us() - dma_wait_begin;
-            publish_active_stats(word, app->stats());
+            s_last_frame_dma_us = s_display.dma_wait_us() - dma_wait_start_us;
+            publish_active_stats(selection, app->stats());
         }
 
-        // Once-a-second telemetry (only while an app runs; the line itself is
-        // byte-identical to the pre-split output, sourced from the decoded
-        // running app's stats). The live system snapshot shares this exact
-        // <=1 Hz gate: sampled into stack storage here, after the frame
-        // callback above and never during console dumps, and delivered to the
-        // running app with the render generation before the log line.
-        const uint32_t now_s = static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
-        if (now_s != last_log_s && !s_console.protocol_output_active()) {
-            last_log_s = now_s;
-            sample_system_telemetry(app, word >> kAppGenShift);
+        const uint32_t current_second =
+            static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
+        if (current_second != last_log_second &&
+            !s_console.protocol_output_active()) {
+            last_log_second = current_second;
+            sample_system_telemetry(app, selection >> kAppGenerationShift);
             log_telemetry(app, app_index);
         }
-        // Same overrun guard as physics: harmless while on schedule.
         vTaskDelay(1);
     }
 }
 
-void emit_mode_line(const char *name)
+void emit_mode_line(const char *mode_name)
 {
-    // Additive host-protocol line on every committed mode change.
-    std::printf("\r\n@DEV MODE %s\r\n", name);
+    std::printf("\r\n@DEV MODE %s\r\n", mode_name);
     std::fflush(stdout);
 }
 
-/// Execute one transition request synchronously (main task; the queue
-/// serializes requests, so transitions never overlap). No allocation, no
-/// task recreation, no hardware reinit. A request whose target equals the
-/// already committed side is a no-op: no barrier, no wire line.
 void commit_transition(RuntimeRequest request)
 {
-    const RegistryEntry *old_app = s_active_app;
-    // nullptr target means the launcher stable mode.
-    const RegistryEntry *next_app = nullptr;
-    uint32_t next_index = kNoAppIndex;
+    const RegistryEntry *outgoing_entry = s_active_entry;
+    const RegistryEntry *incoming_entry = nullptr;
+    uint32_t incoming_index = kNoAppIndex;
     switch (request.kind) {
-        case RuntimeRequestKind::Launch:
-            // PLUS/touch from the launcher: launch the page bound into this
-            // intent before it entered the queue. Bounded: an out-of-range
-            // payload can never launch outside the registry.
-            if (s_mode != AppMode::Launcher) {
-                return;
-            }
-            next_index = request.app_index;
-            if (next_index >= kRegistryCount) {
-                next_index = 0;
-            }
-            next_app = &kRegistry[next_index];
-            break;
-        case RuntimeRequestKind::Home:
-            // Short PWR while an app runs: return to the launcher (generic;
-            // the selection is preserved across Home). A short PWR at the
-            // launcher is a no-op and never enqueues Home.
-            if (s_mode != AppMode::Running) {
-                return;
-            }
-            break;
-        default:
-            return;  // defensive; the queue only ever carries the above
+    case RuntimeRequestKind::Launch:
+        if (s_mode != AppMode::Launcher) {
+            return;
+        }
+        incoming_index = request.app_index;
+        if (incoming_index >= kRegistryCount) {
+            incoming_index = 0;
+        }
+        incoming_entry = &kRegistry[incoming_index];
+        break;
+    case RuntimeRequestKind::Home:
+        if (s_mode != AppMode::Running) {
+            return;
+        }
+        break;
+    default:
+        return;
     }
 
-    // 1. Publish Quiesce: clear per-lane ack bits, mode=Transition, bump the
-    //    generation, store the packed (kNoAppIndex, Transition, gen) word
-    //    once (release).
     s_mode = AppMode::Transition;
-    s_lane_acks.store(0, std::memory_order_release);
-    const uint32_t quiesce_gen = ++s_generation;
+    s_lane_acknowledgements.store(0, std::memory_order_release);
+    const uint32_t quiesce_generation = ++s_generation;
     s_active_selection.store(
-        pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Transition),
-                       quiesce_gen),
+        pack_selection(kNoAppIndex, AppMode::Transition, quiesce_generation),
         std::memory_order_release);
 
-    // 2. Wait for all three lane acks; fail closed on a 500 ms timeout.
-    //    Every lane finishes its current callback before acking, so no app
-    //    callback runs after its lane's acknowledgement.
-    const int64_t deadline_us =
-        esp_timer_get_time() + static_cast<int64_t>(kBarrierTimeoutMs) * 1000;
-    while ((s_lane_acks.load(std::memory_order_acquire) & kAckAll) != kAckAll) {
-        if (esp_timer_get_time() >= deadline_us) {
+    const int64_t quiesce_deadline_us =
+        esp_timer_get_time() + static_cast<int64_t>(kQuiesceTimeoutMs) * 1000;
+    while ((s_lane_acknowledgements.load(std::memory_order_acquire) &
+            kAllLaneAcknowledgements) != kAllLaneAcknowledgements) {
+        if (esp_timer_get_time() >= quiesce_deadline_us) {
             fail_closed("quiesce ack timeout");
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    // 3. Mandatory DisplayService::drain() before any leave: retire the
-    //    carried final stripe so the incoming side starts on a drained panel
-    //    (the launcher's last frame in either direction).
     if (s_display.drain() != ESP_OK) {
         fail_closed("display drain failed");
     }
 
-    // 4. leave() the outgoing app (no allocation). Nothing to leave when the
-    //    launcher is the outgoing side.
-    if (old_app != nullptr) {
-        old_app->app->leave();
+    if (outgoing_entry != nullptr) {
+        outgoing_entry->app->leave();
     }
 
-    // 5. Entering -> enter() the incoming app (no allocation; leaves a
-    //    pending reset alone), then the committed stable mode.
     s_mode = AppMode::Entering;
-    s_active_app = next_app;
-    if (next_app != nullptr) {
-        const esp_err_t err = next_app->app->enter();
-        if (err != ESP_OK) {
+    s_active_entry = incoming_entry;
+    if (incoming_entry != nullptr) {
+        const esp_err_t enter_result = incoming_entry->app->enter();
+        if (enter_result != ESP_OK) {
             fail_closed("app enter failed");
         }
     }
-    s_mode = next_app != nullptr ? AppMode::Running : AppMode::Launcher;
+    s_mode = incoming_entry != nullptr ? AppMode::Running : AppMode::Launcher;
 
-    // 6. Publish the run generation with the committed mode; lanes rebase and
-    //    resume (Running) or park and draw the launcher (Launcher).
-    const uint32_t run_gen = ++s_generation;
+    const uint32_t active_generation = ++s_generation;
     s_active_selection.store(
-        pack_selection(next_index, static_cast<uint32_t>(s_mode), run_gen),
+        pack_selection(incoming_index, s_mode, active_generation),
         std::memory_order_release);
 
-    // Publish the committed stable-mode name for status telemetry.
-    s_mode_name.store(next_app != nullptr ? next_app->id : "launcher",
-                      std::memory_order_release);
-
-    // 7. Committed mode change on the wire.
-    const char *name = next_app != nullptr ? next_app->id : "launcher";
-    emit_mode_line(name);
+    const char *active_name =
+        incoming_entry != nullptr ? incoming_entry->id : "launcher";
+    s_active_name.store(active_name, std::memory_order_release);
+    emit_mode_line(active_name);
 
     ESP_LOGV(kTag, "transition committed: mode=%u generation=%u",
-             static_cast<unsigned>(s_mode), static_cast<unsigned>(s_generation));
+             static_cast<unsigned>(s_mode),
+             static_cast<unsigned>(s_generation));
 }
 
-}  // namespace
-
-const RegistryEntry *registry()
-{
-    return kRegistry;
 }
-
 
 const char *runtime_mode_name()
 {
-    return s_mode_name.load(std::memory_order_acquire);
+    return s_active_name.load(std::memory_order_acquire);
 }
 
 bool runtime_active_stats(AppStats &stats)
 {
-    const uint32_t before =
+    const uint32_t selection_before =
         s_active_selection.load(std::memory_order_acquire);
-    AppStats snapshot{};
-    bool valid = false;
-    if (word_mode(before) == AppMode::Running) {
+    AppStats published_stats{};
+    bool stats_available = false;
+    if (selection_mode(selection_before) == AppMode::Running) {
         portENTER_CRITICAL(&s_stats_mux);
-        if (s_stats_selection == before) {
-            snapshot = s_stats_snapshot;
-            valid = true;
+        if (s_stats_selection == selection_before) {
+            published_stats = s_stats_snapshot;
+            stats_available = true;
         }
         portEXIT_CRITICAL(&s_stats_mux);
     }
-    const uint32_t after =
+    const uint32_t selection_after =
         s_active_selection.load(std::memory_order_acquire);
-    if (!valid || after != before) {
+    if (!stats_available || selection_after != selection_before) {
         stats = {};
         return false;
     }
-    stats = snapshot;
+    stats = published_stats;
     return true;
 }
 
 [[noreturn]] void runtime_run()
 {
-    // The small bounded request queue is consumed on this (ESP main) task.
     s_request_queue = xQueueCreate(8, sizeof(RuntimeRequest));
     if (s_request_queue == nullptr) {
         fatal_startup("request queue create", ESP_ERR_NO_MEM);
     }
 
-    // Cache this task's persistent handle for the live telemetry sampler:
-    // the coordinator runs forever on the ESP main task.
-    s_coordinator_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+    s_coordinator_task.store(xTaskGetCurrentTaskHandle(),
+                             std::memory_order_release);
 
     log_startup_info();
 
-    // Board: direct ST7789 display, QMI8658 IMU, PLUS/BOOT inputs.
     ESP_LOGI(kTag, "board_init (ESP32-S3-Touch-LCD-1.54)");
-    esp_err_t err = board_init(s_board);
-    if (err != ESP_OK) {
-        fatal_startup("board init", err);
+    esp_err_t startup_result = board_init(s_board);
+    if (startup_result != ESP_OK) {
+        fatal_startup("board init", startup_result);
     }
 
-    // The shell's DisplayService owns the panel transport + PSRAM capture and
-    // must init first; the app then drives it through a bound DisplayFrame.
     ESP_LOGI(kTag, "display init");
-    err = s_display.init(s_board.panel, s_board.io);
-    if (err != ESP_OK) {
-        fatal_startup("display init", err);
+    startup_result = s_display.init(s_board.panel, s_board.io);
+    if (startup_result != ESP_OK) {
+        fatal_startup("display init", startup_result);
     }
     bind_display_frame();
 
-    // Setup every registered app exactly once, in registry order, before the
-    // lanes start.
-    // No app's enter() runs here; the first Launch performs it inside the
-    // full barrier.
-    for (size_t i = 0; i < kRegistryCount; ++i) {
-        ESP_LOGI(kTag, "app init: %s", kRegistry[i].id);
-        err = kRegistry[i].app->setup_once();
-        if (err != ESP_OK) {
-            fatal_startup("app init", err);
+    for (uint32_t app_index = 0; app_index < kRegistryCount; ++app_index) {
+        ESP_LOGI(kTag, "app init: %s", kRegistry[app_index].id);
+        startup_result = kRegistry[app_index].app->setup_once();
+        if (startup_result != ESP_OK) {
+            fatal_startup("app init", startup_result);
         }
     }
 
-    // The console binds the shell's DisplayService (capture), MotionService
-    // (motion/release/status) and InputService (synthetic `input` gestures);
-    // the reset callback is the app's reset atomic via a trampoline bound
-    // exactly once here, never rebound.
-    err = s_console.start(s_display, s_motion, s_input, app_reset_trampoline);
-    if (err != ESP_OK) {
-        fatal_startup("console service init", err);
+    startup_result =
+        s_console.start(s_display, s_motion, s_input, app_reset_trampoline);
+    if (startup_result != ESP_OK) {
+        fatal_startup("console service init", startup_result);
     }
-    // Resolve the dev REPL's task handle exactly once, right after console
-    // startup (the USB Serial/JTAG REPL task exists as soon as start()
-    // returns). A nullptr lookup marks the Console slot invalid for the
-    // telemetry sampler — it is never retried.
-    s_console_task.store(xTaskGetHandle("console_repl"), std::memory_order_release);
+    s_console_task.store(xTaskGetHandle("console_repl"),
+                         std::memory_order_release);
 
-    // InputService terminal-action markers: emit and flush the console's wire
-    // marker immediately before restart/power-off from the sensor lane. Each
-    // callback is bound exactly once here, never rebound.
     s_input.set_reboot_marker(&emit_reboot_marker);
     s_input.set_power_off_marker(&emit_poweroff_marker);
 
-    // Boot stable mode is Launcher: every registered app's setup_once() above
-    // ran exactly once, but enter() is deliberately deferred — the first
-    // Launch (PLUS or accepted launcher touch) performs it inside the full
-    // barrier. Publishing the (Launcher, gen 0) word before the lanes start
-    // means each lane's first acquire load sees the stable mode: sensor polls
-    // buttons, render draws the selected launcher, physics parks. No
-    // lifecycle work runs at boot.
-    s_active_app = nullptr;
+    s_active_entry = nullptr;
     s_mode = AppMode::Launcher;
     s_generation = 0;
-    s_mode_name.store("launcher", std::memory_order_release);
-    s_active_selection.store(
-        pack_selection(kNoAppIndex, static_cast<uint32_t>(AppMode::Launcher), 0),
-        std::memory_order_release);
+    s_active_name.store("launcher", std::memory_order_release);
+    s_active_selection.store(pack_selection(kNoAppIndex, AppMode::Launcher, 0),
+                             std::memory_order_release);
     emit_mode_line("launcher");
 
-    // Create the three pinned lanes exactly once; they are never recreated.
-    BaseType_t ok = xTaskCreatePinnedToCore(sensor_task, "sensor", kSensorStackBytes,
-                                            nullptr, 7, nullptr, 0);
-    if (ok != pdPASS) {
+    BaseType_t task_creation_result = xTaskCreatePinnedToCore(
+        sensor_task, "sensor", kSensorStackBytes, nullptr, 7, nullptr, 0);
+    if (task_creation_result != pdPASS) {
         fatal_startup("sensor task create", ESP_ERR_NO_MEM);
     }
-    ok = xTaskCreatePinnedToCore(physics_task, "physics", kPhysicsStackBytes,
-                                 nullptr, 8, nullptr, 1);
-    if (ok != pdPASS) {
+    task_creation_result = xTaskCreatePinnedToCore(
+        physics_task, "physics", kPhysicsStackBytes, nullptr, 8, nullptr, 1);
+    if (task_creation_result != pdPASS) {
         fatal_startup("physics task create", ESP_ERR_NO_MEM);
     }
-    ok = xTaskCreatePinnedToCore(render_task, "render", kRenderStackBytes,
-                                 nullptr, 5, nullptr, 0);
-    if (ok != pdPASS) {
+    task_creation_result = xTaskCreatePinnedToCore(
+        render_task, "render", kRenderStackBytes, nullptr, 5, nullptr, 0);
+    if (task_creation_result != pdPASS) {
         fatal_startup("render task create", ESP_ERR_NO_MEM);
     }
 
@@ -993,16 +808,13 @@ bool runtime_active_stats(AppStats &stats)
              "PLUS/tap launch selected, swipe cycle, short PWR home",
              static_cast<unsigned>(kRegistryCount));
 
-    // Coordinator loop on the ESP main task; transitions run synchronously,
-    // one at a time, in queue order. Requests whose target equals the
-    // committed side are no-ops inside commit_transition.
     for (;;) {
         RuntimeRequest request;
         if (xQueueReceive(s_request_queue, &request, portMAX_DELAY) != pdTRUE) {
-            continue;  // unreachable: portMAX_DELAY only returns on a send
+            continue;
         }
         commit_transition(request);
     }
 }
 
-}  // namespace fluid_demo
+}

@@ -22,7 +22,7 @@ public:
     esp_err_t enter() override;
     bool on_motion(const MotionTick &tick) override;
     const LauncherVisual *launcher_visual() const override;
-    ShellAction handle_event(AppEvent event) override;
+    void on_plus_press() override;
     esp_err_t update(float dt = kPhysicsDt) override;
     bool render(DisplayFrame &frame) override;
     AppStats stats() override;

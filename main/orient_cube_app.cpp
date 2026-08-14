@@ -213,13 +213,10 @@ void OrientCubeApp::leave()
     portEXIT_CRITICAL(&motion_mux_);
 }
 
-ShellAction OrientCubeApp::handle_event(AppEvent event)
+void OrientCubeApp::on_plus_press()
 {
-    if (event == AppEvent::PlusPress) {
-        reset_requested_.store(true, std::memory_order_release);
-        filter_.request_align();
-    }
-    return ShellAction::None;
+    reset_requested_.store(true, std::memory_order_release);
+    filter_.request_align();
 }
 
 bool OrientCubeApp::on_motion(const MotionTick &tick)

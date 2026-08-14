@@ -28,9 +28,9 @@ public:
     esp_err_t setup_once() override;
     esp_err_t enter() override;
     bool on_motion(const MotionTick &tick) override;
-    void on_touch(const TouchEvent &event) override;
+    void on_touch_begin(const TouchEvent &event) override;
     const LauncherVisual *launcher_visual() const override;
-    ShellAction handle_event(AppEvent event) override;
+    void on_plus_press() override;
     esp_err_t update(float dt = kPhysicsDt) override;
     bool render(DisplayFrame &frame) override;
     AppStats stats() override;
@@ -212,7 +212,7 @@ private:
     uint32_t tick_ = 0;               ///< 60 Hz UI animation clock
     uint32_t epoch_ = 0;
     uint32_t sequence_ = 0;
-    // Written by the update lane, read by the sensor lane in on_touch()
+    // Written by the update lane, read by the sensor lane in on_touch_begin()
     // (restart-after-game-over tap). Relaxed is sufficient: a stale read
     // only delays or duplicates a restart request.
     std::atomic<bool> game_over_{false};

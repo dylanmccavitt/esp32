@@ -28,7 +28,7 @@ public:
 
     bool on_motion(const MotionTick &tick) override;
 
-    ShellAction handle_event(AppEvent) override;
+    void on_plus_press() override;
 
     const LauncherVisual *launcher_visual() const override;
 

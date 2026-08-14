@@ -173,15 +173,12 @@ void TiltMazeApp::leave()
     portEXIT_CRITICAL(&motion_mux_);
 }
 
-ShellAction TiltMazeApp::handle_event(AppEvent event)
+void TiltMazeApp::on_plus_press()
 {
-    if (event == AppEvent::PlusPress) {
-        reset_requested_.store(true, std::memory_order_release);
-    }
-    return ShellAction::None;
+    reset_requested_.store(true, std::memory_order_release);
 }
 
-void TiltMazeApp::on_touch(const TouchEvent &event)
+void TiltMazeApp::on_touch_begin(const TouchEvent &event)
 {
     static_cast<void>(event);
     reset_requested_.store(true, std::memory_order_release);
@@ -558,26 +555,27 @@ void TiltMazeApp::draw_task_node(const SystemTaskTelemetry &task,
     // not-yet-sampled record stays on the center rail rather than inventing
     // affinity. Placement and paint are visual only, never collision input.
     int x = 120;
-    if (task.valid && task.core_id == 0) {
+    if (task.available && task.core_id == 0) {
         x = 12;
-    } else if (task.valid && task.core_id == 1) {
+    } else if (task.available && task.core_id == 1) {
         x = 228;
     }
     const int y = kTaskNodeY[index];
     const SystemTaskState state =
-        task.valid ? task.state : SystemTaskState::Unknown;
+        task.available ? task.state : SystemTaskState::Unknown;
     const uint16_t color = task_state_color(state);
     const uint32_t bounded_words =
         task.stack_high_water_words < 2048u ? task.stack_high_water_words : 2048u;
     const int fill_radius =
-        task.valid ? 1 + static_cast<int>((bounded_words * 4u) / 2048u) : 1;
+        task.available ? 1 + static_cast<int>((bounded_words * 4u) / 2048u) : 1;
 
     draw_disc(pixels, width, y0, rows, x, y, 7, kWall);
     draw_disc(pixels, width, y0, rows, x, y, fill_radius, color);
 
     // Five tiny, font-free center marks identify the fixed task order:
     // coordinator dot, sensor dash, update stem, render cross, console box.
-    const SystemTaskKind kind = task.valid ? task.kind : kTaskKinds[index];
+    const SystemTaskKind kind =
+        task.available ? task.kind : kTaskKinds[index];
     switch (kind) {
     case SystemTaskKind::Coordinator:
         draw_disc(pixels, width, y0, rows, x, y, 1, kFloor);
