@@ -238,12 +238,9 @@ void FluidBoxApp::leave()
     portEXIT_CRITICAL(&motion_mux_);
 }
 
-ShellAction FluidBoxApp::handle_event(AppEvent event)
+void FluidBoxApp::on_plus_press()
 {
-    if (event == AppEvent::PlusPress) {
-        request_fluid_reset();
-    }
-    return ShellAction::None;
+    request_fluid_reset();
 }
 
 const LauncherVisual *FluidBoxApp::launcher_visual() const
@@ -973,7 +970,7 @@ AppStats FluidBoxApp::stats()
     st.count = kParticleCount;
     st.epoch = epoch_.load(std::memory_order_relaxed);
     st.candidate_checks = walk_steps_.load(std::memory_order_relaxed);
-    st.nonfinite_resets = governor_hits_.load(std::memory_order_relaxed);
+    st.governor_hits = governor_hits_.load(std::memory_order_relaxed);
     st.physics_us = physics_us_.load(std::memory_order_relaxed);
     portENTER_CRITICAL(&motion_mux_);
     st.raw[0] = motion_.raw_accel.x;

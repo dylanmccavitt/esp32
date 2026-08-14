@@ -215,13 +215,10 @@ void AttitudeApp::leave()
     portEXIT_CRITICAL(&motion_mux_);
 }
 
-ShellAction AttitudeApp::handle_event(AppEvent event)
+void AttitudeApp::on_plus_press()
 {
-    if (event == AppEvent::PlusPress) {
-        reset_requested_.store(true, std::memory_order_release);
-        filter_.request_align();
-    }
-    return ShellAction::None;
+    reset_requested_.store(true, std::memory_order_release);
+    filter_.request_align();
 }
 
 bool AttitudeApp::on_motion(const MotionTick &tick)

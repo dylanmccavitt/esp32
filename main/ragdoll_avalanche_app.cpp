@@ -195,7 +195,7 @@ bool RagdollAvalancheApp::on_motion(const MotionTick &tick)
     return physical_accepted;
 }
 
-void RagdollAvalancheApp::on_touch(const TouchEvent &event)
+void RagdollAvalancheApp::on_touch_begin(const TouchEvent &event)
 {
     static_cast<void>(event);
     // Tap anywhere restarts after game over; ingame tap is ignored.
@@ -204,12 +204,9 @@ void RagdollAvalancheApp::on_touch(const TouchEvent &event)
     }
 }
 
-ShellAction RagdollAvalancheApp::handle_event(AppEvent event)
+void RagdollAvalancheApp::on_plus_press()
 {
-    if (event == AppEvent::PlusPress) {
-        reset_requested_.store(true, std::memory_order_release);
-    }
-    return ShellAction::None;
+    reset_requested_.store(true, std::memory_order_release);
 }
 
 void RagdollAvalancheApp::spawn_wave()

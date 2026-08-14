@@ -26,9 +26,9 @@ public:
     esp_err_t setup_once() override;
     esp_err_t enter() override;
     bool on_motion(const MotionTick &tick) override;
-    void on_touch(const TouchEvent &event) override;
+    void on_touch_begin(const TouchEvent &event) override;
     const LauncherVisual *launcher_visual() const override;
-    ShellAction handle_event(AppEvent event) override;
+    void on_plus_press() override;
     void on_system_telemetry(const SystemTelemetry &telemetry) override;
     esp_err_t update(float dt = kPhysicsDt) override;
     bool render(DisplayFrame &frame) override;
