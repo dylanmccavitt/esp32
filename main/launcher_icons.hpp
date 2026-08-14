@@ -12,4 +12,4 @@ extern const uint16_t kIconAttitude[kLauncherIconPixels];
 extern const uint16_t kIconMaze[kLauncherIconPixels];
 extern const uint16_t kIconAvalanche[kLauncherIconPixels];
 
-}  // namespace fluid_demo
+}
