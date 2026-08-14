@@ -1,5 +1,6 @@
 #include "launcher.hpp"
 
+#include "common_math.hpp"
 #include "esp_err.h"
 #include "esp_log.h"
 
@@ -8,19 +9,13 @@ namespace {
 
 constexpr char kTag[] = "launcher";
 
-// Fixed swipe-chevron art and a page-dot row make horizontal swipeability
-// visible (left swipe = next entry, right swipe = previous). The "<" sits
-// just inside the band's left edge, the ">" sits between the glyph box and
-// the PLUS, and the dots occupy one row below the band. Chevrons, dots and
-// the right plus stay secondary to the centered selected-entry icon and use
-// only fixed, allocation-free geometry.
-constexpr int kChevronCenterY = 120;  // band vertical center
-constexpr int kChevronArm = 12;       // chevron half-width
+constexpr int kChevronCenterY = 120;
+constexpr int kChevronHalfExtent = 12;
 constexpr int kChevronStroke = 2;
-constexpr int kChevronLeftApexX = 30;   // '<' apex, opens right
-constexpr int kChevronRightApexX = 178; // '>' apex, opens left
+constexpr int kChevronLeftApexX = 30;
+constexpr int kChevronRightApexX = 178;
 
-constexpr int kPageDotRowY = 208;  // below the band, on the background
+constexpr int kPageDotRowY = 208;
 constexpr int kPageDotRadius = 2;
 constexpr int kPageDotSpacing = 14;
 
@@ -29,15 +24,12 @@ constexpr int kPlusCenterY = 120;
 constexpr int kPlusHalfLength = 8;
 constexpr int kPlusHalfStroke = 2;
 
-constexpr int abs_int(int value)
-{
-    return value < 0 ? -value : value;
-}
-
 constexpr bool glyph_cell_set(const uint8_t bitmap[8], int x, int y)
 {
-    if (x < kLauncherGlyphLeft || x >= kLauncherGlyphLeft + kLauncherGlyphExtent ||
-        y < kLauncherGlyphTop || y >= kLauncherGlyphTop + kLauncherGlyphExtent) {
+    if (x < kLauncherGlyphLeft ||
+        x >= kLauncherGlyphLeft + kLauncherGlyphExtent ||
+        y < kLauncherGlyphTop ||
+        y >= kLauncherGlyphTop + kLauncherGlyphExtent) {
         return false;
     }
     const int row = (y - kLauncherGlyphTop) / kLauncherGlyphScale;
@@ -51,74 +43,61 @@ constexpr bool glyph_pixel(int x, int y)
     return glyph_cell_set(kLauncherGlyphBitmap, x, y);
 }
 
-constexpr bool chevron_left_pixel(int x, int y)
+constexpr bool chevron_pixel(int x, int y, int apex_x, int direction)
 {
-    if (y < kChevronCenterY - kChevronArm - kChevronStroke ||
-        y > kChevronCenterY + kChevronArm + kChevronStroke || x < kChevronLeftApexX) {
+    if (y < kChevronCenterY - kChevronHalfExtent - kChevronStroke ||
+        y > kChevronCenterY + kChevronHalfExtent + kChevronStroke) {
         return false;
     }
-    const int dx = x - kChevronLeftApexX;
-    if (dx > kChevronArm) {
+    const int distance_from_apex = (x - apex_x) * direction;
+    if (distance_from_apex < 0 || distance_from_apex > kChevronHalfExtent) {
         return false;
     }
-    const bool top = abs_int(y - (kChevronCenterY - dx)) < kChevronStroke;
-    const bool bottom = abs_int(y - (kChevronCenterY + dx)) < kChevronStroke;
-    return top || bottom;
+    const bool upper_arm =
+        abs_int(y - (kChevronCenterY - distance_from_apex)) < kChevronStroke;
+    const bool lower_arm =
+        abs_int(y - (kChevronCenterY + distance_from_apex)) < kChevronStroke;
+    return upper_arm || lower_arm;
 }
 
-constexpr bool chevron_right_pixel(int x, int y)
-{
-    if (y < kChevronCenterY - kChevronArm - kChevronStroke ||
-        y > kChevronCenterY + kChevronArm + kChevronStroke || x > kChevronRightApexX) {
-        return false;
-    }
-    const int dx = kChevronRightApexX - x;
-    if (dx > kChevronArm) {
-        return false;
-    }
-    const bool top = abs_int(y - (kChevronCenterY - dx)) < kChevronStroke;
-    const bool bottom = abs_int(y - (kChevronCenterY + dx)) < kChevronStroke;
-    return top || bottom;
-}
-
-/// Effective page-dot count: never zero, so a modulo by zero is impossible.
-constexpr uint32_t page_dot_count(uint32_t registry_count)
+constexpr uint32_t effective_page_count(uint32_t registry_count)
 {
     return registry_count == 0 ? 1 : registry_count;
 }
 
-/// True when (x, y) is inside any page dot (drawn in the affordance color).
-constexpr bool page_dot_any_pixel(int x, int y, uint32_t registry_count)
+constexpr bool is_page_dot_pixel(int x, int y, uint32_t registry_count)
 {
-    if (y < kPageDotRowY - kPageDotRadius || y > kPageDotRowY + kPageDotRadius) {
+    if (y < kPageDotRowY - kPageDotRadius ||
+        y > kPageDotRowY + kPageDotRadius) {
         return false;
     }
-    const uint32_t dots = page_dot_count(registry_count);
-    const int span = static_cast<int>(dots - 1) * kPageDotSpacing;
-    const int first_cx = kLauncherWidth / 2 - span / 2;
-    for (uint32_t i = 0; i < dots; ++i) {
-        if (abs_int(x - (first_cx + static_cast<int>(i) * kPageDotSpacing)) <=
-            kPageDotRadius) {
+    const uint32_t dot_count = effective_page_count(registry_count);
+    const int dot_span = static_cast<int>(dot_count - 1) * kPageDotSpacing;
+    const int first_center_x = kLauncherWidth / 2 - dot_span / 2;
+    for (uint32_t dot_index = 0; dot_index < dot_count; ++dot_index) {
+        const int center_x =
+            first_center_x + static_cast<int>(dot_index) * kPageDotSpacing;
+        if (abs_int(x - center_x) <= kPageDotRadius) {
             return true;
         }
     }
     return false;
 }
 
-/// True when (x, y) is inside the selected page dot (drawn in the accent
-/// color).
-constexpr bool page_dot_selected_pixel(int x, int y, uint32_t selected_index,
-                                       uint32_t registry_count)
+constexpr bool is_selected_page_dot_pixel(int x, int y, uint32_t selected_index,
+                                          uint32_t registry_count)
 {
-    if (y < kPageDotRowY - kPageDotRadius || y > kPageDotRowY + kPageDotRadius) {
+    if (y < kPageDotRowY - kPageDotRadius ||
+        y > kPageDotRowY + kPageDotRadius) {
         return false;
     }
-    const uint32_t dots = page_dot_count(registry_count);
-    const int span = static_cast<int>(dots - 1) * kPageDotSpacing;
-    const int first_cx = kLauncherWidth / 2 - span / 2;
-    const int cx =
-        first_cx + static_cast<int>(selected_index % dots) * kPageDotSpacing;
-    return abs_int(x - cx) <= kPageDotRadius;
+    const uint32_t dot_count = effective_page_count(registry_count);
+    const int dot_span = static_cast<int>(dot_count - 1) * kPageDotSpacing;
+    const int first_center_x = kLauncherWidth / 2 - dot_span / 2;
+    const int selected_center_x =
+        first_center_x +
+        static_cast<int>(selected_index % dot_count) * kPageDotSpacing;
+    return abs_int(x - selected_center_x) <= kPageDotRadius;
 }
 
 constexpr bool plus_pixel(int x, int y)
@@ -134,40 +113,41 @@ constexpr bool plus_pixel(int x, int y)
     return horizontal || vertical;
 }
 
-/// One logical RGB565 color per pixel for the selected entry's launcher.
-/// `selected_index` and `registry_count` drive the page-dot highlight.
-/// A null `visual` keeps the exact built-in Fluid Box launcher colors,
-/// glyph and capture probes byte-for-byte; a non-null descriptor supplies its
-/// palette and 64x64 icon.
 constexpr uint16_t logical_color_at(const LauncherVisual *visual, int x, int y,
                                     uint32_t selected_index,
                                     uint32_t registry_count)
 {
-    uint16_t color =
-        visual != nullptr ? visual->background_rgb565 : kLauncherBackgroundRgb565;
+    uint16_t color = visual != nullptr ? visual->background_rgb565
+                                       : kLauncherBackgroundRgb565;
     if (y >= kLauncherBandTop && y < kLauncherBandBottom) {
         color = visual != nullptr ? visual->band_rgb565 : kLauncherBandRgb565;
     }
-    if (chevron_left_pixel(x, y) || chevron_right_pixel(x, y)) {
-        color =
-            visual != nullptr ? visual->affordance_rgb565 : kLauncherAffordanceRgb565;
+    if (chevron_pixel(x, y, kChevronLeftApexX, 1) ||
+        chevron_pixel(x, y, kChevronRightApexX, -1)) {
+        color = visual != nullptr ? visual->affordance_rgb565
+                                  : kLauncherAffordanceRgb565;
     }
     if (plus_pixel(x, y)) {
-        color = visual != nullptr ? visual->accent_rgb565 : kLauncherAccentRgb565;
-    }
-    if (page_dot_any_pixel(x, y, registry_count)) {
         color =
-            visual != nullptr ? visual->affordance_rgb565 : kLauncherAffordanceRgb565;
-        if (page_dot_selected_pixel(x, y, selected_index, registry_count)) {
-            color = visual != nullptr ? visual->accent_rgb565 : kLauncherAccentRgb565;
+            visual != nullptr ? visual->accent_rgb565 : kLauncherAccentRgb565;
+    }
+    if (is_page_dot_pixel(x, y, registry_count)) {
+        color = visual != nullptr ? visual->affordance_rgb565
+                                  : kLauncherAffordanceRgb565;
+        if (is_selected_page_dot_pixel(x, y, selected_index, registry_count)) {
+            color = visual != nullptr ? visual->accent_rgb565
+                                      : kLauncherAccentRgb565;
         }
     }
     if (visual != nullptr && visual->icon_rgb565 != nullptr) {
-        if (x >= kLauncherGlyphLeft && x < kLauncherGlyphLeft + kLauncherIconSize &&
-            y >= kLauncherGlyphTop && y < kLauncherGlyphTop + kLauncherIconSize) {
+        if (x >= kLauncherGlyphLeft &&
+            x < kLauncherGlyphLeft + kLauncherIconSize &&
+            y >= kLauncherGlyphTop &&
+            y < kLauncherGlyphTop + kLauncherIconSize) {
             const uint16_t pixel =
-                visual->icon_rgb565[(y - kLauncherGlyphTop) * kLauncherIconSize +
-                                    (x - kLauncherGlyphLeft)];
+                visual
+                    ->icon_rgb565[(y - kLauncherGlyphTop) * kLauncherIconSize +
+                                  (x - kLauncherGlyphLeft)];
             if (pixel != kLauncherIconTransparent) {
                 color = pixel;
             }
@@ -178,40 +158,35 @@ constexpr uint16_t logical_color_at(const LauncherVisual *visual, int x, int y,
     return color;
 }
 
-// The null descriptor keeps every capture-probe pixel byte-identical to the
-// pre-split Fluid launcher: the chevrons, dots and PLUS occupy geometry the
-// probes deliberately avoid.
 static_assert(logical_color_at(nullptr, kLauncherBackgroundProbe.left,
-                               kLauncherBackgroundProbe.top, 0, 1) ==
-              kLauncherBackgroundProbe.logical_rgb565);
+                               kLauncherBackgroundProbe.top, 0,
+                               1) == kLauncherBackgroundProbe.logical_rgb565);
 static_assert(logical_color_at(nullptr, kLauncherBandProbe.left,
-                               kLauncherBandProbe.top, 0, 1) ==
-              kLauncherBandProbe.logical_rgb565);
+                               kLauncherBandProbe.top, 0,
+                               1) == kLauncherBandProbe.logical_rgb565);
 static_assert(logical_color_at(nullptr, kLauncherGlyphProbe.left,
-                               kLauncherGlyphProbe.top, 0, 1) ==
-              kLauncherGlyphProbe.logical_rgb565);
+                               kLauncherGlyphProbe.top, 0,
+                               1) == kLauncherGlyphProbe.logical_rgb565);
 
-bool fail(const char *stage, esp_err_t error)
+bool fail(const char *operation, esp_err_t error)
 {
-    ESP_LOGE(kTag, "launcher %s failed: %s", stage, esp_err_to_name(error));
+    ESP_LOGE(kTag, "launcher %s failed: %s", operation, esp_err_to_name(error));
     return false;
 }
 
 bool valid_frame(const DisplayFrame &frame)
 {
-    if (frame.width != kLauncherWidth || frame.height != kLauncherHeight ||
-        frame.stripe_rows <= 0 || frame.stripe_count <= 0 ||
-        frame.stripe_count !=
-            (kLauncherHeight + frame.stripe_rows - 1) / frame.stripe_rows ||
-        frame.stripe[0] == nullptr || frame.stripe[1] == nullptr ||
-        frame.transport == nullptr) {
-        return false;
-    }
-    return frame.ops.wait_previous != nullptr && frame.ops.latch_capture != nullptr &&
-           frame.ops.submit != nullptr && frame.ops.finish != nullptr;
+    return frame.width == kLauncherWidth && frame.height == kLauncherHeight &&
+           frame.stripe_rows > 0 && frame.stripe_count > 0 &&
+           frame.stripe_count ==
+               (kLauncherHeight + frame.stripe_rows - 1) / frame.stripe_rows &&
+           frame.stripe[0] != nullptr && frame.stripe[1] != nullptr &&
+           frame.transport != nullptr && frame.ops.wait_previous != nullptr &&
+           frame.ops.latch_capture != nullptr && frame.ops.submit != nullptr &&
+           frame.ops.finish != nullptr;
 }
 
-}  // namespace
+}
 
 bool render_launcher(DisplayFrame &frame, const LauncherVisual *visual,
                      uint32_t selected_index, uint32_t registry_count)
@@ -225,28 +200,29 @@ bool render_launcher(DisplayFrame &frame, const LauncherVisual *visual,
         return fail("wait", error);
     }
 
-    // Latch only after the carried final stripe has retired. Every following
-    // submit belongs to this one complete deterministic frame.
-    static_cast<void>(frame.ops.latch_capture(frame.transport));
+    frame.ops.latch_capture(frame.transport);
 
-    for (int stripe = 0; stripe < frame.stripe_count; ++stripe) {
-        const int y0 = stripe * frame.stripe_rows;
-        const int remaining = frame.height - y0;
-        const int rows = remaining < frame.stripe_rows ? remaining : frame.stripe_rows;
-        uint16_t *pixels = frame.stripe[stripe & 1];
+    for (int stripe_index = 0; stripe_index < frame.stripe_count;
+         ++stripe_index) {
+        const int stripe_y = stripe_index * frame.stripe_rows;
+        const int remaining_rows = frame.height - stripe_y;
+        const int stripe_rows = remaining_rows < frame.stripe_rows
+                                    ? remaining_rows
+                                    : frame.stripe_rows;
+        uint16_t *stripe_pixels = frame.stripe[stripe_index & 1];
 
-        for (int local_y = 0; local_y < rows; ++local_y) {
-            const int y = y0 + local_y;
-            uint16_t *row = pixels + local_y * frame.width;
-            for (int x = 0; x < frame.width; ++x) {
-                // This is the sole logical-RGB565 to wire-order conversion
-                // (identical for every launcher visual).
-                row[x] = __builtin_bswap16(
-                    logical_color_at(visual, x, y, selected_index, registry_count));
+        for (int local_y = 0; local_y < stripe_rows; ++local_y) {
+            const int screen_y = stripe_y + local_y;
+            uint16_t *output_row = stripe_pixels + local_y * frame.width;
+            for (int screen_x = 0; screen_x < frame.width; ++screen_x) {
+                const uint16_t logical_color = logical_color_at(
+                    visual, screen_x, screen_y, selected_index, registry_count);
+                output_row[screen_x] = __builtin_bswap16(logical_color);
             }
         }
 
-        error = frame.ops.submit(frame.transport, stripe, y0, rows, pixels);
+        error = frame.ops.submit(frame.transport, stripe_index, stripe_y,
+                                 stripe_rows, stripe_pixels);
         if (error != ESP_OK) {
             return fail("submit", error);
         }
@@ -259,4 +235,4 @@ bool render_launcher(DisplayFrame &frame, const LauncherVisual *visual,
     return true;
 }
 
-}  // namespace fluid_demo
+}
