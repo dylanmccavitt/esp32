@@ -30,34 +30,34 @@ public:
 
 private:
     struct CubeFrame {
-        uint32_t sequence = 0;
-        uint32_t epoch = 0;
-        float R[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+        float rotation_matrix[9] = {
+            1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+        };
     };
 
     struct SharedMotion {
-        Vec3 apparent{0.0f, 0.0f, 6.0f};
-        Vec3 raw{0.0f, 0.0f, 0.0f};
-        float R[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+        Vec3 apparent_acceleration{0.0f, 0.0f, 6.0f};
+        Vec3 raw_acceleration{0.0f, 0.0f, 0.0f};
+        float rotation_matrix[9] = {
+            1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+        };
         float pitch = 0.0f;
         float roll = 0.0f;
         float yaw = 0.0f;
-        bool valid = false;
     };
 
-    void fill_snapshot(CubeFrame &snapshot);
-    static void raster_stripe(const float projected[8][3], const float cam[8][3],
-                              const int order[6], const bool visible[6],
-                              uint16_t *pixels, int width, int y0, int rows);
+    static void raster_stripe(const float projected_vertices[8][3],
+                              const float camera_vertices[8][3],
+                              const int face_order[6],
+                              const bool face_visible[6], uint16_t *pixels,
+                              int width, int stripe_y, int stripe_rows);
 
-    // The current pose is Cube identity at launch/PLUS. Screen-local roll,
-    // pitch, and yaw therefore remain intuitive in both flat and handheld use.
-    AttitudeFilter filter_{AttitudeFilter::ReferenceMode::Relative};
+    // Launch and PLUS define the relative attitude identity.
+    AttitudeFilter attitude_filter_{AttitudeFilter::ReferenceMode::Relative};
     portMUX_TYPE motion_mux_ = portMUX_INITIALIZER_UNLOCKED;
     SharedMotion motion_{};
     std::atomic<bool> reset_requested_{false};
 
-    uint32_t sequence_ = 0;
     uint32_t epoch_ = 0;
     LatestFrameExchange<CubeFrame, 3> frames_;
 
@@ -71,4 +71,4 @@ private:
 
 extern OrientCubeApp s_orient_cube_app;
 
-}  // namespace fluid_demo
+}

@@ -29,42 +29,29 @@ public:
     void leave() override;
 
 private:
-    struct HorizonFrame {
-        uint32_t sequence = 0;
-        uint32_t epoch = 0;
-        float up_x = 0.0f;
-        float up_y = 1.0f;
-        float up_z = 0.0f;
+    struct LevelFrame {
         float roll = 0.0f;
         float pitch = 0.0f;
-        bool ladder_ok = true;
     };
 
     struct SharedMotion {
-        Vec3 apparent{0.0f, 0.0f, 6.0f};
-        Vec3 raw{0.0f, 0.0f, 0.0f};
-        float up_x = 0.0f;
-        float up_y = 1.0f;
-        float up_z = 0.0f;
+        Vec3 apparent_acceleration{0.0f, 0.0f, 6.0f};
+        Vec3 raw_acceleration{};
         float roll = 0.0f;
         float pitch = 0.0f;
         float yaw = 0.0f;
-        float gyro_abs = 0.0f;
-        bool valid = false;
     };
 
-    void fill_snapshot(HorizonFrame &snapshot);
-    static void raster_stripe(const HorizonFrame &horizon, uint16_t *pixels, int width,
-                              int y0, int rows);
+    static void raster_stripe(const LevelFrame &level, uint16_t *pixels,
+                              int width, int stripe_y, int stripe_rows);
 
-    AttitudeFilter filter_;
+    AttitudeFilter attitude_filter_;
     portMUX_TYPE motion_mux_ = portMUX_INITIALIZER_UNLOCKED;
     SharedMotion motion_{};
     std::atomic<bool> reset_requested_{false};
 
-    uint32_t sequence_ = 0;
     uint32_t epoch_ = 0;
-    LatestFrameExchange<HorizonFrame, 3> frames_;
+    LatestFrameExchange<LevelFrame, 3> frames_;
 
     std::atomic<uint32_t> published_epoch_{0};
     std::atomic<uint32_t> physics_us_{0};
@@ -76,4 +63,4 @@ private:
 
 extern AttitudeApp s_attitude_app;
 
-}  // namespace fluid_demo
+}
