@@ -14,9 +14,10 @@ class LatestFrameExchange {
 public:
     LatestFrameExchange()
     {
-        for (std::size_t i = 0; i < SlotCount; ++i) {
-            states_[i].store(SlotState::Free, std::memory_order_relaxed);
-            sequences_[i].store(0, std::memory_order_relaxed);
+        for (std::size_t slot_index = 0; slot_index < SlotCount; ++slot_index) {
+            states_[slot_index].store(SlotState::Free,
+                                      std::memory_order_relaxed);
+            sequences_[slot_index].store(0, std::memory_order_relaxed);
         }
     }
 
@@ -28,79 +29,89 @@ public:
         if (writing_ != nullptr) {
             return nullptr;
         }
-        for (std::size_t i = 0; i < SlotCount; ++i) {
+        for (std::size_t slot_index = 0; slot_index < SlotCount; ++slot_index) {
             SlotState expected = SlotState::Free;
-            if (states_[i].compare_exchange_strong(
+            if (states_[slot_index].compare_exchange_strong(
                     expected, SlotState::Writing, std::memory_order_acq_rel,
                     std::memory_order_relaxed)) {
-                writing_ = &frames_[i];
+                writing_ = &frames_[slot_index];
                 return writing_;
             }
         }
 
-        std::size_t oldest = SlotCount;
+        std::size_t oldest_slot = SlotCount;
         uint32_t oldest_sequence = 0;
-        for (std::size_t i = 0; i < SlotCount; ++i) {
-            if (states_[i].load(std::memory_order_acquire) != SlotState::Ready) {
+        for (std::size_t slot_index = 0; slot_index < SlotCount; ++slot_index) {
+            if (states_[slot_index].load(std::memory_order_acquire) !=
+                SlotState::Ready) {
                 continue;
             }
             const uint32_t sequence =
-                sequences_[i].load(std::memory_order_relaxed);
-            if (oldest == SlotCount || newer(oldest_sequence, sequence)) {
-                oldest = i;
+                sequences_[slot_index].load(std::memory_order_relaxed);
+            if (oldest_slot == SlotCount ||
+                sequence_is_newer(oldest_sequence, sequence)) {
+                oldest_slot = slot_index;
                 oldest_sequence = sequence;
             }
         }
-        if (oldest == SlotCount) {
+        if (oldest_slot == SlotCount) {
             return nullptr;
         }
 
         SlotState expected = SlotState::Ready;
-        if (!states_[oldest].compare_exchange_strong(
+        if (!states_[oldest_slot].compare_exchange_strong(
                 expected, SlotState::Writing, std::memory_order_acq_rel,
                 std::memory_order_relaxed)) {
             return nullptr;
         }
-        writing_ = &frames_[oldest];
+        writing_ = &frames_[oldest_slot];
         return writing_;
     }
 
     void publish(Frame *frame)
     {
-        const std::size_t index = index_of(frame);
-        if (frame != writing_ || index == SlotCount) {
+        const std::size_t slot_index = index_of(frame);
+        if (frame != writing_ || slot_index == SlotCount) {
             return;
         }
-        sequences_[index].store(frame->sequence, std::memory_order_relaxed);
-        states_[index].store(SlotState::Ready, std::memory_order_release);
+        ++last_published_sequence_;
+        if (last_published_sequence_ == 0u) {
+            last_published_sequence_ = 1u;
+        }
+        sequences_[slot_index].store(last_published_sequence_,
+                                     std::memory_order_relaxed);
+        states_[slot_index].store(SlotState::Ready, std::memory_order_release);
         writing_ = nullptr;
     }
 
     const Frame *acquire_latest()
     {
         for (int attempt = 0; attempt < 2; ++attempt) {
-            std::size_t newest = SlotCount;
+            std::size_t newest_slot = SlotCount;
             uint32_t newest_sequence = 0;
-            for (std::size_t i = 0; i < SlotCount; ++i) {
-                if (states_[i].load(std::memory_order_acquire) != SlotState::Ready) {
+            for (std::size_t slot_index = 0; slot_index < SlotCount;
+                 ++slot_index) {
+                if (states_[slot_index].load(std::memory_order_acquire) !=
+                    SlotState::Ready) {
                     continue;
                 }
                 const uint32_t sequence =
-                    sequences_[i].load(std::memory_order_relaxed);
-                if (newest == SlotCount || newer(sequence, newest_sequence)) {
-                    newest = i;
+                    sequences_[slot_index].load(std::memory_order_relaxed);
+                if (newest_slot == SlotCount ||
+                    sequence_is_newer(sequence, newest_sequence)) {
+                    newest_slot = slot_index;
                     newest_sequence = sequence;
                 }
             }
-            if (newest == SlotCount) {
+            if (newest_slot == SlotCount) {
                 return nullptr;
             }
 
             SlotState expected = SlotState::Ready;
-            if (states_[newest].compare_exchange_strong(
+            if (states_[newest_slot].compare_exchange_strong(
                     expected, SlotState::Reading, std::memory_order_acq_rel,
                     std::memory_order_relaxed)) {
-                return &frames_[newest];
+                return &frames_[newest_slot];
             }
         }
         return nullptr;
@@ -108,19 +119,20 @@ public:
 
     void release(const Frame *frame)
     {
-        const std::size_t index = index_of(frame);
-        if (index == SlotCount) {
+        const std::size_t slot_index = index_of(frame);
+        if (slot_index == SlotCount) {
             return;
         }
         SlotState expected = SlotState::Reading;
-        static_cast<void>(states_[index].compare_exchange_strong(
+        static_cast<void>(states_[slot_index].compare_exchange_strong(
             expected, SlotState::Free, std::memory_order_release,
             std::memory_order_relaxed));
     }
 
     void drain()
     {
-        for (std::size_t i = 0; i < SlotCount; ++i) {
+        for (std::size_t remaining_slots = SlotCount; remaining_slots > 0;
+             --remaining_slots) {
             const Frame *frame = acquire_latest();
             if (frame == nullptr) {
                 break;
@@ -137,16 +149,16 @@ private:
         Reading,
     };
 
-    static bool newer(uint32_t candidate, uint32_t reference)
+    static bool sequence_is_newer(uint32_t candidate, uint32_t reference)
     {
         return static_cast<int32_t>(candidate - reference) > 0;
     }
 
     std::size_t index_of(const Frame *frame) const
     {
-        for (std::size_t i = 0; i < SlotCount; ++i) {
-            if (frame == &frames_[i]) {
-                return i;
+        for (std::size_t slot_index = 0; slot_index < SlotCount; ++slot_index) {
+            if (frame == &frames_[slot_index]) {
+                return slot_index;
             }
         }
         return SlotCount;
@@ -156,6 +168,7 @@ private:
     std::array<std::atomic<SlotState>, SlotCount> states_{};
     std::array<std::atomic<uint32_t>, SlotCount> sequences_{};
     Frame *writing_ = nullptr;
+    uint32_t last_published_sequence_ = 0;
 };
 
-}  // namespace fluid_demo
+}

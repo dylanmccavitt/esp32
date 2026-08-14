@@ -8,4 +8,4 @@ struct Vec3 {
     float z;
 };
 
-}  // namespace fluid_demo
+}
