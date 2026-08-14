@@ -4,25 +4,25 @@
 #include <cmath>
 #include <cstdint>
 
+#include "common_math.hpp"
+
 namespace fluid_demo {
 namespace {
 
-constexpr float kDtMin = 1e-4f;
-constexpr float kDtMax = 0.1f;
-constexpr float kMinGravityMag = 0.05f * AttitudeFilter::kOneG;
-constexpr float kMaxAccelMag = 5.0f * AttitudeFilter::kOneG;
-constexpr float kEps = 1e-6f;
-constexpr float kComplementaryTau = 0.35f;
-constexpr float kOverrideTau = 0.04f;
-// Seed from a plausibly stationary alignment sample, but only adapt an
-// established bias when residual motion is below normal deliberate hand motion.
-constexpr float kGyroBiasSeedMax = 0.12f;
-constexpr float kGyroBiasAdaptMax = 0.04f;
-constexpr float kGyroBiasTau = 1.5f;
-constexpr float kGainMin = 0.0f;
-constexpr float kGainMax = 4.0f;
-constexpr float kTauMin = 0.05f;
-constexpr float kTauMax = 2.0f;
+constexpr float kMinimumDeltaTime = 1e-4f;
+constexpr float kMaximumDeltaTime = 0.1f;
+constexpr float kMinimumGravityMagnitude = 0.05f * AttitudeFilter::kOneG;
+constexpr float kMaximumAccelerationMagnitude = 5.0f * AttitudeFilter::kOneG;
+constexpr float kNormalizationEpsilon = 1e-6f;
+constexpr float kComplementaryTimeConstant = 0.35f;
+constexpr float kOverrideTimeConstant = 0.04f;
+constexpr float kMaximumInitialGyroscopeBiasMagnitude = 0.12f;
+constexpr float kMaximumGyroscopeBiasAdaptationMagnitude = 0.04f;
+constexpr float kGyroscopeBiasTimeConstant = 1.5f;
+constexpr float kMinimumDisplayGain = 0.0f;
+constexpr float kMaximumDisplayGain = 4.0f;
+constexpr float kMinimumCorrectionTimeConstant = 0.05f;
+constexpr float kMaximumCorrectionTimeConstant = 2.0f;
 
 constexpr uint32_t kAxisXPositive = 1u << 0;
 constexpr uint32_t kAxisYPositive = 1u << 1;
@@ -32,240 +32,253 @@ constexpr uint32_t kAxisSignMask =
 constexpr uint32_t kAxisGenerationStep = 1u << 3;
 constexpr uint32_t kAxisGenerationMask = ~kAxisSignMask;
 
-constexpr int axis_sign(uint32_t config, uint32_t positive_bit)
+constexpr int axis_direction(uint32_t config, uint32_t positive_bit)
 {
     return (config & positive_bit) != 0u ? 1 : -1;
 }
 
 std::atomic<float> s_yaw_request{0.0f};
-std::atomic<uint32_t> s_axes_config{kAxisGenerationStep | kAxisXPositive};
-std::atomic<float> s_gain{1.0f};
-std::atomic<float> s_tau{kComplementaryTau};
+std::atomic<uint32_t> s_axes_configuration{kAxisGenerationStep |
+                                           kAxisXPositive};
+std::atomic<float> s_display_gain{1.0f};
+std::atomic<float> s_correction_time_constant{kComplementaryTimeConstant};
 
-}  // namespace
-
-Vec3 AttitudeFilter::map_box(const Vec3 &v, uint32_t axes_config)
-{
-    return {static_cast<float>(axis_sign(axes_config, kAxisXPositive)) * v.x,
-            static_cast<float>(axis_sign(axes_config, kAxisYPositive)) * v.y,
-            static_cast<float>(axis_sign(axes_config, kAxisZPositive)) * v.z};
 }
 
-bool AttitudeFilter::finite_vec(const Vec3 &v)
+Vec3 AttitudeFilter::map_to_box_frame(const Vec3 &vector, uint32_t axes_config)
 {
-    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+    return {
+        static_cast<float>(axis_direction(axes_config, kAxisXPositive)) *
+            vector.x,
+        static_cast<float>(axis_direction(axes_config, kAxisYPositive)) *
+            vector.y,
+        static_cast<float>(axis_direction(axes_config, kAxisZPositive)) *
+            vector.z,
+    };
 }
 
-bool AttitudeFilter::finite_quat(const Quat &q)
+bool AttitudeFilter::finite_quaternion(const Quaternion &quaternion)
 {
-    return std::isfinite(q.w) && std::isfinite(q.x) && std::isfinite(q.y) &&
-           std::isfinite(q.z);
+    return std::isfinite(quaternion.w) && std::isfinite(quaternion.x) &&
+           std::isfinite(quaternion.y) && std::isfinite(quaternion.z);
 }
 
-float AttitudeFilter::clampf(float v, float lo, float hi)
+float AttitudeFilter::vector_length(const Vec3 &vector)
 {
-    if (v < lo) {
-        return lo;
-    }
-    if (v > hi) {
-        return hi;
-    }
-    return v;
+    return std::sqrt(vector.x * vector.x + vector.y * vector.y +
+                     vector.z * vector.z);
 }
 
-float AttitudeFilter::vec_length(const Vec3 &v)
+Vec3 AttitudeFilter::vector_cross(const Vec3 &left, const Vec3 &right)
 {
-    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    return {
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x,
+    };
 }
 
-Vec3 AttitudeFilter::vec_scale(const Vec3 &v, float s)
+float AttitudeFilter::vector_dot(const Vec3 &left, const Vec3 &right)
 {
-    return {v.x * s, v.y * s, v.z * s};
+    return left.x * right.x + left.y * right.y + left.z * right.z;
 }
 
-Vec3 AttitudeFilter::vec_cross(const Vec3 &a, const Vec3 &b)
+bool AttitudeFilter::normalize_vector(Vec3 &vector)
 {
-    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
-}
-
-float AttitudeFilter::vec_dot(const Vec3 &a, const Vec3 &b)
-{
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-bool AttitudeFilter::vec_normalize(Vec3 &v)
-{
-    const float mag = vec_length(v);
-    if (!std::isfinite(mag) || mag < kEps) {
+    const float magnitude = vector_length(vector);
+    if (!std::isfinite(magnitude) || magnitude < kNormalizationEpsilon) {
         return false;
     }
-    v.x /= mag;
-    v.y /= mag;
-    v.z /= mag;
-    return finite_vec(v);
+    vector.x /= magnitude;
+    vector.y /= magnitude;
+    vector.z /= magnitude;
+    return finite_vec(vector);
 }
 
-AttitudeFilter::Quat AttitudeFilter::quat_mul(const Quat &a, const Quat &b)
+AttitudeFilter::Quaternion
+AttitudeFilter::multiply_quaternions(const Quaternion &left,
+                                     const Quaternion &right)
 {
-    return {a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w};
+    return {
+        left.w * right.w - left.x * right.x - left.y * right.y -
+            left.z * right.z,
+        left.w * right.x + left.x * right.w + left.y * right.z -
+            left.z * right.y,
+        left.w * right.y - left.x * right.z + left.y * right.w +
+            left.z * right.x,
+        left.w * right.z + left.x * right.y - left.y * right.x +
+            left.z * right.w,
+    };
 }
 
-AttitudeFilter::Quat AttitudeFilter::quat_conj(const Quat &q)
+AttitudeFilter::Quaternion
+AttitudeFilter::quaternion_conjugate(const Quaternion &quaternion)
 {
-    return {q.w, -q.x, -q.y, -q.z};
+    return {
+        quaternion.w,
+        -quaternion.x,
+        -quaternion.y,
+        -quaternion.z,
+    };
 }
 
-bool AttitudeFilter::quat_normalize(Quat &q)
+bool AttitudeFilter::normalize_quaternion(Quaternion &quaternion)
 {
-    const float mag = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
-    if (!std::isfinite(mag) || mag < kEps) {
+    const float magnitude =
+        std::sqrt(quaternion.w * quaternion.w + quaternion.x * quaternion.x +
+                  quaternion.y * quaternion.y + quaternion.z * quaternion.z);
+    if (!std::isfinite(magnitude) || magnitude < kNormalizationEpsilon) {
         return false;
     }
-    q.w /= mag;
-    q.x /= mag;
-    q.y /= mag;
-    q.z /= mag;
-    return finite_quat(q);
+    quaternion.w /= magnitude;
+    quaternion.x /= magnitude;
+    quaternion.y /= magnitude;
+    quaternion.z /= magnitude;
+    return finite_quaternion(quaternion);
 }
 
-Vec3 AttitudeFilter::rotate(const Quat &q, const Vec3 &v)
+Vec3 AttitudeFilter::rotate(const Quaternion &quaternion, const Vec3 &vector)
 {
-    const Vec3 u{q.x, q.y, q.z};
-    const Vec3 uv = vec_cross(u, v);
-    const Vec3 uuv = vec_cross(u, uv);
-    return {v.x + 2.0f * (q.w * uv.x + uuv.x),
-            v.y + 2.0f * (q.w * uv.y + uuv.y),
-            v.z + 2.0f * (q.w * uv.z + uuv.z)};
+    const Vec3 rotation_axis{
+        quaternion.x,
+        quaternion.y,
+        quaternion.z,
+    };
+    const Vec3 first_cross = vector_cross(rotation_axis, vector);
+    const Vec3 second_cross = vector_cross(rotation_axis, first_cross);
+    return {
+        vector.x + 2.0f * (quaternion.w * first_cross.x + second_cross.x),
+        vector.y + 2.0f * (quaternion.w * first_cross.y + second_cross.y),
+        vector.z + 2.0f * (quaternion.w * first_cross.z + second_cross.z),
+    };
 }
 
-AttitudeFilter::Quat AttitudeFilter::quat_between(const Vec3 &from, const Vec3 &to)
+AttitudeFilter::Quaternion AttitudeFilter::rotation_between(const Vec3 &from,
+                                                            const Vec3 &to)
 {
-    const float d = clampf(vec_dot(from, to), -1.0f, 1.0f);
-    const Vec3 c = vec_cross(from, to);
-    Quat q{d + 1.0f, c.x, c.y, c.z};
-    if (quat_normalize(q)) {
-        return q;
+    const float dot_product = clamp_float(vector_dot(from, to), -1.0f, 1.0f);
+    const Vec3 cross_product = vector_cross(from, to);
+    Quaternion rotation{
+        dot_product + 1.0f,
+        cross_product.x,
+        cross_product.y,
+        cross_product.z,
+    };
+    if (normalize_quaternion(rotation)) {
+        return rotation;
     }
 
-    Vec3 axis = vec_cross(from, {1.0f, 0.0f, 0.0f});
-    if (vec_length(axis) < 1e-3f) {
-        axis = vec_cross(from, {0.0f, 1.0f, 0.0f});
+    Vec3 perpendicular_axis = vector_cross(from, {1.0f, 0.0f, 0.0f});
+    if (vector_length(perpendicular_axis) < 1e-3f) {
+        perpendicular_axis = vector_cross(from, {0.0f, 1.0f, 0.0f});
     }
-    if (!vec_normalize(axis)) {
+    if (!normalize_vector(perpendicular_axis)) {
         return {};
     }
-    return {0.0f, axis.x, axis.y, axis.z};
+    return {
+        0.0f,
+        perpendicular_axis.x,
+        perpendicular_axis.y,
+        perpendicular_axis.z,
+    };
 }
 
-AttitudeFilter::Quat AttitudeFilter::scale_rotation(const Quat &q, float gain)
+AttitudeFilter::Quaternion
+AttitudeFilter::scale_rotation(const Quaternion &rotation, float gain)
 {
-    const float w = clampf(q.w, -1.0f, 1.0f);
-    const float half = std::acos(w);
-    const float mag = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
-    if (mag < kEps || half < 1e-6f) {
+    const float clamped_scalar = clamp_float(rotation.w, -1.0f, 1.0f);
+    const float half_angle = std::acos(clamped_scalar);
+    const float vector_magnitude =
+        std::sqrt(rotation.x * rotation.x + rotation.y * rotation.y +
+                  rotation.z * rotation.z);
+    if (vector_magnitude < kNormalizationEpsilon || half_angle < 1e-6f) {
         return {};
     }
-    const float new_half = gain * half;
-    const float s = std::sin(new_half) / mag;
-    Quat out{std::cos(new_half), q.x * s, q.y * s, q.z * s};
-    if (!quat_normalize(out)) {
+    const float scaled_half_angle = gain * half_angle;
+    const float vector_scale = std::sin(scaled_half_angle) / vector_magnitude;
+    Quaternion scaled_rotation{
+        std::cos(scaled_half_angle),
+        rotation.x * vector_scale,
+        rotation.y * vector_scale,
+        rotation.z * vector_scale,
+    };
+    if (!normalize_quaternion(scaled_rotation)) {
         return {};
     }
-    return out;
+    return scaled_rotation;
 }
 
-void AttitudeFilter::quat_to_matrix(const Quat &q, float out[9])
+void AttitudeFilter::quaternion_to_matrix(const Quaternion &quaternion,
+                                          float matrix[9])
 {
-    const float xx = q.x * q.x;
-    const float yy = q.y * q.y;
-    const float zz = q.z * q.z;
-    const float xy = q.x * q.y;
-    const float xz = q.x * q.z;
-    const float yz = q.y * q.z;
-    const float wx = q.w * q.x;
-    const float wy = q.w * q.y;
-    const float wz = q.w * q.z;
-    out[0] = 1.0f - 2.0f * (yy + zz);
-    out[1] = 2.0f * (xy - wz);
-    out[2] = 2.0f * (xz + wy);
-    out[3] = 2.0f * (xy + wz);
-    out[4] = 1.0f - 2.0f * (xx + zz);
-    out[5] = 2.0f * (yz - wx);
-    out[6] = 2.0f * (xz - wy);
-    out[7] = 2.0f * (yz + wx);
-    out[8] = 1.0f - 2.0f * (xx + yy);
+    const float xx = quaternion.x * quaternion.x;
+    const float yy = quaternion.y * quaternion.y;
+    const float zz = quaternion.z * quaternion.z;
+    const float xy = quaternion.x * quaternion.y;
+    const float xz = quaternion.x * quaternion.z;
+    const float yz = quaternion.y * quaternion.z;
+    const float wx = quaternion.w * quaternion.x;
+    const float wy = quaternion.w * quaternion.y;
+    const float wz = quaternion.w * quaternion.z;
+    matrix[0] = 1.0f - 2.0f * (yy + zz);
+    matrix[1] = 2.0f * (xy - wz);
+    matrix[2] = 2.0f * (xz + wy);
+    matrix[3] = 2.0f * (xy + wz);
+    matrix[4] = 1.0f - 2.0f * (xx + zz);
+    matrix[5] = 2.0f * (yz - wx);
+    matrix[6] = 2.0f * (xz - wy);
+    matrix[7] = 2.0f * (yz + wx);
+    matrix[8] = 1.0f - 2.0f * (xx + yy);
 }
 
-bool AttitudeFilter::valid_gravity(const Vec3 &v) const
+bool AttitudeFilter::valid_gravity_sample(const Vec3 &acceleration) const
 {
-    if (!finite_vec(v)) {
+    if (!finite_vec(acceleration)) {
         return false;
     }
-    const float mag = vec_length(v);
-    return mag >= kMinGravityMag && mag <= kMaxAccelMag;
+    const float magnitude = vector_length(acceleration);
+    return magnitude >= kMinimumGravityMagnitude &&
+           magnitude <= kMaximumAccelerationMagnitude;
+}
+
+void AttitudeFilter::reset_state()
+{
+    orientation_ = {};
+    reference_orientation_ = {};
+    rotation_matrix_[0] = 1.0f;
+    rotation_matrix_[1] = 0.0f;
+    rotation_matrix_[2] = 0.0f;
+    rotation_matrix_[3] = 0.0f;
+    rotation_matrix_[4] = 1.0f;
+    rotation_matrix_[5] = 0.0f;
+    rotation_matrix_[6] = 0.0f;
+    rotation_matrix_[7] = 0.0f;
+    rotation_matrix_[8] = 1.0f;
+    world_gravity_ = {0.0f, 0.0f, kOneG};
+    mapped_acceleration_ = {};
+    pitch_ = 0.0f;
+    roll_ = 0.0f;
+    yaw_ = 0.0f;
+    gyro_bias_ = {};
+    has_reference_ = false;
+    last_sample_was_accepted_ = false;
+    alignment_pending_.store(true, std::memory_order_release);
 }
 
 void AttitudeFilter::hard_reset()
 {
-    q_ = {};
-    q_ref_ = {};
-    R_[0] = 1.0f;
-    R_[1] = 0.0f;
-    R_[2] = 0.0f;
-    R_[3] = 0.0f;
-    R_[4] = 1.0f;
-    R_[5] = 0.0f;
-    R_[6] = 0.0f;
-    R_[7] = 0.0f;
-    R_[8] = 1.0f;
-    g_world_ = {0.0f, 0.0f, kOneG};
-    up_ = {0.0f, 1.0f, 0.0f};
-    mapped_ = {};
-    raw_accel_ = {};
-    pitch_ = 0.0f;
-    roll_ = 0.0f;
-    yaw_ = 0.0f;
-    gyro_abs_ = 0.0f;
-    gyro_bias_ = {};
-    have_ref_ = false;
-    accepted_last_ = false;
     ++nonfinite_resets_;
-    align_pending_.store(true, std::memory_order_release);
+    reset_state();
 }
 
 void AttitudeFilter::reset()
 {
-    q_ = {};
-    q_ref_ = {};
-    R_[0] = 1.0f;
-    R_[1] = 0.0f;
-    R_[2] = 0.0f;
-    R_[3] = 0.0f;
-    R_[4] = 1.0f;
-    R_[5] = 0.0f;
-    R_[6] = 0.0f;
-    R_[7] = 0.0f;
-    R_[8] = 1.0f;
-    g_world_ = {0.0f, 0.0f, kOneG};
-    up_ = {0.0f, 1.0f, 0.0f};
-    mapped_ = {};
-    raw_accel_ = {};
-    pitch_ = 0.0f;
-    roll_ = 0.0f;
-    yaw_ = 0.0f;
-    gyro_abs_ = 0.0f;
-    gyro_bias_ = {};
-    have_ref_ = false;
-    accepted_last_ = false;
-    align_pending_.store(true, std::memory_order_release);
+    reset_state();
 }
 
 void AttitudeFilter::request_align()
 {
-    align_pending_.store(true, std::memory_order_release);
+    alignment_pending_.store(true, std::memory_order_release);
 }
 
 void AttitudeFilter::request_yaw(float radians)
@@ -276,24 +289,26 @@ void AttitudeFilter::request_yaw(float radians)
     s_yaw_request.store(radians, std::memory_order_release);
 }
 
-void AttitudeFilter::set_axes(int sx, int sy, int sz)
+void AttitudeFilter::set_axes(int x_sign, int y_sign, int z_sign)
 {
-    if ((sx != 1 && sx != -1) || (sy != 1 && sy != -1) || (sz != 1 && sz != -1)) {
+    if ((x_sign != 1 && x_sign != -1) || (y_sign != 1 && y_sign != -1) ||
+        (z_sign != 1 && z_sign != -1)) {
         return;
     }
-    const uint32_t signs =
-        (sx > 0 ? kAxisXPositive : 0u) |
-        (sy > 0 ? kAxisYPositive : 0u) |
-        (sz > 0 ? kAxisZPositive : 0u);
-    uint32_t current = s_axes_config.load(std::memory_order_relaxed);
+    const uint32_t axis_signs = (x_sign > 0 ? kAxisXPositive : 0u) |
+                                (y_sign > 0 ? kAxisYPositive : 0u) |
+                                (z_sign > 0 ? kAxisZPositive : 0u);
+    uint32_t current_configuration =
+        s_axes_configuration.load(std::memory_order_relaxed);
     for (;;) {
-        const uint32_t generation =
-            ((current & kAxisGenerationMask) + kAxisGenerationStep) &
+        const uint32_t next_generation =
+            ((current_configuration & kAxisGenerationMask) +
+             kAxisGenerationStep) &
             kAxisGenerationMask;
-        const uint32_t next = generation | signs;
-        if (s_axes_config.compare_exchange_weak(
-                current, next, std::memory_order_release,
-                std::memory_order_relaxed)) {
+        const uint32_t next_configuration = next_generation | axis_signs;
+        if (s_axes_configuration.compare_exchange_weak(
+                current_configuration, next_configuration,
+                std::memory_order_release, std::memory_order_relaxed)) {
             return;
         }
     }
@@ -304,7 +319,9 @@ void AttitudeFilter::set_gain(float gain)
     if (!std::isfinite(gain)) {
         return;
     }
-    s_gain.store(clampf(gain, kGainMin, kGainMax), std::memory_order_relaxed);
+    s_display_gain.store(
+        clamp_float(gain, kMinimumDisplayGain, kMaximumDisplayGain),
+        std::memory_order_relaxed);
 }
 
 void AttitudeFilter::set_tau(float seconds)
@@ -312,102 +329,117 @@ void AttitudeFilter::set_tau(float seconds)
     if (!std::isfinite(seconds)) {
         return;
     }
-    s_tau.store(clampf(seconds, kTauMin, kTauMax), std::memory_order_relaxed);
+    s_correction_time_constant.store(
+        clamp_float(seconds, kMinimumCorrectionTimeConstant,
+                    kMaximumCorrectionTimeConstant),
+        std::memory_order_relaxed);
 }
 
-void AttitudeFilter::axes(int *sx, int *sy, int *sz)
+void AttitudeFilter::axes(int *x_sign, int *y_sign, int *z_sign)
 {
-    const uint32_t config = s_axes_config.load(std::memory_order_acquire);
-    if (sx != nullptr) {
-        *sx = axis_sign(config, kAxisXPositive);
+    const uint32_t config =
+        s_axes_configuration.load(std::memory_order_acquire);
+    if (x_sign != nullptr) {
+        *x_sign = axis_direction(config, kAxisXPositive);
     }
-    if (sy != nullptr) {
-        *sy = axis_sign(config, kAxisYPositive);
+    if (y_sign != nullptr) {
+        *y_sign = axis_direction(config, kAxisYPositive);
     }
-    if (sz != nullptr) {
-        *sz = axis_sign(config, kAxisZPositive);
+    if (z_sign != nullptr) {
+        *z_sign = axis_direction(config, kAxisZPositive);
     }
 }
 
 float AttitudeFilter::gain()
 {
-    return s_gain.load(std::memory_order_relaxed);
+    return s_display_gain.load(std::memory_order_relaxed);
 }
 
 float AttitudeFilter::tau()
 {
-    return s_tau.load(std::memory_order_relaxed);
+    return s_correction_time_constant.load(std::memory_order_relaxed);
 }
 
 void AttitudeFilter::apply_yaw(float radians)
 {
-    const float half = 0.5f * radians;
-    Quat dq{std::cos(half), 0.0f, std::sin(half), 0.0f};
-    if (!quat_normalize(dq)) {
+    const float half_angle = 0.5f * radians;
+    Quaternion yaw_rotation{
+        std::cos(half_angle),
+        0.0f,
+        std::sin(half_angle),
+        0.0f,
+    };
+    if (!normalize_quaternion(yaw_rotation)) {
         return;
     }
-    q_ = quat_mul(q_, dq);
-    if (!quat_normalize(q_)) {
+    orientation_ = multiply_quaternions(orientation_, yaw_rotation);
+    if (!normalize_quaternion(orientation_)) {
         hard_reset();
         return;
     }
-    recompute();
+    recompute_outputs();
 }
 
 void AttitudeFilter::consume_yaw_request()
 {
-    const float yaw = s_yaw_request.exchange(0.0f, std::memory_order_acq_rel);
-    if (yaw == 0.0f || !std::isfinite(yaw) || !have_ref_) {
+    const float requested_yaw =
+        s_yaw_request.exchange(0.0f, std::memory_order_acq_rel);
+    if (requested_yaw == 0.0f || !std::isfinite(requested_yaw) ||
+        !has_reference_) {
         return;
     }
-    apply_yaw(yaw);
+    apply_yaw(requested_yaw);
 }
 
-void AttitudeFilter::maybe_axes_realign(uint32_t axes_config)
+void AttitudeFilter::handle_axes_change(uint32_t axes_config)
 {
     const uint32_t generation = axes_config & kAxisGenerationMask;
-    if (generation != axes_gen_) {
-        axes_gen_ = generation;
-        align_pending_.store(true, std::memory_order_release);
+    if (generation != axes_generation_) {
+        axes_generation_ = generation;
+        alignment_pending_.store(true, std::memory_order_release);
     }
 }
 
-void AttitudeFilter::recompute()
+void AttitudeFilter::recompute_outputs()
 {
-    Quat q_disp = quat_mul(quat_conj(q_ref_), q_);
-    if (!quat_normalize(q_disp)) {
+    Quaternion display_orientation = multiply_quaternions(
+        quaternion_conjugate(reference_orientation_), orientation_);
+    if (!normalize_quaternion(display_orientation)) {
         hard_reset();
         return;
     }
 
-    // Gravity-aligned attitude must remain a one-to-one physical pose. Scaling
-    // a full orientation aliases ordinary 90-degree turns (gain 4 => 360
-    // degrees), so gain is intentionally limited to relative displays.
+    // Scaling absolute orientation aliases distinct physical poses.
     if (reference_mode_ == ReferenceMode::Relative) {
-        const float gain = s_gain.load(std::memory_order_relaxed);
-        if (std::fabs(gain - 1.0f) > 1e-6f) {
-            q_disp = scale_rotation(q_disp, gain);
-            if (!quat_normalize(q_disp)) {
+        const float display_gain =
+            s_display_gain.load(std::memory_order_relaxed);
+        if (std::fabs(display_gain - 1.0f) > 1e-6f) {
+            display_orientation =
+                scale_rotation(display_orientation, display_gain);
+            if (!normalize_quaternion(display_orientation)) {
                 hard_reset();
                 return;
             }
         }
     }
 
-    quat_to_matrix(q_disp, R_);
+    quaternion_to_matrix(display_orientation, rotation_matrix_);
 
-    // Board +Y is screen-up (USB at -Y). Relative identity => up = (0,1,0).
-    up_ = rotate(q_disp, {0.0f, 1.0f, 0.0f});
-    if (!finite_vec(up_)) {
+    const Vec3 screen_up = rotate(display_orientation, {0.0f, 1.0f, 0.0f});
+    if (!finite_vec(screen_up)) {
         hard_reset();
         return;
     }
 
-    const float uxy = std::sqrt(up_.x * up_.x + up_.y * up_.y);
-    roll_ = std::atan2(up_.x, up_.y);
-    pitch_ = std::atan2(up_.z, uxy);
-    yaw_ = std::atan2(2.0f * (q_disp.w * q_disp.y + q_disp.x * q_disp.z),
-                      1.0f - 2.0f * (q_disp.y * q_disp.y + q_disp.z * q_disp.z));
+    const float horizontal_up_magnitude =
+        std::sqrt(screen_up.x * screen_up.x + screen_up.y * screen_up.y);
+    roll_ = std::atan2(screen_up.x, screen_up.y);
+    pitch_ = std::atan2(screen_up.z, horizontal_up_magnitude);
+    yaw_ = std::atan2(
+        2.0f * (display_orientation.w * display_orientation.y +
+                display_orientation.x * display_orientation.z),
+        1.0f - 2.0f * (display_orientation.y * display_orientation.y +
+                       display_orientation.z * display_orientation.z));
     if (!std::isfinite(roll_)) {
         roll_ = 0.0f;
     }
@@ -419,175 +451,186 @@ void AttitudeFilter::recompute()
     }
 }
 
-void AttitudeFilter::init_world(const Vec3 &g_meas)
+void AttitudeFilter::initialize_world_reference(const Vec3 &measured_gravity)
 {
-    q_ref_ = {};
+    reference_orientation_ = {};
     if (reference_mode_ == ReferenceMode::Relative) {
-        q_ = {};
-        g_world_ = g_meas;
+        orientation_ = {};
+        world_gravity_ = measured_gravity;
     } else {
-        // The renderer's identity pose is the physical board lying screen-up,
-        // so mapped +Z is the fixed world-gravity direction. Using screen +Y
-        // here would make a flat board appear rotated by 90 degrees.
-        Vec3 measured = g_meas;
-        Vec3 gravity{0.0f, 0.0f, 1.0f};
-        if (!vec_normalize(measured)) {
+        Vec3 measured_direction = measured_gravity;
+        Vec3 world_gravity_direction{0.0f, 0.0f, 1.0f};
+        if (!normalize_vector(measured_direction)) {
             hard_reset();
             return;
         }
-        q_ = quat_between(measured, gravity);
-        if (!quat_normalize(q_)) {
+        orientation_ =
+            rotation_between(measured_direction, world_gravity_direction);
+        if (!normalize_quaternion(orientation_)) {
             hard_reset();
             return;
         }
-        g_world_ = {0.0f, 0.0f, kOneG};
+        world_gravity_ = {0.0f, 0.0f, kOneG};
     }
-    have_ref_ = true;
-    gyro_abs_ = 0.0f;
-    recompute();
+    has_reference_ = true;
+    recompute_outputs();
 }
 
-void AttitudeFilter::pull_toward_gravity(const Vec3 &g_meas, float alpha)
+void AttitudeFilter::pull_toward_gravity(const Vec3 &measured_gravity,
+                                         float correction_gain)
 {
-    // Tilt-only: rotate world so estimated gravity matches the active
-    // reference. The shortest-arc correction has no component around gravity,
-    // so yaw stays gyro-only.
-    Vec3 meas = g_meas;
-    Vec3 g_world = g_world_;
-    if (!vec_normalize(meas) || !vec_normalize(g_world)) {
+    // Shortest-arc gravity correction leaves yaw gyro-only.
+    Vec3 measured_direction = measured_gravity;
+    Vec3 target_direction = world_gravity_;
+    if (!normalize_vector(measured_direction) ||
+        !normalize_vector(target_direction)) {
         return;
     }
-    Vec3 g_est = rotate(q_, meas);
-    if (!vec_normalize(g_est)) {
+    Vec3 estimated_direction = rotate(orientation_, measured_direction);
+    if (!normalize_vector(estimated_direction)) {
         return;
     }
-    const float d = vec_dot(g_est, g_world);
-    if (d > 0.999999f) {
+    const float alignment = vector_dot(estimated_direction, target_direction);
+    if (alignment > 0.999999f) {
         return;
     }
-    Quat delta = quat_between(g_est, g_world);
-    if (alpha < 0.999f) {
-        delta.w = 1.0f + alpha * (delta.w - 1.0f);
-        delta.x *= alpha;
-        delta.y *= alpha;
-        delta.z *= alpha;
-        if (!quat_normalize(delta)) {
+    Quaternion correction =
+        rotation_between(estimated_direction, target_direction);
+    if (correction_gain < 0.999f) {
+        correction.w = 1.0f + correction_gain * (correction.w - 1.0f);
+        correction.x *= correction_gain;
+        correction.y *= correction_gain;
+        correction.z *= correction_gain;
+        if (!normalize_quaternion(correction)) {
             return;
         }
     }
-    q_ = quat_mul(delta, q_);
-    if (!quat_normalize(q_)) {
+    orientation_ = multiply_quaternions(correction, orientation_);
+    if (!normalize_quaternion(orientation_)) {
         hard_reset();
     }
 }
 
-bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float dt)
+bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads,
+                            float dt)
 {
-    accepted_last_ = false;
+    last_sample_was_accepted_ = false;
     const uint32_t axes_config =
-        s_axes_config.load(std::memory_order_acquire);
-    maybe_axes_realign(axes_config);
-    if (!valid_gravity(accel_mps2) || !finite_vec(gyro_rads) || !std::isfinite(dt) ||
-        dt <= 0.0f) {
+        s_axes_configuration.load(std::memory_order_acquire);
+    handle_axes_change(axes_config);
+    if (!valid_gravity_sample(accel_mps2) || !finite_vec(gyro_rads) ||
+        !std::isfinite(dt) || dt <= 0.0f) {
         return false;
     }
 
-    const Vec3 mapped = map_box(accel_mps2, axes_config);
-    const Vec3 gyro = map_box(gyro_rads, axes_config);
-    if (!valid_gravity(mapped) || !finite_vec(gyro)) {
+    const Vec3 mapped_acceleration = map_to_box_frame(accel_mps2, axes_config);
+    const Vec3 mapped_angular_rate = map_to_box_frame(gyro_rads, axes_config);
+    if (!valid_gravity_sample(mapped_acceleration) ||
+        !finite_vec(mapped_angular_rate)) {
         return false;
     }
 
-    const float clamped_dt = clampf(dt, kDtMin, kDtMax);
-    const float raw_gyro_abs = vec_length(gyro);
-    gyro_abs_ = raw_gyro_abs;
-    mapped_ = mapped;
-    raw_accel_ = accel_mps2;
-    accepted_last_ = true;
+    const float clamped_dt =
+        clamp_float(dt, kMinimumDeltaTime, kMaximumDeltaTime);
+    const float angular_rate_magnitude = vector_length(mapped_angular_rate);
+    mapped_acceleration_ = mapped_acceleration;
+    last_sample_was_accepted_ = true;
 
-    const bool align = align_pending_.exchange(false, std::memory_order_acq_rel);
-    if (!have_ref_ || align) {
-        // Alignment is the explicit stationary reference point. Seed the
-        // hardware offset only from a low-rate sample; a moving sample starts
-        // unbiased and gravity still supplies roll/pitch.
-        init_world(mapped);
-        gyro_bias_ = raw_gyro_abs < kGyroBiasSeedMax ? gyro : Vec3{};
+    const bool alignment_requested =
+        alignment_pending_.exchange(false, std::memory_order_acq_rel);
+    if (!has_reference_ || alignment_requested) {
+        initialize_world_reference(mapped_acceleration);
+        gyro_bias_ =
+            angular_rate_magnitude < kMaximumInitialGyroscopeBiasMagnitude
+                ? mapped_angular_rate
+                : Vec3{};
         consume_yaw_request();
         return true;
     }
 
-    Vec3 gyro_corr{gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
-                   gyro.z - gyro_bias_.z};
-    float corr_abs = vec_length(gyro_corr);
-    if (corr_abs < kGyroBiasAdaptMax) {
-        const float blend = 1.0f - std::exp(-clamped_dt / kGyroBiasTau);
-        gyro_bias_.x += blend * gyro_corr.x;
-        gyro_bias_.y += blend * gyro_corr.y;
-        gyro_bias_.z += blend * gyro_corr.z;
-        gyro_corr = {gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
-                     gyro.z - gyro_bias_.z};
-        corr_abs = vec_length(gyro_corr);
+    Vec3 corrected_angular_rate{
+        mapped_angular_rate.x - gyro_bias_.x,
+        mapped_angular_rate.y - gyro_bias_.y,
+        mapped_angular_rate.z - gyro_bias_.z,
+    };
+    const float corrected_rate_magnitude =
+        vector_length(corrected_angular_rate);
+    if (corrected_rate_magnitude < kMaximumGyroscopeBiasAdaptationMagnitude) {
+        const float bias_blend =
+            1.0f - std::exp(-clamped_dt / kGyroscopeBiasTimeConstant);
+        gyro_bias_.x += bias_blend * corrected_angular_rate.x;
+        gyro_bias_.y += bias_blend * corrected_angular_rate.y;
+        gyro_bias_.z += bias_blend * corrected_angular_rate.z;
+        corrected_angular_rate = {
+            mapped_angular_rate.x - gyro_bias_.x,
+            mapped_angular_rate.y - gyro_bias_.y,
+            mapped_angular_rate.z - gyro_bias_.z,
+        };
     }
-    gyro_abs_ = corr_abs;
 
-    const float half = 0.5f * clamped_dt;
-    Quat dq{1.0f, gyro_corr.x * half, gyro_corr.y * half, gyro_corr.z * half};
-    if (!quat_normalize(dq)) {
+    const float half_step = 0.5f * clamped_dt;
+    Quaternion gyroscope_step{
+        1.0f,
+        corrected_angular_rate.x * half_step,
+        corrected_angular_rate.y * half_step,
+        corrected_angular_rate.z * half_step,
+    };
+    if (!normalize_quaternion(gyroscope_step)) {
         hard_reset();
         return false;
     }
-    q_ = quat_mul(q_, dq);
-    if (!quat_normalize(q_)) {
+    orientation_ = multiply_quaternions(orientation_, gyroscope_step);
+    if (!normalize_quaternion(orientation_)) {
         hard_reset();
         return false;
     }
 
-    const float mag = vec_length(mapped);
-    const float g_err = std::fabs(mag - kOneG) / kOneG;
-    const float trust = 1.0f / (1.0f + 8.0f * g_err * g_err);
-    const float tau = s_tau.load(std::memory_order_relaxed);
-    const float alpha = (1.0f - std::exp(-clamped_dt / tau)) * trust;
-    pull_toward_gravity(mapped, clampf(alpha, 0.0f, 1.0f));
+    const float acceleration_magnitude = vector_length(mapped_acceleration);
+    const float gravity_error_fraction =
+        std::fabs(acceleration_magnitude - kOneG) / kOneG;
+    const float gravity_trust =
+        1.0f / (1.0f + 8.0f * gravity_error_fraction * gravity_error_fraction);
+    const float correction_tau =
+        s_correction_time_constant.load(std::memory_order_relaxed);
+    const float gravity_correction =
+        (1.0f - std::exp(-clamped_dt / correction_tau)) * gravity_trust;
+    pull_toward_gravity(mapped_acceleration,
+                        clamp_float(gravity_correction, 0.0f, 1.0f));
     consume_yaw_request();
-    recompute();
-    if (!finite_quat(q_) || !finite_vec(up_)) {
+    recompute_outputs();
+    if (!finite_quaternion(orientation_)) {
         hard_reset();
         return false;
     }
     return true;
 }
 
-bool AttitudeFilter::apply_override(const Vec3 &apparent_accel)
+bool AttitudeFilter::apply_override(const Vec3 &apparent_acceleration)
 {
-    accepted_last_ = false;
+    last_sample_was_accepted_ = false;
     const uint32_t axes_config =
-        s_axes_config.load(std::memory_order_acquire);
-    maybe_axes_realign(axes_config);
-    if (!valid_gravity(apparent_accel)) {
+        s_axes_configuration.load(std::memory_order_acquire);
+    handle_axes_change(axes_config);
+    if (!has_reference_ ||
+        alignment_pending_.load(std::memory_order_acquire) ||
+        !valid_gravity_sample(apparent_acceleration)) {
         return false;
     }
 
-    mapped_ = apparent_accel;
-    gyro_abs_ = 0.0f;
-    accepted_last_ = true;
+    mapped_acceleration_ = apparent_acceleration;
+    last_sample_was_accepted_ = true;
 
-    const bool align = align_pending_.exchange(false, std::memory_order_acq_rel);
-    if (!have_ref_ || align) {
-        init_world(apparent_accel);
-        gyro_bias_ = {};
-        consume_yaw_request();
-        return true;
-    }
-
-    const float alpha = 1.0f - std::exp(-0.01f / kOverrideTau);
-    pull_toward_gravity(apparent_accel, clampf(alpha, 0.0f, 1.0f));
+    const float correction_gain =
+        1.0f - std::exp(-0.01f / kOverrideTimeConstant);
+    pull_toward_gravity(apparent_acceleration,
+                        clamp_float(correction_gain, 0.0f, 1.0f));
     consume_yaw_request();
-    recompute();
-    if (!finite_quat(q_) || !finite_vec(up_)) {
+    recompute_outputs();
+    if (!finite_quaternion(orientation_)) {
         hard_reset();
         return false;
     }
     return true;
 }
 
-}  // namespace fluid_demo
+}

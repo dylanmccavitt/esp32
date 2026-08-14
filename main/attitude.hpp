@@ -7,11 +7,6 @@
 
 namespace fluid_demo {
 
-/// Board-frame attitude from gyro integration plus accelerometer tilt.
-/// Relative mode treats the current pose as identity at reset and supports
-/// display gain. GravityAligned mode uses a screen-up board as identity:
-/// roll/pitch stay tied to gravity and yaw is gyro-relative. USB-at-bottom
-/// axis mapping matches MotionFilter.
 class AttitudeFilter {
 public:
     enum class ReferenceMode : uint8_t {
@@ -21,91 +16,88 @@ public:
 
     static constexpr float kOneG = 9.807f;
 
-    explicit AttitudeFilter(ReferenceMode reference_mode = ReferenceMode::Relative)
-        : reference_mode_(reference_mode) {}
+    explicit AttitudeFilter(
+        ReferenceMode reference_mode = ReferenceMode::Relative)
+        : reference_mode_(reference_mode)
+    {
+    }
 
     void reset();
     void request_align();
     static void request_yaw(float radians);
-    static void set_axes(int sx, int sy, int sz);
-    static void set_gain(float gain);  ///< Relative-mode display gain only.
+    static void set_axes(int x_sign, int y_sign, int z_sign);
+    static void set_gain(float gain);
     static void set_tau(float seconds);
-    static void axes(int *sx, int *sy, int *sz);
+    static void axes(int *x_sign, int *y_sign, int *z_sign);
     static float gain();
     static float tau();
 
-    /// Integrate one physical IMU sample. Override gravity is supplied through
-    /// `apply_override` instead.
     bool update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float dt);
 
-    /// Treat `apparent_accel` as gravity in box frame and freeze gyro.
-    bool apply_override(const Vec3 &apparent_accel);
+    bool apply_override(const Vec3 &apparent_acceleration);
 
-    const float *matrix() const { return R_; }
-    Vec3 up() const { return up_; }
+    const float *rotation_matrix() const { return rotation_matrix_; }
     float pitch() const { return pitch_; }
     float roll() const { return roll_; }
     float yaw() const { return yaw_; }
-    float gyro_abs() const { return gyro_abs_; }
-    Vec3 mapped_accel() const { return mapped_; }
-    Vec3 raw_accel() const { return raw_accel_; }
-    bool aligned() const { return have_ref_; }
-    bool last_sample_accepted() const { return accepted_last_; }
+    Vec3 mapped_acceleration() const { return mapped_acceleration_; }
+    bool aligned() const { return has_reference_; }
+    bool last_sample_accepted() const { return last_sample_was_accepted_; }
     uint32_t nonfinite_resets() const { return nonfinite_resets_; }
 
 private:
-    struct Quat {
+    struct Quaternion {
         float w = 1.0f;
         float x = 0.0f;
         float y = 0.0f;
         float z = 0.0f;
     };
 
-    static Vec3 map_box(const Vec3 &v, uint32_t axes_config);
-    static bool finite_vec(const Vec3 &v);
-    static bool finite_quat(const Quat &q);
-    static float clampf(float v, float lo, float hi);
-    static float vec_length(const Vec3 &v);
-    static Vec3 vec_scale(const Vec3 &v, float s);
-    static Vec3 vec_cross(const Vec3 &a, const Vec3 &b);
-    static float vec_dot(const Vec3 &a, const Vec3 &b);
-    static bool vec_normalize(Vec3 &v);
-    static Quat quat_mul(const Quat &a, const Quat &b);
-    static Quat quat_conj(const Quat &q);
-    static bool quat_normalize(Quat &q);
-    static Vec3 rotate(const Quat &q, const Vec3 &v);
-    static Quat quat_between(const Vec3 &from, const Vec3 &to);
-    static Quat scale_rotation(const Quat &q, float gain);
-    static void quat_to_matrix(const Quat &q, float out[9]);
+    static Vec3 map_to_box_frame(const Vec3 &vector, uint32_t axes_config);
+    static bool finite_quaternion(const Quaternion &quaternion);
+    static float vector_length(const Vec3 &vector);
+    static Vec3 vector_cross(const Vec3 &left, const Vec3 &right);
+    static float vector_dot(const Vec3 &left, const Vec3 &right);
+    static bool normalize_vector(Vec3 &vector);
+    static Quaternion multiply_quaternions(const Quaternion &left,
+                                           const Quaternion &right);
+    static Quaternion quaternion_conjugate(const Quaternion &quaternion);
+    static bool normalize_quaternion(Quaternion &quaternion);
+    static Vec3 rotate(const Quaternion &quaternion, const Vec3 &vector);
+    static Quaternion rotation_between(const Vec3 &from, const Vec3 &to);
+    static Quaternion scale_rotation(const Quaternion &rotation, float gain);
+    static void quaternion_to_matrix(const Quaternion &quaternion,
+                                     float matrix[9]);
 
-    bool valid_gravity(const Vec3 &v) const;
-    void init_world(const Vec3 &g_meas);
-    void pull_toward_gravity(const Vec3 &g_meas, float alpha);
+    bool valid_gravity_sample(const Vec3 &acceleration) const;
+    void initialize_world_reference(const Vec3 &measured_gravity);
+    void pull_toward_gravity(const Vec3 &measured_gravity,
+                             float correction_gain);
     void apply_yaw(float radians);
     void consume_yaw_request();
-    void maybe_axes_realign(uint32_t axes_config);
-    void recompute();
+    void handle_axes_change(uint32_t axes_config);
+    void recompute_outputs();
     void hard_reset();
+    void reset_state();
 
     const ReferenceMode reference_mode_;
 
-    Quat q_{};
-    Quat q_ref_{};
-    float R_[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
-    Vec3 g_world_{0.0f, 0.0f, kOneG};
-    Vec3 up_{0.0f, 1.0f, 0.0f};
-    Vec3 mapped_{};
-    Vec3 raw_accel_{};
+    Quaternion orientation_{};
+    Quaternion reference_orientation_{};
+    float rotation_matrix_[9] = {
+        1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    Vec3 world_gravity_{0.0f, 0.0f, kOneG};
+    Vec3 mapped_acceleration_{};
     Vec3 gyro_bias_{};
     float pitch_ = 0.0f;
     float roll_ = 0.0f;
     float yaw_ = 0.0f;
-    float gyro_abs_ = 0.0f;
-    bool have_ref_ = false;
-    bool accepted_last_ = false;
+    bool has_reference_ = false;
+    bool last_sample_was_accepted_ = false;
     uint32_t nonfinite_resets_ = 0;
-    uint32_t axes_gen_ = 1u << 3;
-    std::atomic<bool> align_pending_{true};
+    uint32_t axes_generation_ = 1u << 3;
+    std::atomic<bool> alignment_pending_{true};
 };
 
-}  // namespace fluid_demo
+}

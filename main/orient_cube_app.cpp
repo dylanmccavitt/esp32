@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "common_math.hpp"
 #include "draw.hpp"
 #include "launcher_icons.hpp"
 
@@ -14,7 +15,7 @@ namespace fluid_demo {
 
 namespace {
 
-constexpr const char *kTag = "orient_cube";
+constexpr char kTag[] = "orient_cube";
 constexpr int kPanelWidth = 240;
 constexpr int kPanelHeight = 240;
 
@@ -35,143 +36,190 @@ constexpr uint16_t kUsbMark = rgb24(0xFFDF00);
 constexpr uint16_t kEdge = rgb24(0x000000);
 
 constexpr LauncherVisual kLauncherVisual{
-    kBackground,
-    kBand,
-    kMuted,
-    kAccent,
-    kIconCube,
+    kBackground, kBand, kMuted, kAccent, kIconCube,
 };
 
-constexpr float kHalf = 1.00f;
-constexpr float kCam = 5.5f;
-constexpr float kFocal = 400.0f;
-constexpr float kCenter = 120.0f;
+constexpr int kCubeVertexCount = 8;
+constexpr int kCubeFaceCount = 6;
+constexpr int kVerticesPerFace = 4;
+constexpr float kCubeHalfExtent = 1.0f;
+constexpr float kCameraDistance = 5.5f;
+constexpr float kFocalLength = 400.0f;
+constexpr float kScreenCenter = 120.0f;
+constexpr float kMinimumCameraDepth = 0.35f;
 constexpr float kLightX = 0.42f;
 constexpr float kLightY = 0.74f;
 constexpr float kLightZ = 0.53f;
 
-constexpr int kFaceVerts[6][4] = {
-    {0, 1, 2, 3},  // screen / +Z
-    {5, 4, 7, 6},  // back / -Z
-    {1, 5, 6, 2},  // right / +X
-    {4, 0, 3, 7},  // left / -X
-    {3, 2, 6, 7},  // top / +Y
-    {4, 5, 1, 0},  // USB / -Y
+constexpr int kFaceVertexIndices[kCubeFaceCount][kVerticesPerFace] = {
+    {0, 1, 2, 3}, {5, 4, 7, 6}, {1, 5, 6, 2},
+    {4, 0, 3, 7}, {3, 2, 6, 7}, {4, 5, 1, 0},
 };
-constexpr uint16_t kFaceFill[6] = {kFront, kBack, kRight, kLeft, kTop, kUsb};
+constexpr uint16_t kFaceColors[kCubeFaceCount] = {
+    kFront, kBack, kRight, kLeft, kTop, kUsb,
+};
 
-inline int min_int(int a, int b) { return a < b ? a : b; }
-inline bool finite_vec(const Vec3 &value)
+void copy_matrix(float *destination, const float *source)
 {
-    return std::isfinite(value.x) && std::isfinite(value.y) &&
-           std::isfinite(value.z);
-}
-
-void copy_matrix(float *dst, const float *src)
-{
-    for (int i = 0; i < 9; ++i) {
-        dst[i] = src[i];
+    for (int element_index = 0; element_index < 9; ++element_index) {
+        destination[element_index] = source[element_index];
     }
 }
 
-void project_vertices(const float R[9], float cam[8][3], float out[8][3])
+void project_vertices(const float rotation_matrix[9],
+                      float camera_vertices[kCubeVertexCount][3],
+                      float projected_vertices[kCubeVertexCount][3])
 {
-    const float model[8][3] = {
-        {-kHalf, -kHalf, kHalf},  {kHalf, -kHalf, kHalf},
-        {kHalf, kHalf, kHalf},    {-kHalf, kHalf, kHalf},
-        {-kHalf, -kHalf, -kHalf}, {kHalf, -kHalf, -kHalf},
-        {kHalf, kHalf, -kHalf},   {-kHalf, kHalf, -kHalf},
+    const float model_vertices[kCubeVertexCount][3] = {
+        {-kCubeHalfExtent, -kCubeHalfExtent, kCubeHalfExtent},
+        {kCubeHalfExtent, -kCubeHalfExtent, kCubeHalfExtent},
+        {kCubeHalfExtent, kCubeHalfExtent, kCubeHalfExtent},
+        {-kCubeHalfExtent, kCubeHalfExtent, kCubeHalfExtent},
+        {-kCubeHalfExtent, -kCubeHalfExtent, -kCubeHalfExtent},
+        {kCubeHalfExtent, -kCubeHalfExtent, -kCubeHalfExtent},
+        {kCubeHalfExtent, kCubeHalfExtent, -kCubeHalfExtent},
+        {-kCubeHalfExtent, kCubeHalfExtent, -kCubeHalfExtent},
     };
-    // Camera sits on +Z looking toward the origin (-Z). Identity R is rest:
-    // screen face (+Z) fills the view, USB at -Y (bottom), no 3/4 offset.
-    for (int i = 0; i < 8; ++i) {
-        const float ax = R[0] * model[i][0] + R[1] * model[i][1] + R[2] * model[i][2];
-        const float ay = R[3] * model[i][0] + R[4] * model[i][1] + R[5] * model[i][2];
-        const float az = R[6] * model[i][0] + R[7] * model[i][1] + R[8] * model[i][2];
-        cam[i][0] = ax;
-        cam[i][1] = ay;
-        cam[i][2] = az;
-        float denom = kCam - az;
-        if (denom < 0.35f) {
-            denom = 0.35f;
+
+    for (int vertex_index = 0; vertex_index < kCubeVertexCount;
+         ++vertex_index) {
+        const float camera_x =
+            rotation_matrix[0] * model_vertices[vertex_index][0] +
+            rotation_matrix[1] * model_vertices[vertex_index][1] +
+            rotation_matrix[2] * model_vertices[vertex_index][2];
+        const float camera_y =
+            rotation_matrix[3] * model_vertices[vertex_index][0] +
+            rotation_matrix[4] * model_vertices[vertex_index][1] +
+            rotation_matrix[5] * model_vertices[vertex_index][2];
+        const float camera_z =
+            rotation_matrix[6] * model_vertices[vertex_index][0] +
+            rotation_matrix[7] * model_vertices[vertex_index][1] +
+            rotation_matrix[8] * model_vertices[vertex_index][2];
+
+        camera_vertices[vertex_index][0] = camera_x;
+        camera_vertices[vertex_index][1] = camera_y;
+        camera_vertices[vertex_index][2] = camera_z;
+
+        float camera_depth = kCameraDistance - camera_z;
+        if (camera_depth < kMinimumCameraDepth) {
+            camera_depth = kMinimumCameraDepth;
         }
-        const float persp = kFocal / denom;
-        out[i][0] = kCenter + ax * persp;
-        out[i][1] = kCenter - ay * persp;
-        out[i][2] = az;
+        const float perspective_scale = kFocalLength / camera_depth;
+        projected_vertices[vertex_index][0] =
+            kScreenCenter + camera_x * perspective_scale;
+        projected_vertices[vertex_index][1] =
+            kScreenCenter - camera_y * perspective_scale;
+        projected_vertices[vertex_index][2] = camera_z;
     }
 }
 
-float face_light(const float cam[8][3], int face)
+float face_light(const float camera_vertices[kCubeVertexCount][3],
+                 int face_index)
 {
-    const int ia = kFaceVerts[face][0];
-    const int ib = kFaceVerts[face][1];
-    const int ic = kFaceVerts[face][2];
-    const float e1x = cam[ib][0] - cam[ia][0];
-    const float e1y = cam[ib][1] - cam[ia][1];
-    const float e1z = cam[ib][2] - cam[ia][2];
-    const float e2x = cam[ic][0] - cam[ia][0];
-    const float e2y = cam[ic][1] - cam[ia][1];
-    const float e2z = cam[ic][2] - cam[ia][2];
-    float nx = e1y * e2z - e1z * e2y;
-    float ny = e1z * e2x - e1x * e2z;
-    float nz = e1x * e2y - e1y * e2x;
-    const float mag = std::sqrt(nx * nx + ny * ny + nz * nz);
-    if (mag < 1e-5f) {
+    const int first_vertex = kFaceVertexIndices[face_index][0];
+    const int second_vertex = kFaceVertexIndices[face_index][1];
+    const int third_vertex = kFaceVertexIndices[face_index][2];
+    const float first_edge_x =
+        camera_vertices[second_vertex][0] - camera_vertices[first_vertex][0];
+    const float first_edge_y =
+        camera_vertices[second_vertex][1] - camera_vertices[first_vertex][1];
+    const float first_edge_z =
+        camera_vertices[second_vertex][2] - camera_vertices[first_vertex][2];
+    const float second_edge_x =
+        camera_vertices[third_vertex][0] - camera_vertices[first_vertex][0];
+    const float second_edge_y =
+        camera_vertices[third_vertex][1] - camera_vertices[first_vertex][1];
+    const float second_edge_z =
+        camera_vertices[third_vertex][2] - camera_vertices[first_vertex][2];
+
+    float normal_x =
+        first_edge_y * second_edge_z - first_edge_z * second_edge_y;
+    float normal_y =
+        first_edge_z * second_edge_x - first_edge_x * second_edge_z;
+    float normal_z =
+        first_edge_x * second_edge_y - first_edge_y * second_edge_x;
+    const float normal_length = std::sqrt(
+        normal_x * normal_x + normal_y * normal_y + normal_z * normal_z);
+    if (normal_length < 1e-5f) {
         return 0.35f;
     }
-    nx /= mag;
-    ny /= mag;
-    nz /= mag;
-    float ndotl = nx * kLightX + ny * kLightY + nz * kLightZ;
-    if (ndotl < 0.0f) {
-        ndotl = 0.0f;
+    normal_x /= normal_length;
+    normal_y /= normal_length;
+    normal_z /= normal_length;
+    float light_dot =
+        normal_x * kLightX + normal_y * kLightY + normal_z * kLightZ;
+    if (light_dot < 0.0f) {
+        light_dot = 0.0f;
     }
-    return 0.48f + 0.52f * ndotl;
+    return 0.48f + 0.52f * light_dot;
 }
 
-float face_area(const float projected[8][3], int face)
+float face_area(const float projected_vertices[kCubeVertexCount][3],
+                int face_index)
 {
-    float area = 0.0f;
-    for (int i = 0; i < 4; ++i) {
-        const int a = kFaceVerts[face][i];
-        const int b = kFaceVerts[face][(i + 1) & 3];
-        area += projected[a][0] * projected[b][1] - projected[b][0] * projected[a][1];
+    float signed_area = 0.0f;
+    for (int vertex_offset = 0; vertex_offset < kVerticesPerFace;
+         ++vertex_offset) {
+        const int current_vertex =
+            kFaceVertexIndices[face_index][vertex_offset];
+        const int next_vertex =
+            kFaceVertexIndices[face_index]
+                              [(vertex_offset + 1) % kVerticesPerFace];
+        signed_area += projected_vertices[current_vertex][0] *
+                           projected_vertices[next_vertex][1] -
+                       projected_vertices[next_vertex][0] *
+                           projected_vertices[current_vertex][1];
     }
-    return area;
+    return signed_area;
 }
 
-void face_quad(const float projected[8][3], int face, float xy[8])
+void face_quad(const float projected_vertices[kCubeVertexCount][3],
+               int face_index, float quad_coordinates[kVerticesPerFace * 2])
 {
-    for (int i = 0; i < 4; ++i) {
-        const int v = kFaceVerts[face][i];
-        xy[2 * i] = projected[v][0];
-        xy[2 * i + 1] = projected[v][1];
+    for (int vertex_offset = 0; vertex_offset < kVerticesPerFace;
+         ++vertex_offset) {
+        const int vertex_index = kFaceVertexIndices[face_index][vertex_offset];
+        quad_coordinates[2 * vertex_offset] =
+            projected_vertices[vertex_index][0];
+        quad_coordinates[2 * vertex_offset + 1] =
+            projected_vertices[vertex_index][1];
     }
 }
 
-void lerp_quad(const float xy[8], float t, float out[8])
+void scale_quad(const float quad_coordinates[kVerticesPerFace * 2], float scale,
+                float scaled_coordinates[kVerticesPerFace * 2])
 {
-    const float cx = 0.25f * (xy[0] + xy[2] + xy[4] + xy[6]);
-    const float cy = 0.25f * (xy[1] + xy[3] + xy[5] + xy[7]);
-    for (int i = 0; i < 4; ++i) {
-        out[2 * i] = cx + t * (xy[2 * i] - cx);
-        out[2 * i + 1] = cy + t * (xy[2 * i + 1] - cy);
+    const float center_x = 0.25f * (quad_coordinates[0] + quad_coordinates[2] +
+                                    quad_coordinates[4] + quad_coordinates[6]);
+    const float center_y = 0.25f * (quad_coordinates[1] + quad_coordinates[3] +
+                                    quad_coordinates[5] + quad_coordinates[7]);
+    for (int vertex_offset = 0; vertex_offset < kVerticesPerFace;
+         ++vertex_offset) {
+        scaled_coordinates[2 * vertex_offset] =
+            center_x + scale * (quad_coordinates[2 * vertex_offset] - center_x);
+        scaled_coordinates[2 * vertex_offset + 1] =
+            center_y +
+            scale * (quad_coordinates[2 * vertex_offset + 1] - center_y);
     }
 }
 
-void draw_edges(const float xy[8], uint16_t *pixels, int width, int y0, int rows)
+void draw_edges(const float quad_coordinates[kVerticesPerFace * 2],
+                uint16_t *pixels, int width, int stripe_y, int stripe_rows)
 {
-    for (int i = 0; i < 4; ++i) {
-        const int j = (i + 1) & 3;
-        fill_segment(pixels, width, y0, rows, static_cast<int>(xy[2 * i] + 0.5f),
-                     static_cast<int>(xy[2 * i + 1] + 0.5f),
-                     static_cast<int>(xy[2 * j] + 0.5f),
-                     static_cast<int>(xy[2 * j + 1] + 0.5f), 1, kEdge);
+    for (int vertex_offset = 0; vertex_offset < kVerticesPerFace;
+         ++vertex_offset) {
+        const int next_vertex_offset = (vertex_offset + 1) % kVerticesPerFace;
+        fill_segment(
+            pixels, width, stripe_y, stripe_rows,
+            static_cast<int>(quad_coordinates[2 * vertex_offset] + 0.5f),
+            static_cast<int>(quad_coordinates[2 * vertex_offset + 1] + 0.5f),
+            static_cast<int>(quad_coordinates[2 * next_vertex_offset] + 0.5f),
+            static_cast<int>(quad_coordinates[2 * next_vertex_offset + 1] +
+                             0.5f),
+            1, kEdge);
     }
 }
-
-}  // namespace
+}
 
 OrientCubeApp s_orient_cube_app;
 
@@ -185,7 +233,7 @@ esp_err_t OrientCubeApp::setup_once()
     if (setup_done_) {
         return ESP_OK;
     }
-    filter_.reset();
+    attitude_filter_.reset();
     epoch_ = 1;
     published_epoch_.store(epoch_, std::memory_order_relaxed);
     setup_done_ = true;
@@ -198,81 +246,62 @@ esp_err_t OrientCubeApp::enter()
         return ESP_ERR_INVALID_STATE;
     }
     frames_.drain();
-    filter_.reset();
+    attitude_filter_.reset();
     portENTER_CRITICAL(&motion_mux_);
-    motion_.valid = false;
-    copy_matrix(motion_.R, filter_.matrix());
+    copy_matrix(motion_.rotation_matrix, attitude_filter_.rotation_matrix());
     portEXIT_CRITICAL(&motion_mux_);
     return ESP_OK;
 }
 
-void OrientCubeApp::leave()
-{
-    portENTER_CRITICAL(&motion_mux_);
-    motion_.valid = false;
-    portEXIT_CRITICAL(&motion_mux_);
-}
+void OrientCubeApp::leave() {}
 
 void OrientCubeApp::on_plus_press()
 {
     reset_requested_.store(true, std::memory_order_release);
-    filter_.request_align();
+    attitude_filter_.request_align();
 }
 
 bool OrientCubeApp::on_motion(const MotionTick &tick)
 {
-    const bool physical_valid =
+    const bool physical_sample_valid =
         tick.fresh && std::isfinite(tick.dt) && tick.dt > 0.0f &&
         finite_vec(tick.accel_mps2) && finite_vec(tick.gyro_rads);
-    bool physical_accepted = false;
-    if (physical_valid) {
-        // Init the world from the real IMU even if a console override is
-        // already latched, so a leftover `motion` cannot pin identity.
-        if (tick.override_active && filter_.aligned()) {
-            physical_accepted = true;
-        } else {
-            physical_accepted = filter_.update(tick.accel_mps2, tick.gyro_rads, tick.dt);
-        }
+    const bool had_reference = attitude_filter_.aligned();
+    bool override_accepted =
+        tick.override_active && had_reference &&
+        attitude_filter_.apply_override(tick.apparent_accel);
+
+    bool physical_sample_accepted = false;
+    if (physical_sample_valid) {
+        physical_sample_accepted =
+            override_accepted ||
+            attitude_filter_.update(tick.accel_mps2, tick.gyro_rads, tick.dt);
+    }
+    if (tick.override_active && !override_accepted &&
+        physical_sample_accepted && attitude_filter_.aligned()) {
+        override_accepted =
+            attitude_filter_.apply_override(tick.apparent_accel);
     }
 
-    const bool override_valid = tick.override_active && finite_vec(tick.apparent_accel);
-    if (override_valid) {
-        static_cast<void>(filter_.apply_override(tick.apparent_accel));
-    }
-
-    if (!physical_accepted && !override_valid) {
-        portENTER_CRITICAL(&motion_mux_);
-        motion_.valid = false;
-        portEXIT_CRITICAL(&motion_mux_);
+    if (!physical_sample_accepted && !override_accepted) {
         return false;
     }
 
     portENTER_CRITICAL(&motion_mux_);
-    motion_.apparent = override_valid ? tick.apparent_accel : filter_.mapped_accel();
-    motion_.valid = true;
-    copy_matrix(motion_.R, filter_.matrix());
-    motion_.pitch = filter_.pitch();
-    motion_.roll = filter_.roll();
-    motion_.yaw = filter_.yaw();
-    if (physical_valid) {
-        motion_.raw = tick.accel_mps2;
+    motion_.apparent_acceleration =
+        override_accepted ? tick.apparent_accel
+                          : attitude_filter_.mapped_acceleration();
+    copy_matrix(motion_.rotation_matrix, attitude_filter_.rotation_matrix());
+    motion_.pitch = attitude_filter_.pitch();
+    motion_.roll = attitude_filter_.roll();
+    motion_.yaw = attitude_filter_.yaw();
+    if (physical_sample_valid) {
+        motion_.raw_acceleration = tick.accel_mps2;
     }
     portEXIT_CRITICAL(&motion_mux_);
-    nonfinite_resets_.store(filter_.nonfinite_resets(), std::memory_order_relaxed);
-    return physical_accepted;
-}
-
-void OrientCubeApp::fill_snapshot(CubeFrame &snapshot)
-{
-    ++sequence_;
-    if (sequence_ == 0u) {
-        sequence_ = 1u;
-    }
-    snapshot.sequence = sequence_;
-    snapshot.epoch = epoch_;
-    portENTER_CRITICAL(&motion_mux_);
-    copy_matrix(snapshot.R, motion_.R);
-    portEXIT_CRITICAL(&motion_mux_);
+    nonfinite_resets_.store(attitude_filter_.nonfinite_resets(),
+                            std::memory_order_relaxed);
+    return physical_sample_accepted;
 }
 
 esp_err_t OrientCubeApp::update(float dt)
@@ -284,7 +313,7 @@ esp_err_t OrientCubeApp::update(float dt)
         return ESP_ERR_INVALID_ARG;
     }
 
-    const int64_t update_start = esp_timer_get_time();
+    const int64_t update_start_us = esp_timer_get_time();
     if (reset_requested_.exchange(false, std::memory_order_acq_rel)) {
         ++epoch_;
         if (epoch_ == 0u) {
@@ -295,12 +324,15 @@ esp_err_t OrientCubeApp::update(float dt)
 
     CubeFrame *snapshot = frames_.begin_write();
     if (snapshot != nullptr) {
-        fill_snapshot(*snapshot);
+        portENTER_CRITICAL(&motion_mux_);
+        copy_matrix(snapshot->rotation_matrix, motion_.rotation_matrix);
+        portEXIT_CRITICAL(&motion_mux_);
         frames_.publish(snapshot);
     }
     published_epoch_.store(epoch_, std::memory_order_relaxed);
-    physics_us_.store(static_cast<uint32_t>(esp_timer_get_time() - update_start),
-                      std::memory_order_relaxed);
+    physics_us_.store(
+        static_cast<uint32_t>(esp_timer_get_time() - update_start_us),
+        std::memory_order_relaxed);
     return ESP_OK;
 }
 
@@ -312,12 +344,12 @@ AppStats OrientCubeApp::stats()
     result.nonfinite_resets = nonfinite_resets_.load(std::memory_order_relaxed);
     result.physics_us = physics_us_.load(std::memory_order_relaxed);
     portENTER_CRITICAL(&motion_mux_);
-    result.raw[0] = motion_.raw.x;
-    result.raw[1] = motion_.raw.y;
-    result.raw[2] = motion_.raw.z;
-    result.apparent[0] = motion_.apparent.x;
-    result.apparent[1] = motion_.apparent.y;
-    result.apparent[2] = motion_.apparent.z;
+    result.raw[0] = motion_.raw_acceleration.x;
+    result.raw[1] = motion_.raw_acceleration.y;
+    result.raw[2] = motion_.raw_acceleration.z;
+    result.apparent[0] = motion_.apparent_acceleration.x;
+    result.apparent[1] = motion_.apparent_acceleration.y;
+    result.apparent[2] = motion_.apparent_acceleration.z;
     result.pitch = motion_.pitch;
     result.roll = motion_.roll;
     result.yaw = motion_.yaw;
@@ -327,147 +359,164 @@ AppStats OrientCubeApp::stats()
     return result;
 }
 
-void OrientCubeApp::raster_stripe(const float projected[8][3], const float cam[8][3],
-                                  const int order[6], const bool visible[6],
-                                  uint16_t *pixels, int width, int y0, int rows)
+void OrientCubeApp::raster_stripe(
+    const float projected_vertices[kCubeVertexCount][3],
+    const float camera_vertices[kCubeVertexCount][3],
+    const int face_order[kCubeFaceCount],
+    const bool face_visible[kCubeFaceCount], uint16_t *pixels, int width,
+    int stripe_y, int stripe_rows)
 {
-    for (int local_y = 0; local_y < rows; ++local_y) {
+    for (int local_y = 0; local_y < stripe_rows; ++local_y) {
         uint16_t *row = pixels + local_y * width;
-        for (int x = 0; x < width; ++x) {
-            row[x] = kBackground;
+        for (int screen_x = 0; screen_x < width; ++screen_x) {
+            row[screen_x] = kBackground;
         }
     }
 
-    for (int n = 0; n < 6; ++n) {
-        const int face = order[n];
-        if (!visible[face]) {
+    for (int order_index = 0; order_index < kCubeFaceCount; ++order_index) {
+        const int face_index = face_order[order_index];
+        if (!face_visible[face_index]) {
             continue;
         }
-        float xy[8];
-        face_quad(projected, face, xy);
-        const float light = face_light(cam, face);
-        const uint16_t fill = shade_rgb565(kFaceFill[face], light);
-        float expanded[8];
-        lerp_quad(xy, 1.03f, expanded);
-        fill_convex_quad(pixels, width, y0, rows, expanded, fill);
 
-        const float area = std::fabs(face_area(projected, face));
-        if (area > 1200.0f) {
-            float inset[8];
-            if (face == 0) {
-                lerp_quad(xy, 0.70f, inset);
-                fill_convex_quad(pixels, width, y0, rows, inset,
-                                 shade_rgb565(kFrontInset, light));
-                lerp_quad(xy, 0.52f, inset);
-                fill_convex_quad(pixels, width, y0, rows, inset,
-                                 shade_rgb565(kFrontGlass, light * 0.90f));
-            } else if (face == 1) {
-                lerp_quad(xy, 0.28f, inset);
-                fill_convex_quad(pixels, width, y0, rows, inset,
-                                 shade_rgb565(kBackMark, light));
-            } else if (face == 5) {
-                lerp_quad(xy, 0.40f, inset);
-                fill_convex_quad(pixels, width, y0, rows, inset,
-                                 shade_rgb565(kUsbMark, light));
-            }
-        }
-    }
+        float quad_coordinates[kVerticesPerFace * 2];
+        face_quad(projected_vertices, face_index, quad_coordinates);
+        const float light = face_light(camera_vertices, face_index);
+        const uint16_t fill_color =
+            shade_rgb565(kFaceColors[face_index], light);
+        float expanded_quad[kVerticesPerFace * 2];
+        scale_quad(quad_coordinates, 1.03f, expanded_quad);
+        fill_convex_quad(pixels, width, stripe_y, stripe_rows, expanded_quad,
+                         fill_color);
 
-    for (int n = 0; n < 6; ++n) {
-        const int face = order[n];
-        if (!visible[face]) {
+        const float projected_area =
+            std::fabs(face_area(projected_vertices, face_index));
+        if (projected_area <= 1200.0f) {
             continue;
         }
-        float xy[8];
-        face_quad(projected, face, xy);
-        draw_edges(xy, pixels, width, y0, rows);
+
+        float inset_quad[kVerticesPerFace * 2];
+        if (face_index == 0) {
+            scale_quad(quad_coordinates, 0.70f, inset_quad);
+            fill_convex_quad(pixels, width, stripe_y, stripe_rows, inset_quad,
+                             shade_rgb565(kFrontInset, light));
+            scale_quad(quad_coordinates, 0.52f, inset_quad);
+            fill_convex_quad(pixels, width, stripe_y, stripe_rows, inset_quad,
+                             shade_rgb565(kFrontGlass, light * 0.90f));
+        } else if (face_index == 1) {
+            scale_quad(quad_coordinates, 0.28f, inset_quad);
+            fill_convex_quad(pixels, width, stripe_y, stripe_rows, inset_quad,
+                             shade_rgb565(kBackMark, light));
+        } else if (face_index == 5) {
+            scale_quad(quad_coordinates, 0.40f, inset_quad);
+            fill_convex_quad(pixels, width, stripe_y, stripe_rows, inset_quad,
+                             shade_rgb565(kUsbMark, light));
+        }
     }
 
+    for (int order_index = 0; order_index < kCubeFaceCount; ++order_index) {
+        const int face_index = face_order[order_index];
+        if (!face_visible[face_index]) {
+            continue;
+        }
+        float quad_coordinates[kVerticesPerFace * 2];
+        face_quad(projected_vertices, face_index, quad_coordinates);
+        draw_edges(quad_coordinates, pixels, width, stripe_y, stripe_rows);
+    }
 }
 
 bool OrientCubeApp::render(DisplayFrame &frame)
 {
-    if (!setup_done_ || frame.transport == nullptr || frame.width != kPanelWidth ||
-        frame.height != kPanelHeight || frame.stripe_rows <= 0 ||
-        frame.stripe_count <= 0 || frame.stripe[0] == nullptr ||
-        frame.stripe[1] == nullptr || frame.ops.wait_previous == nullptr ||
+    if (!setup_done_ || frame.transport == nullptr ||
+        frame.width != kPanelWidth || frame.height != kPanelHeight ||
+        frame.stripe_rows <= 0 || frame.stripe_count <= 0 ||
+        frame.stripe[0] == nullptr || frame.stripe[1] == nullptr ||
+        frame.ops.wait_previous == nullptr ||
         frame.ops.latch_capture == nullptr || frame.ops.submit == nullptr ||
         frame.ops.finish == nullptr || frame.ops.capture_copy_us == nullptr) {
         ESP_LOGW(kTag, "render rejected invalid display frame");
         return false;
     }
 
-    const CubeFrame *cube = frames_.acquire_latest();
-    if (cube == nullptr) {
+    const CubeFrame *snapshot = frames_.acquire_latest();
+    if (snapshot == nullptr) {
         return false;
     }
 
-    float cam[8][3];
-    float projected[8][3];
-    project_vertices(cube->R, cam, projected);
-    bool visible[6];
-    float depth[6];
-    int order[6];
-    for (int face = 0; face < 6; ++face) {
-        visible[face] = face_area(projected, face) < 0.0f;
-        depth[face] = 0.25f * (projected[kFaceVerts[face][0]][2] +
-                               projected[kFaceVerts[face][1]][2] +
-                               projected[kFaceVerts[face][2]][2] +
-                               projected[kFaceVerts[face][3]][2]);
-        order[face] = face;
+    float camera_vertices[kCubeVertexCount][3];
+    float projected_vertices[kCubeVertexCount][3];
+    project_vertices(snapshot->rotation_matrix, camera_vertices,
+                     projected_vertices);
+    bool face_is_visible[kCubeFaceCount];
+    float face_depths[kCubeFaceCount];
+    int face_order[kCubeFaceCount];
+    for (int face_index = 0; face_index < kCubeFaceCount; ++face_index) {
+        face_is_visible[face_index] =
+            face_area(projected_vertices, face_index) < 0.0f;
+        face_depths[face_index] =
+            0.25f * (projected_vertices[kFaceVertexIndices[face_index][0]][2] +
+                     projected_vertices[kFaceVertexIndices[face_index][1]][2] +
+                     projected_vertices[kFaceVertexIndices[face_index][2]][2] +
+                     projected_vertices[kFaceVertexIndices[face_index][3]][2]);
+        face_order[face_index] = face_index;
     }
-    for (int i = 1; i < 6; ++i) {
-        const int face = order[i];
-        const float z = depth[face];
-        int j = i;
-        while (j > 0 && depth[order[j - 1]] > z) {
-            order[j] = order[j - 1];
-            --j;
+    for (int order_index = 1; order_index < kCubeFaceCount; ++order_index) {
+        const int face_index = face_order[order_index];
+        const float selected_depth = face_depths[face_index];
+        int insertion_index = order_index;
+        while (insertion_index > 0 &&
+               face_depths[face_order[insertion_index - 1]] > selected_depth) {
+            face_order[insertion_index] = face_order[insertion_index - 1];
+            --insertion_index;
         }
-        order[j] = face;
+        face_order[insertion_index] = face_index;
     }
 
-    const int64_t frame_start = esp_timer_get_time();
-    uint32_t raster_total = 0;
-    esp_err_t result = frame.ops.wait_previous(frame.transport);
-    if (result == ESP_OK) {
-        static_cast<void>(frame.ops.latch_capture(frame.transport));
-        for (int stripe = 0; stripe < frame.stripe_count; ++stripe) {
-            const int stripe_y = stripe * frame.stripe_rows;
-            const int stripe_rows = min_int(frame.stripe_rows, frame.height - stripe_y);
+    const int64_t frame_start_us = esp_timer_get_time();
+    uint32_t total_raster_us = 0;
+    esp_err_t error = frame.ops.wait_previous(frame.transport);
+    if (error == ESP_OK) {
+        frame.ops.latch_capture(frame.transport);
+        for (int stripe_index = 0; stripe_index < frame.stripe_count;
+             ++stripe_index) {
+            const int stripe_y = stripe_index * frame.stripe_rows;
+            const int stripe_rows =
+                min_int(frame.stripe_rows, frame.height - stripe_y);
             if (stripe_rows <= 0) {
                 break;
             }
-            uint16_t *pixels = frame.stripe[stripe & 1];
-            const int64_t raster_start = esp_timer_get_time();
-            raster_stripe(projected, cam, order, visible, pixels, frame.width, stripe_y,
+            uint16_t *stripe_pixels = frame.stripe[stripe_index & 1];
+            const int64_t raster_start_us = esp_timer_get_time();
+            raster_stripe(projected_vertices, camera_vertices, face_order,
+                          face_is_visible, stripe_pixels, frame.width, stripe_y,
                           stripe_rows);
             const int pixel_count = frame.width * stripe_rows;
-            for (int pixel = 0; pixel < pixel_count; ++pixel) {
-                pixels[pixel] = __builtin_bswap16(pixels[pixel]);
+            for (int pixel_index = 0; pixel_index < pixel_count;
+                 ++pixel_index) {
+                stripe_pixels[pixel_index] =
+                    __builtin_bswap16(stripe_pixels[pixel_index]);
             }
-            raster_total +=
-                static_cast<uint32_t>(esp_timer_get_time() - raster_start);
-            result = frame.ops.submit(frame.transport, stripe, stripe_y, stripe_rows,
-                                      pixels);
-            if (result != ESP_OK) {
+            total_raster_us +=
+                static_cast<uint32_t>(esp_timer_get_time() - raster_start_us);
+            error = frame.ops.submit(frame.transport, stripe_index, stripe_y,
+                                     stripe_rows, stripe_pixels);
+            if (error != ESP_OK) {
                 break;
             }
         }
-        if (result == ESP_OK) {
-            result = frame.ops.finish(frame.transport);
+        if (error == ESP_OK) {
+            error = frame.ops.finish(frame.transport);
         }
     }
 
-    frames_.release(cube);
-    if (result != ESP_OK) {
-        ESP_LOGW(kTag, "render transport failed: %s", esp_err_to_name(result));
+    frames_.release(snapshot);
+    if (error != ESP_OK) {
+        ESP_LOGW(kTag, "render transport failed: %s", esp_err_to_name(error));
         return false;
     }
 
-    frame_us_ = static_cast<uint32_t>(esp_timer_get_time() - frame_start);
-    raster_us_ = raster_total + frame.ops.capture_copy_us(frame.transport);
+    frame_us_ = static_cast<uint32_t>(esp_timer_get_time() - frame_start_us);
+    raster_us_ = total_raster_us + frame.ops.capture_copy_us(frame.transport);
     return true;
 }
-
-}  // namespace fluid_demo
+}
