@@ -11,15 +11,16 @@ class DisplayService;
 class InputService;
 class MotionService;
 
-/// USB Serial/JTAG development console and framebuffer protocol endpoint.
 class ConsoleService {
 public:
-    using ResetTrampoline = esp_err_t (*)();
+    using ResetCallback = esp_err_t (*)();
 
-    esp_err_t start(DisplayService *display, MotionService *motion,
-                    InputService *input, ResetTrampoline reset_callback);
-
-    bool dump_active() const { return dumping_.load(std::memory_order_acquire); }
+    esp_err_t start(DisplayService &display, MotionService &motion,
+                    InputService &input, ResetCallback reset_callback);
+    bool protocol_output_active() const
+    {
+        return protocol_output_active_.load(std::memory_order_acquire);
+    }
 
     void emit_poweroff();
     void emit_rebooting();
@@ -48,10 +49,10 @@ private:
     DisplayService *display_ = nullptr;
     MotionService *motion_ = nullptr;
     InputService *input_ = nullptr;
-    ResetTrampoline reset_callback_ = nullptr;
-    void *repl_ = nullptr;
-    std::atomic<bool> dumping_{false};
+    ResetCallback reset_callback_ = nullptr;
+    void *repl_handle_ = nullptr;
+    std::atomic<bool> protocol_output_active_{false};
     uint32_t capture_sequence_ = 0;
 };
 
-}  // namespace fluid_demo
+}

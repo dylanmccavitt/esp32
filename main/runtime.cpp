@@ -448,7 +448,8 @@ void sensor_task(void *arg)
             const esp_err_t motion_err = s_motion.last_read_error();
             if (motion_err != ESP_OK) {
                 const uint32_t now_s = static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
-                if (now_s != last_err_log_s && !s_console.dump_active()) {
+                if (now_s != last_err_log_s &&
+                    !s_console.protocol_output_active()) {
                     last_err_log_s = now_s;
                     ESP_LOGW(kTag, "board_read_motion failed: %s", esp_err_to_name(motion_err));
                 }
@@ -462,7 +463,7 @@ void sensor_task(void *arg)
 
 
         TouchEvent touch;
-        if (s_input.poll_touch(&touch)) {
+        if (s_input.poll_touch(touch)) {
             // Every contact-qualified report is forwarded independently of
             // simultaneous button emission: while Running the decoded app
             // receives exactly one Begin per physical contact (Move/End are
@@ -530,7 +531,8 @@ void sensor_task(void *arg)
                 launcher_contact_ = false;
                 const uint32_t now_s =
                     static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
-                if (now_s != last_touch_err_log_s && !s_console.dump_active()) {
+                if (now_s != last_touch_err_log_s &&
+                    !s_console.protocol_output_active()) {
                     last_touch_err_log_s = now_s;
                     ESP_LOGW(kTag, "board_read_touch failed: %s",
                              esp_err_to_name(touch_err));
@@ -548,7 +550,7 @@ void sensor_task(void *arg)
         // --- lane.
         const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
         ButtonEvent event;
-        const bool button_emitted = s_input.poll(now_ms, &event);
+        const bool button_emitted = s_input.poll(now_ms, event);
         if (button_emitted) {
             if (event == ButtonEvent::PlusPress) {
                 if (mode == AppMode::Running && app != nullptr) {
@@ -561,7 +563,7 @@ void sensor_task(void *arg)
                     // the event is dropped (no lifecycle work).
                     enqueue_or_retain(selected_launch_request());
                 }
-            } else if (event == ButtonEvent::PwrShort) {
+            } else if (event == ButtonEvent::PowerShort) {
                 if (mode == AppMode::Running) {
                     // Short PWR while an app runs returns to the launcher;
                     // InputService guarantees this is never a leftover of a
@@ -675,7 +677,7 @@ void render_task(void *arg)
             continue;
         }
         if (word_mode(word) == AppMode::Launcher) {
-            if (s_console.dump_active()) {
+            if (s_console.protocol_output_active()) {
                 // The console owns stdout; park raster work so protocol lines
                 // stay intact and IDLE0 services the WDT (same rule as Fluid).
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -698,7 +700,7 @@ void render_task(void *arg)
             vTaskDelay(1);
             continue;
         }
-        if (s_console.dump_active()) {
+        if (s_console.protocol_output_active()) {
             // The console also runs on core 0. Park raster work while it owns
             // stdout so protocol lines stay intact and IDLE0 services the WDT.
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -734,7 +736,7 @@ void render_task(void *arg)
         // callback above and never during console dumps, and delivered to the
         // running app with the render generation before the log line.
         const uint32_t now_s = static_cast<uint32_t>(esp_timer_get_time() / 1000000ULL);
-        if (now_s != last_log_s && !s_console.dump_active()) {
+        if (now_s != last_log_s && !s_console.protocol_output_active()) {
             last_log_s = now_s;
             sample_system_telemetry(app, word >> kAppGenShift);
             log_telemetry(app, app_index);
@@ -867,11 +869,8 @@ const char *runtime_mode_name()
     return s_mode_name.load(std::memory_order_acquire);
 }
 
-bool runtime_active_stats(AppStats *out)
+bool runtime_active_stats(AppStats &stats)
 {
-    if (out == nullptr) {
-        return false;
-    }
     const uint32_t before =
         s_active_selection.load(std::memory_order_acquire);
     AppStats snapshot{};
@@ -887,10 +886,10 @@ bool runtime_active_stats(AppStats *out)
     const uint32_t after =
         s_active_selection.load(std::memory_order_acquire);
     if (!valid || after != before) {
-        *out = {};
+        stats = {};
         return false;
     }
-    *out = snapshot;
+    stats = snapshot;
     return true;
 }
 
@@ -940,7 +939,7 @@ bool runtime_active_stats(AppStats *out)
     // (motion/release/status) and InputService (synthetic `input` gestures);
     // the reset callback is the app's reset atomic via a trampoline bound
     // exactly once here, never rebound.
-    err = s_console.start(&s_display, &s_motion, &s_input, app_reset_trampoline);
+    err = s_console.start(s_display, s_motion, s_input, app_reset_trampoline);
     if (err != ESP_OK) {
         fatal_startup("console service init", err);
     }
