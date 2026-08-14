@@ -170,7 +170,7 @@ esp_err_t ConsoleService::start(DisplayService *display, MotionService *motion,
                                 "<radians>", command_yaw)) != ESP_OK ||
         (err = register_command("axes", "Set IMU axis signs for Cube/Level (each ±1)",
                                 "<sx> <sy> <sz>", command_axes)) != ESP_OK ||
-        (err = register_command("gain", "Scale Level rotation (Cube stays one-to-one)",
+        (err = register_command("gain", "Scale Cube/Level relative rotation",
                                 "<scale>", command_gain)) != ESP_OK ||
         (err = register_command("tau", "Set Cube/Level complementary-filter time constant",
                                 "<seconds>", command_tau)) != ESP_OK) {

@@ -9,7 +9,7 @@ namespace fluid_demo {
 
 /// Board-frame attitude from gyro integration plus accelerometer tilt.
 /// Relative mode treats the current pose as identity at reset and supports
-/// display gain. GravityAligned mode keeps a one-to-one physical pose:
+/// display gain. GravityAligned mode uses a screen-up board as identity:
 /// roll/pitch stay tied to gravity and yaw is gyro-relative. USB-at-bottom
 /// axis mapping matches MotionFilter.
 class AttitudeFilter {
@@ -92,7 +92,7 @@ private:
     Quat q_{};
     Quat q_ref_{};
     float R_[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
-    Vec3 g_world_{0.0f, -kOneG, 0.0f};
+    Vec3 g_world_{0.0f, 0.0f, kOneG};
     Vec3 up_{0.0f, 1.0f, 0.0f};
     Vec3 mapped_{};
     Vec3 raw_accel_{};

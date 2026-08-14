@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""Build, flash, and debug the ESP32-S3 without manual environment setup."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+BUILD_DIR = ROOT / ".cache" / "debug"
+SDKCONFIG = BUILD_DIR / "sdkconfig"
+SDKCONFIG_DEFAULTS = ROOT / "sdkconfig.defaults"
+DEBUG_DEFAULTS = ROOT / "sdkconfig.debug.defaults"
+APP_ELF = BUILD_DIR / "fluid_box_3d.elf"
+IDF_VERSION = "6.0.2"
+GDB_PORT = 3333
+OPENOCD_READY_SECONDS = 10.0
+CUBE_BREAKPOINT = "main/orient_cube_app.cpp:243"
+
+
+class DebugError(RuntimeError):
+    """A debugger setup step failed with a user-actionable message."""
+
+
+def executable(env: dict[str, str], name: str) -> str | None:
+    return shutil.which(name, path=env.get("PATH"))
+
+def expose_idf_py(env: dict[str, str]) -> None:
+    idf_path = env.get("IDF_PATH")
+    if not idf_path:
+        return
+    tools = str(Path(idf_path) / "tools")
+    path_entries = env.get("PATH", "").split(os.pathsep)
+    if tools not in path_entries:
+        env["PATH"] = tools + os.pathsep + env.get("PATH", "")
+
+
+def idf_environment() -> dict[str, str]:
+    """Return an ESP-IDF environment, loading the local EIM activation if needed."""
+    env = os.environ.copy()
+    expose_idf_py(env)
+    required = ("idf.py", "openocd", "xtensa-esp32s3-elf-gdb")
+    if env.get("IDF_PATH") and all(executable(env, name) for name in required):
+        return env
+
+    activation = (
+        Path.home() / ".espressif" / "tools" /
+        "activate_idf_v{}.sh".format(IDF_VERSION)
+    )
+    if not activation.is_file():
+        raise DebugError(
+            "ESP-IDF {} is unavailable; expected {}"
+            .format(IDF_VERSION, activation)
+        )
+
+    result = subprocess.run(
+        [str(activation), "-e"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise DebugError("ESP-IDF activation failed: {}".format(detail))
+
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key:
+            env[key] = value
+
+    expose_idf_py(env)
+
+    missing = [name for name in required if not executable(env, name)]
+    if missing:
+        raise DebugError(
+            "ESP-IDF activation omitted required tool(s): {}"
+            .format(", ".join(missing))
+        )
+    return env
+
+
+def run_idf_flash(env: dict[str, str], port: str | None) -> None:
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    command = [
+        executable(env, "idf.py") or "idf.py",
+        "-B", str(BUILD_DIR),
+        "-DSDKCONFIG={}".format(SDKCONFIG),
+        "-DSDKCONFIG_DEFAULTS={};{}".format(
+            SDKCONFIG_DEFAULTS, DEBUG_DEFAULTS
+        ),
+    ]
+    if port:
+        command.extend(("-p", port))
+    command.append("flash")
+
+    print("[debug] Building and flashing the source-level debug firmware...",
+          flush=True)
+    result = subprocess.run(command, cwd=ROOT, env=env, check=False)
+    if result.returncode != 0:
+        raise DebugError("ESP-IDF build/flash failed")
+
+
+def require_existing_build() -> None:
+    required = (
+        APP_ELF,
+        BUILD_DIR / "gdbinit" / "symbols",
+        BUILD_DIR / "gdbinit" / "prefix_map",
+        BUILD_DIR / "gdbinit" / "py_extensions",
+    )
+    missing = [str(path.relative_to(ROOT)) for path in required if not path.is_file()]
+    if missing:
+        raise DebugError(
+            "--reuse needs an existing debug build; run ./debug first "
+            "(missing {})".format(", ".join(missing))
+        )
+
+
+def port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+            return True
+    except OSError:
+        return False
+
+
+def log_tail(path: Path, lines: int = 30) -> str:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(content[-lines:])
+
+
+def stop_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def start_openocd(env: dict[str, str]):
+    if port_open(GDB_PORT):
+        raise DebugError(
+            "TCP port {} is already in use; stop the old OpenOCD/debug session"
+            .format(GDB_PORT)
+        )
+
+    log_path = BUILD_DIR / "openocd.log"
+    log_file = log_path.open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        [executable(env, "openocd") or "openocd",
+         "-f", "board/esp32s3-builtin.cfg"],
+        cwd=ROOT,
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    deadline = time.monotonic() + OPENOCD_READY_SECONDS
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        if port_open(GDB_PORT):
+            return process, log_file, log_path
+        time.sleep(0.1)
+
+    stop_process_group(process)
+    log_file.close()
+    detail = log_tail(log_path)
+    if "LIBUSB_ERROR_ACCESS" in detail:
+        raise DebugError(
+            "JTAG permission denied. Install OpenOCD's 60-openocd.rules, "
+            "reload udev, and replug the board"
+        )
+    raise DebugError(
+        "OpenOCD did not start; see {}{}"
+        .format(log_path, "\n" + detail if detail else "")
+    )
+
+
+def resume_target() -> None:
+    """Best-effort resume so leaving the helper does not strand a halted board."""
+    try:
+        with socket.create_connection(("127.0.0.1", 4444), timeout=0.4) as sock:
+            sock.settimeout(0.1)
+            try:
+                sock.recv(4096)
+            except OSError:
+                pass
+            sock.sendall(b"resume\n")
+            time.sleep(0.1)
+    except OSError:
+        pass
+
+
+def gdb_script(location: str | None) -> Path:
+    script = BUILD_DIR / "session.gdb"
+    commands = [
+        "source {}".format(BUILD_DIR / "gdbinit" / "symbols"),
+        "source {}".format(BUILD_DIR / "gdbinit" / "prefix_map"),
+        "source {}".format(BUILD_DIR / "gdbinit" / "py_extensions"),
+        "set confirm off",
+        "set print pretty on",
+        "set history filename {}".format(BUILD_DIR / "gdb_history"),
+        "set history save on",
+        "set remotetimeout 10",
+        "target remote :{}".format(GDB_PORT),
+        "monitor reset halt",
+        "maintenance flush register-cache",
+    ]
+    if location:
+        commands.extend((
+            "break {}".format(location),
+            "echo [debug] Breakpoint armed at {}\\n".format(location),
+            "echo [debug] Launch the app, then use ./debug drive right in another terminal.\\n",
+            "continue",
+        ))
+    else:
+        commands.extend((
+            "thbreak app_main",
+            "continue",
+            "echo [debug] Stopped at app_main; set a breakpoint, then continue.\\n",
+        ))
+    script.write_text("\n".join(commands) + "\n", encoding="utf-8")
+    return script
+
+
+def run_gdb(env: dict[str, str], location: str | None, tui: bool) -> int:
+    script = gdb_script(location)
+    command = [executable(env, "xtensa-esp32s3-elf-gdb") or
+               "xtensa-esp32s3-elf-gdb", "-q"]
+    if tui:
+        command.append("-tui")
+    command.extend(("-x", str(script)))
+
+    print("[debug] OpenOCD is ready. GDB owns this terminal.", flush=True)
+    print("[debug] Ctrl-C pauses; use 'detach' then 'quit' when done.", flush=True)
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+    try:
+        process = subprocess.Popen(command, cwd=ROOT, env=env)
+        return process.wait()
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+
+
+def debug_session(
+    env: dict[str, str],
+    location: str | None,
+    reuse: bool,
+    port: str | None,
+    tui: bool,
+) -> int:
+    if reuse:
+        require_existing_build()
+    else:
+        run_idf_flash(env, port)
+
+    openocd = None
+    log_file = None
+    try:
+        openocd, log_file, _log_path = start_openocd(env)
+        return run_gdb(env, location, tui)
+    finally:
+        if openocd is not None:
+            resume_target()
+            stop_process_group(openocd)
+        if log_file is not None:
+            log_file.close()
+
+
+def run_device_command(
+    env: dict[str, str], port: str | None, arguments: list[str]
+) -> int:
+    python_dir = env.get("IDF_PYTHON_ENV_PATH")
+    python = str(Path(python_dir) / "bin" / "python") if python_dir else sys.executable
+    command = [python, str(ROOT / "tools" / "device_dev.py")]
+    if port:
+        command.extend(("--port", port))
+    command.extend(arguments)
+    return subprocess.run(command, cwd=ROOT, env=env, check=False).returncode
+
+
+def add_session_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--reuse", action="store_true",
+        help="reuse the existing debug ELF and flashed image"
+    )
+    parser.add_argument("--port", metavar="DEV", help="serial port used for flashing")
+    parser.add_argument(
+        "--tui", action="store_true",
+        help="open GDB's split source/command interface"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="./debug",
+        description="One-command ESP32-S3 build, flash, OpenOCD, and GDB workflow.",
+        epilog=(
+            "examples:\n"
+            "  ./debug                  debug Cube\n"
+            "  ./debug --reuse          reconnect without rebuilding/flashing\n"
+            "  ./debug drive right      inject a deterministic Cube tilt\n"
+            "  ./debug release          return motion control to the IMU\n"
+            "  ./debug send tau 0.15   tune the filter live\n"
+            "  ./debug gdb main/foo.cpp:123\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    cube = subparsers.add_parser(
+        "cube", help="debug Cube's deterministic motion path"
+    )
+    add_session_options(cube)
+
+    generic = subparsers.add_parser(
+        "gdb", help="open a general firmware GDB session"
+    )
+    generic.add_argument(
+        "location", nargs="?", metavar="BREAKPOINT",
+        help="optional function or file:line breakpoint"
+    )
+    add_session_options(generic)
+
+    drive = subparsers.add_parser(
+        "drive", help="inject a named gravity pose from another terminal"
+    )
+    drive.add_argument("pose", metavar="POSE")
+    drive.add_argument(
+        "--duration", type=int, default=10000, metavar="MS",
+        help="override duration (default: %(default)s ms)"
+    )
+    drive.add_argument("--port", metavar="DEV", help="serial device")
+
+    release = subparsers.add_parser(
+        "release", help="return motion control to the physical IMU"
+    )
+    release.add_argument("--port", metavar="DEV", help="serial device")
+
+    send = subparsers.add_parser(
+        "send", help="send one firmware console command"
+    )
+    send.add_argument("words", nargs="+", metavar="WORD")
+    send.add_argument("--port", metavar="DEV", help="serial device")
+    return parser
+
+
+def parse_args(argv: list[str] | None = None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        arguments = ["cube"]
+    elif arguments[0].startswith("-") and arguments[0] not in ("-h", "--help"):
+        arguments.insert(0, "cube")
+    return build_parser().parse_args(arguments)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.command is None:
+        build_parser().print_help()
+        return 0
+
+    try:
+        env = idf_environment()
+        if args.command == "cube":
+            return debug_session(
+                env, CUBE_BREAKPOINT, args.reuse, args.port, args.tui
+            )
+        if args.command == "gdb":
+            return debug_session(
+                env, args.location, args.reuse, args.port, args.tui
+            )
+        if args.command == "drive":
+            return run_device_command(
+                env, args.port,
+                ["drive", args.pose, "--duration", str(args.duration)],
+            )
+        if args.command == "release":
+            return run_device_command(
+                env, args.port, ["send", "release", "--timeout", "0.2"]
+            )
+        if args.command == "send":
+            return run_device_command(
+                env, args.port, ["send", *args.words, "--timeout", "0.7"]
+            )
+        raise DebugError("unknown command {}".format(args.command))
+    except DebugError as exc:
+        print("debug: error: {}".format(exc), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n[debug] interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

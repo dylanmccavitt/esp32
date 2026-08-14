@@ -14,7 +14,10 @@ constexpr float kMaxAccelMag = 5.0f * AttitudeFilter::kOneG;
 constexpr float kEps = 1e-6f;
 constexpr float kComplementaryTau = 0.35f;
 constexpr float kOverrideTau = 0.04f;
-constexpr float kGyroBiasStill = 0.12f;
+// Seed from a plausibly stationary alignment sample, but only adapt an
+// established bias when residual motion is below normal deliberate hand motion.
+constexpr float kGyroBiasSeedMax = 0.12f;
+constexpr float kGyroBiasAdaptMax = 0.04f;
 constexpr float kGyroBiasTau = 1.5f;
 constexpr float kGainMin = 0.0f;
 constexpr float kGainMax = 4.0f;
@@ -218,7 +221,7 @@ void AttitudeFilter::hard_reset()
     R_[6] = 0.0f;
     R_[7] = 0.0f;
     R_[8] = 1.0f;
-    g_world_ = {0.0f, -kOneG, 0.0f};
+    g_world_ = {0.0f, 0.0f, kOneG};
     up_ = {0.0f, 1.0f, 0.0f};
     mapped_ = {};
     raw_accel_ = {};
@@ -246,7 +249,7 @@ void AttitudeFilter::reset()
     R_[6] = 0.0f;
     R_[7] = 0.0f;
     R_[8] = 1.0f;
-    g_world_ = {0.0f, -kOneG, 0.0f};
+    g_world_ = {0.0f, 0.0f, kOneG};
     up_ = {0.0f, 1.0f, 0.0f};
     mapped_ = {};
     raw_accel_ = {};
@@ -423,9 +426,12 @@ void AttitudeFilter::init_world(const Vec3 &g_meas)
         q_ = {};
         g_world_ = g_meas;
     } else {
+        // The renderer's identity pose is the physical board lying screen-up,
+        // so mapped +Z is the fixed world-gravity direction. Using screen +Y
+        // here would make a flat board appear rotated by 90 degrees.
         Vec3 measured = g_meas;
-        Vec3 gravity{0.0f, -1.0f, 0.0f};
-        if (!vec_normalize(measured) || !vec_normalize(gravity)) {
+        Vec3 gravity{0.0f, 0.0f, 1.0f};
+        if (!vec_normalize(measured)) {
             hard_reset();
             return;
         }
@@ -434,7 +440,7 @@ void AttitudeFilter::init_world(const Vec3 &g_meas)
             hard_reset();
             return;
         }
-        g_world_ = {0.0f, -kOneG, 0.0f};
+        g_world_ = {0.0f, 0.0f, kOneG};
     }
     have_ref_ = true;
     gyro_abs_ = 0.0f;
@@ -501,23 +507,27 @@ bool AttitudeFilter::update(const Vec3 &accel_mps2, const Vec3 &gyro_rads, float
 
     const bool align = align_pending_.exchange(false, std::memory_order_acq_rel);
     if (!have_ref_ || align) {
-        // A rotation sample is real motion, not bias. Start without bias and
-        // let the stationary path below converge once the device stops.
+        // Alignment is the explicit stationary reference point. Seed the
+        // hardware offset only from a low-rate sample; a moving sample starts
+        // unbiased and gravity still supplies roll/pitch.
         init_world(mapped);
-        gyro_bias_ = raw_gyro_abs < kGyroBiasStill ? gyro : Vec3{};
+        gyro_bias_ = raw_gyro_abs < kGyroBiasSeedMax ? gyro : Vec3{};
         consume_yaw_request();
         return true;
     }
 
-    if (raw_gyro_abs < kGyroBiasStill) {
+    Vec3 gyro_corr{gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
+                   gyro.z - gyro_bias_.z};
+    float corr_abs = vec_length(gyro_corr);
+    if (corr_abs < kGyroBiasAdaptMax) {
         const float blend = 1.0f - std::exp(-clamped_dt / kGyroBiasTau);
-        gyro_bias_.x += blend * (gyro.x - gyro_bias_.x);
-        gyro_bias_.y += blend * (gyro.y - gyro_bias_.y);
-        gyro_bias_.z += blend * (gyro.z - gyro_bias_.z);
+        gyro_bias_.x += blend * gyro_corr.x;
+        gyro_bias_.y += blend * gyro_corr.y;
+        gyro_bias_.z += blend * gyro_corr.z;
+        gyro_corr = {gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
+                     gyro.z - gyro_bias_.z};
+        corr_abs = vec_length(gyro_corr);
     }
-    const Vec3 gyro_corr{gyro.x - gyro_bias_.x, gyro.y - gyro_bias_.y,
-                         gyro.z - gyro_bias_.z};
-    const float corr_abs = vec_length(gyro_corr);
     gyro_abs_ = corr_abs;
 
     const float half = 0.5f * clamped_dt;
