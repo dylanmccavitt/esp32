@@ -1723,4 +1723,4 @@ const uint16_t kIconAvalanche[kLauncherIconPixels] = {
     0xF81F, 0xF81F, 0xF81F, 0xF81F,
 };
 
-}  // namespace fluid_demo
+}

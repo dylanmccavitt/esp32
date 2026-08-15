@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Hardware acceptance bridge for the development-only firmware shell protocol.
-
-This executable deliberately exercises the board through the same serial protocol
-used by tools/device_dev.py.  It is expected to fail against firmware that does
-not yet implement the ``input`` commands and completed-transition MODE markers.
-"""
+"""Exercise firmware-shell behavior against a connected board."""
 
 from __future__ import annotations
 
@@ -46,12 +41,21 @@ POWER_OFF_POST_MARKER_RELEASE_SECONDS = 1.1
 FREEZE_DRIFT_CALIBRATION_FRAMES = 3
 PORT_POLL_SECONDS = 0.05
 
-MODE_NAMES = ("launcher", "fluid_box", "tilt_maze", "ragdoll_avalanche")
+MODE_NAMES = (
+    "launcher",
+    "fluid_box",
+    "tilt_maze",
+    "ragdoll_avalanche",
+    "orient_cube",
+    "attitude",
+)
 MODE_MARKERS = {mode: "@DEV MODE {}".format(mode) for mode in MODE_NAMES}
 MODE_LAUNCHER = MODE_MARKERS["launcher"]
 MODE_FLUID = MODE_MARKERS["fluid_box"]
 MODE_MAZE = MODE_MARKERS["tilt_maze"]
 MODE_AVALANCHE = MODE_MARKERS["ragdoll_avalanche"]
+MODE_CUBE = MODE_MARKERS["orient_cube"]
+MODE_LEVEL = MODE_MARKERS["attitude"]
 RUNNING_MODES = MODE_NAMES[1:]
 CORE_CHECKS = ("launcher", "once", "cycles", "freeze", "reboot")
 ALL_CHECKS = CORE_CHECKS + ("soak",)
@@ -87,7 +91,7 @@ STATUS_VALUE_DESCRIPTIONS = {
 
 
 class AcceptanceTimeout(UserError):
-    """A bounded acceptance observation did not arrive."""
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -175,12 +179,6 @@ class SerialPortIdentity:
 
 
 class AcceptanceDevice(Device):
-    """Device observer that records non-frame lines from Device.emit().
-
-    ReaderThread continues to own serial reads and FrameParser continues to own
-    @FB decoding.  This subclass only observes Device's existing emit funnel so
-    acceptance waits cannot race a second serial consumer.
-    """
 
     def __init__(self, *args, **kwargs):
         self._line_condition = threading.Condition()
@@ -192,8 +190,8 @@ class AcceptanceDevice(Device):
     def emit(self, text: bytes | str):
         decoded = text.decode("utf-8", "replace") if isinstance(text, bytes) else text
         with self._line_condition:
-            for raw in decoded.splitlines():
-                line = raw.rstrip("\r")
+            for raw_line in decoded.splitlines():
+                line = raw_line.rstrip("\r")
                 if not line:
                     continue
                 self._line_sequence += 1
@@ -212,10 +210,14 @@ class AcceptanceDevice(Device):
         cursor = after
         while True:
             with self._line_condition:
-                pending = [(seq, line) for seq, line in self._lines if seq > cursor]
-                if pending:
-                    cursor = pending[-1][0]
-                for sequence, line in pending:
+                pending_lines = [
+                    (sequence, line)
+                    for sequence, line in self._lines
+                    if sequence > cursor
+                ]
+                if pending_lines:
+                    cursor = pending_lines[-1][0]
+                for sequence, line in pending_lines:
                     self._raise_if_command_rejected(line, description)
                     if predicate(line):
                         return sequence, line
@@ -267,10 +269,9 @@ class AcceptanceDevice(Device):
 
     def lines_since(self, after: int) -> list[tuple[int, str]]:
         with self._line_condition:
-            return [(seq, line) for seq, line in self._lines if seq > after]
+            return [(sequence, line) for sequence, line in self._lines if sequence > after]
 
     def scan_command_failures(self, after: int, description: str) -> int:
-        """Reject command failures observed after a checkpoint and return a cursor."""
         cursor = after
         with self._line_condition:
             for sequence, line in self._lines:
@@ -306,7 +307,6 @@ def parse_telemetry(sequence: int, line: str) -> Telemetry | None:
 
 
 def validate_status(line: str, label: str) -> Status:
-    """Validate and parse the complete STATUS contract exactly once."""
     stripped = line.strip()
     if not stripped.startswith(STATUS_PREFIX):
         raise UserError(
@@ -371,8 +371,7 @@ def frame_signature(frame: FrameEvent) -> str:
     return hashlib.sha256(frame.data).hexdigest()
 
 
-def frame_distance(left: FrameEvent, right: FrameEvent) -> float:
-    """Mean normalized RGB565 channel distance, in the range 0..1."""
+def mean_frame_distance(left: FrameEvent, right: FrameEvent) -> float:
     if (left.width, left.height, len(left.data)) != (
         right.width,
         right.height,
@@ -382,11 +381,11 @@ def frame_distance(left: FrameEvent, right: FrameEvent) -> float:
 
     total = 0
     for offset in range(0, len(left.data), 2):
-        lhs = (left.data[offset] << 8) | left.data[offset + 1]
-        rhs = (right.data[offset] << 8) | right.data[offset + 1]
-        total += abs((lhs >> 11) - (rhs >> 11))
-        total += abs(((lhs >> 5) & 0x3F) - ((rhs >> 5) & 0x3F))
-        total += abs((lhs & 0x1F) - (rhs & 0x1F))
+        left_pixel = (left.data[offset] << 8) | left.data[offset + 1]
+        right_pixel = (right.data[offset] << 8) | right.data[offset + 1]
+        total += abs((left_pixel >> 11) - (right_pixel >> 11))
+        total += abs(((left_pixel >> 5) & 0x3F) - ((right_pixel >> 5) & 0x3F))
+        total += abs((left_pixel & 0x1F) - (right_pixel & 0x1F))
     return total / ((len(left.data) // 2) * (31 + 63 + 31))
 
 
@@ -395,7 +394,7 @@ class FirmwareShellAcceptance:
         self.args = args
         self.requested_port = args.port
         self.port = args.port
-        self.dev = self._connect(args.reconnect_timeout)
+        self.device = self._connect(args.reconnect_timeout)
         self.port_identity = SerialPortIdentity.capture(
             self.port, explicit=args.port is not None
         )
@@ -407,9 +406,9 @@ class FirmwareShellAcceptance:
         self.fluid_frame = None
 
     def close(self):
-        if self.dev is not None:
-            self.dev.close()
-            self.dev = None
+        if self.device is not None:
+            self.device.close()
+            self.device = None
 
     def _connect(
         self,
@@ -443,14 +442,14 @@ class FirmwareShellAcceptance:
                         if identity.device in candidates
                         else candidates[0]
                     )
-                dev = AcceptanceDevice(
+                device = AcceptanceDevice(
                     port=port,
                     baudrate=self.args.baud,
                     out_dir=self.args.out_dir,
                 )
                 self.port = port
                 print("[accept] connected: {} @ {} baud".format(port, self.args.baud))
-                return dev
+                return device
             except (device_dev.PortNotFound, UserError) as exc:
                 last_error = exc
                 time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
@@ -460,19 +459,19 @@ class FirmwareShellAcceptance:
         )
 
     def _reconnect(self, timeout: float | None = None):
-        if self.dev is not None:
-            self.dev.close()
-            self.dev = None
-        self.dev = self._connect(
+        if self.device is not None:
+            self.device.close()
+            self.device = None
+        self.device = self._connect(
             self.args.reconnect_timeout if timeout is None else timeout,
             self.port_identity,
         )
         self.mode = None
 
     def _request_status(self, label: str, timeout: float) -> Status:
-        checkpoint = self.dev.checkpoint()
-        self.dev.echo_send("status")
-        _, line = self.dev.wait_line(
+        checkpoint = self.device.checkpoint()
+        self.device.echo_send("status")
+        _, line = self.device.wait_line(
             lambda candidate: candidate.strip().startswith(STATUS_PREFIX),
             checkpoint,
             timeout,
@@ -482,7 +481,7 @@ class FirmwareShellAcceptance:
 
     def _scan_reboot_lines(
         self,
-        dev: AcceptanceDevice,
+        device: AcceptanceDevice,
         after: int,
         label: str,
         reboot_sequence: int | None,
@@ -491,10 +490,10 @@ class FirmwareShellAcceptance:
     ) -> tuple[int, int | None, int | None]:
         cursor = after
         description = "reboot evidence after {}".format(label)
-        for sequence, line in dev.lines_since(after):
+        for sequence, line in device.lines_since(after):
             if through is not None and sequence > through:
                 break
-            dev._raise_if_command_rejected(line, description)
+            device._raise_if_command_rejected(line, description)
             cursor = sequence
             stripped = line.strip()
             if stripped == "@DEV REBOOTING":
@@ -542,7 +541,7 @@ class FirmwareShellAcceptance:
                 )
             observed_markers = {
                 candidate.strip()
-                for _, candidate in self.dev.lines_since(0)
+                for _, candidate in self.device.lines_since(0)
                 if candidate.strip() in MODE_MARKERS.values()
             }
             unexpected = observed_markers - {MODE_LAUNCHER}
@@ -566,10 +565,9 @@ class FirmwareShellAcceptance:
         command_checkpoint: int,
         baseline_uptime_ms: int,
     ):
-        """Accept identity reconnect or prove an ordered in-place USB restart."""
         deadline = time.monotonic() + self.args.reconnect_timeout
-        dev = self.dev
-        if dev is None:
+        device = self.device
+        if device is None:
             raise UserError(
                 "{} cannot prove a reboot because the serial link was already closed"
                 .format(label)
@@ -580,7 +578,7 @@ class FirmwareShellAcceptance:
         launcher_sequence = None
         while True:
             cursor, reboot_sequence, launcher_sequence = self._scan_reboot_lines(
-                dev,
+                device,
                 cursor,
                 label,
                 reboot_sequence,
@@ -588,14 +586,14 @@ class FirmwareShellAcceptance:
             )
 
             transport_lost = (
-                not dev.reader.is_alive()
+                not device.reader.is_alive()
                 or (
                     self._identity_was_enumerated
                     and not self.port_identity.present_devices()
                 )
             )
             if transport_lost:
-                if dev._stop.is_set():
+                if device._stop.is_set():
                     raise UserError(
                         "{} cannot prove a reboot because the host closed the serial "
                         "link before device-generated transport loss was observed"
@@ -604,15 +602,15 @@ class FirmwareShellAcceptance:
 
                 # Stop and join the sole reader before the final scan so a marker
                 # appended during transport teardown cannot race reconnect.
-                dev.close()
+                device.close()
                 cursor, reboot_sequence, launcher_sequence = self._scan_reboot_lines(
-                    dev,
+                    device,
                     cursor,
                     label,
                     reboot_sequence,
                     launcher_sequence,
                 )
-                self.dev = None
+                self.device = None
                 if reboot_sequence is None:
                     raise UserError(
                         "{} lost transport before the required post-command "
@@ -627,7 +625,7 @@ class FirmwareShellAcceptance:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                dev.scan_command_failures(
+                device.scan_command_failures(
                     cursor,
                     "reboot evidence after {}".format(label),
                 )
@@ -646,10 +644,10 @@ class FirmwareShellAcceptance:
                 time.sleep(min(PORT_POLL_SECONDS, remaining))
                 continue
 
-            status_checkpoint = self.dev.checkpoint()
-            self.dev.echo_send("status")
+            status_checkpoint = self.device.checkpoint()
+            self.device.echo_send("status")
             try:
-                status_sequence, status_line = self.dev.wait_line(
+                status_sequence, status_line = self.device.wait_line(
                     lambda candidate: candidate.strip().startswith(STATUS_PREFIX),
                     status_checkpoint,
                     min(STATUS_RETRY_SECONDS, remaining),
@@ -661,7 +659,7 @@ class FirmwareShellAcceptance:
                 continue
 
             cursor, reboot_sequence, launcher_sequence = self._scan_reboot_lines(
-                dev,
+                device,
                 cursor,
                 label,
                 reboot_sequence,
@@ -696,7 +694,7 @@ class FirmwareShellAcceptance:
                 )
 
             transport_lost = (
-                not dev.reader.is_alive()
+                not device.reader.is_alive()
                 or (
                     self._identity_was_enumerated
                     and not self.port_identity.present_devices()
@@ -800,14 +798,14 @@ class FirmwareShellAcceptance:
 
 
     def _send_wait_exact(self, command: str, marker: str):
-        checkpoint = self.dev.checkpoint()
-        self.dev.echo_send(command)
-        return self.dev.wait_exact(marker, checkpoint, self.args.timeout)
+        checkpoint = self.device.checkpoint()
+        self.device.echo_send(command)
+        return self.device.wait_exact(marker, checkpoint, self.args.timeout)
 
     def _send_wait_prefix(self, command: str, marker: str):
-        checkpoint = self.dev.checkpoint()
-        self.dev.echo_send(command)
-        return self.dev.wait_prefix(marker, checkpoint, self.args.timeout)
+        checkpoint = self.device.checkpoint()
+        self.device.echo_send(command)
+        return self.device.wait_prefix(marker, checkpoint, self.args.timeout)
 
     def _transition(self, command: str, marker: str):
         sequence, _ = self._send_wait_exact(command, marker)
@@ -825,8 +823,8 @@ class FirmwareShellAcceptance:
             "short BOOT pre-command status",
             MODE_NAMES,
         )
-        checkpoint = self.dev.checkpoint()
-        self.dev.echo_send("input boot 150")
+        checkpoint = self.device.checkpoint()
+        self.device.echo_send("input boot 150")
         try:
             self._observe_rebooted_launcher(
                 "short BOOT input",
@@ -844,10 +842,10 @@ class FirmwareShellAcceptance:
             "legacy reboot pre-command status",
             ("launcher",),
         )
-        checkpoint = self.dev.checkpoint()
-        self.dev.echo_send("reboot")
+        checkpoint = self.device.checkpoint()
+        self.device.echo_send("reboot")
         try:
-            self.dev.wait_exact("@DEV REBOOTING", checkpoint, self.args.timeout)
+            self.device.wait_exact("@DEV REBOOTING", checkpoint, self.args.timeout)
         except DeviceGone as exc:
             raise UserError(
                 "legacy reboot command disconnected before the required "
@@ -885,9 +883,9 @@ class FirmwareShellAcceptance:
         self._transition("input plus", MODE_FLUID)
 
     def _capture(self, label: str) -> FrameEvent:
-        frame = self.dev.capture(self.args.capture_timeout)
+        frame = self.device.capture(self.args.capture_timeout)
         self._assert_frame_shape(frame, label)
-        path = save_frame(self.dev, frame, self.args.out_dir)
+        path = save_frame(self.device, frame, self.args.out_dir)
         print(
             "[accept] {} signature={} path={}".format(
                 label, frame_signature(frame)[:16], path
@@ -918,19 +916,19 @@ class FirmwareShellAcceptance:
             )
 
     def _wait_epoch(self, after: int, predicate, description: str) -> Telemetry:
-        _, line = self.dev.wait_telemetry(
+        sequence, line = self.device.wait_telemetry(
             predicate,
             after,
             self.args.telemetry_timeout,
             description,
         )
-        sample = parse_telemetry(0, line)
+        sample = parse_telemetry(sequence, line)
         if sample is None:
             raise UserError("internal telemetry observation error")
         return sample
 
     def _health_baseline(self, after: int, label: str) -> Telemetry:
-        sequence, line = self.dev.wait_telemetry(
+        sequence, line = self.device.wait_telemetry(
             lambda sample: (
                 sample.missed is not None
                 and sample.nonfinite is not None
@@ -964,7 +962,7 @@ class FirmwareShellAcceptance:
         action_end: int,
         label: str,
     ):
-        post_sequence, post_line = self.dev.wait_telemetry(
+        post_sequence, post_line = self.device.wait_telemetry(
             lambda sample: (
                 sample.missed is not None
                 and sample.nonfinite is not None
@@ -992,7 +990,7 @@ class FirmwareShellAcceptance:
         observed = [baseline]
         observed.extend(
             sample
-            for sample in self.dev.telemetry_since(baseline.sequence)
+            for sample in self.device.telemetry_since(baseline.sequence)
             if sample.sequence <= post_sequence
         )
         for sample in observed:
@@ -1058,7 +1056,7 @@ class FirmwareShellAcceptance:
 
         def run_touch_round(round_number: int) -> FrameEvent:
             label = "touch round {}".format(round_number)
-            checkpoint = self.dev.checkpoint()
+            checkpoint = self.device.checkpoint()
             print(
                 "[accept] ACTION: {} tap and release the centered Fluid Box entry "
                 "on the touchscreen"
@@ -1111,7 +1109,7 @@ class FirmwareShellAcceptance:
                 return False
 
             try:
-                fluid_sequence, _ = self.dev.wait_line(
+                fluid_sequence, _ = self.device.wait_line(
                     observe_touch_transition,
                     checkpoint,
                     self.args.touch_timeout,
@@ -1153,14 +1151,14 @@ class FirmwareShellAcceptance:
                     "disconnect/reconnect is not accepted".format(label)
                 ) from exc
 
-            cleanup_checkpoint = self.dev.checkpoint()
+            cleanup_checkpoint = self.device.checkpoint()
             pre_cleanup_description = "the Fluid capture before {} cleanup".format(
                 label
             )
-            for sequence, line in self.dev.lines_since(fluid_sequence):
+            for sequence, line in self.device.lines_since(fluid_sequence):
                 if sequence > cleanup_checkpoint:
                     break
-                self.dev._raise_if_command_rejected(
+                self.device._raise_if_command_rejected(
                     line,
                     pre_cleanup_description,
                 )
@@ -1182,7 +1180,7 @@ class FirmwareShellAcceptance:
                         "cleanup".format(label, stripped)
                     )
 
-            self.dev.echo_send("input pwr 120")
+            self.device.echo_send("input pwr 120")
 
             def observe_cleanup_home(line: str) -> bool:
                 stripped = line.strip()
@@ -1206,7 +1204,7 @@ class FirmwareShellAcceptance:
                 return False
 
             try:
-                home_sequence, _ = self.dev.wait_line(
+                home_sequence, _ = self.device.wait_line(
                     observe_cleanup_home,
                     cleanup_checkpoint,
                     self.args.timeout,
@@ -1241,7 +1239,7 @@ class FirmwareShellAcceptance:
                     )
 
             try:
-                self.dev.wait_line(
+                self.device.wait_line(
                     lambda line: (reject_post_home_line(line), False)[1],
                     home_sequence,
                     TOUCH_RELEASE_QUIET_SECONDS,
@@ -1256,16 +1254,16 @@ class FirmwareShellAcceptance:
                     .format(label)
                 ) from exc
 
-            quiet_end = self.dev.checkpoint()
+            quiet_end = self.device.checkpoint()
             post_home_description = "the touch release window after {} cleanup".format(
                 label
             )
 
             def scan_post_home(through: int):
-                for sequence, line in self.dev.lines_since(home_sequence):
+                for sequence, line in self.device.lines_since(home_sequence):
                     if sequence > through:
                         break
-                    self.dev._raise_if_command_rejected(
+                    self.device._raise_if_command_rejected(
                         line,
                         post_home_description,
                     )
@@ -1283,7 +1281,7 @@ class FirmwareShellAcceptance:
                     "STATUS; disconnect/reconnect is not accepted".format(label)
                 ) from exc
 
-            scan_post_home(self.dev.checkpoint())
+            scan_post_home(self.device.checkpoint())
             if status.mode != "launcher":
                 raise UserError(
                     "{} final STATUS reported mode={}; expected launcher"
@@ -1307,9 +1305,11 @@ class FirmwareShellAcceptance:
         apps = (
             (1, "Task Maze", "tilt_maze", MODE_MAZE),
             (2, "Avalanche", "ragdoll_avalanche", MODE_AVALANCHE),
+            (3, "Cube", "orient_cube", MODE_CUBE),
+            (4, "Level", "attitude", MODE_LEVEL),
         )
         for selection, label, mode, marker in apps:
-            checkpoint = self.dev.checkpoint()
+            checkpoint = self.device.checkpoint()
             print(
                 "[accept] ACTION: swipe left once to select {}".format(label)
             )
@@ -1317,22 +1317,23 @@ class FirmwareShellAcceptance:
                 "swipe left - launcher selection {}: {}"
                 .format(selection, label)
             )
-            self.dev.wait_line(
+            self.device.wait_line(
                 lambda line, expected=expected_selection: expected in line,
                 checkpoint,
                 self.args.touch_timeout,
                 "a physical left swipe selecting {}".format(label),
             )
 
-            launch_sequence = self._transition("input plus", marker)
+            self._transition("input plus", marker)
             self._probe_mode(mode, "{} launch".format(label))
+            baseline_checkpoint = self.device.checkpoint()
             baseline = self._wait_epoch(
-                launch_sequence,
+                baseline_checkpoint,
                 lambda sample: sample.epoch is not None,
                 "{} epoch after launch".format(label),
             )
 
-            reset_checkpoint = self.dev.checkpoint()
+            reset_checkpoint = self.device.checkpoint()
             self._send_wait_exact("reset", "@DEV RESET_REQUESTED")
             reset = self._wait_epoch(
                 reset_checkpoint,
@@ -1351,6 +1352,16 @@ class FirmwareShellAcceptance:
             self._transition("input pwr 120", MODE_LAUNCHER)
             self._probe_mode("launcher", "{} home".format(label))
 
+        checkpoint = self.device.checkpoint()
+        self.device.echo_send("input swipe-left")
+        expected_selection = "swipe left - launcher selection 0: Fluid Box"
+        self.device.wait_line(
+            lambda line: expected_selection in line,
+            checkpoint,
+            self.args.timeout,
+            "launcher selection restored to Fluid Box after app checks",
+        )
+
 
     def check_once(self):
         self._ensure_launcher()
@@ -1358,7 +1369,7 @@ class FirmwareShellAcceptance:
         self._transition("input plus", MODE_FLUID)
         self._probe_mode("fluid_box", "launch/home health warm-up")
         health = self._health_baseline(
-            self.dev.checkpoint(), "launch/home"
+            self.device.checkpoint(), "launch/home"
         )
         self._transition("input pwr 120", MODE_LAUNCHER)
         launcher = self.launcher_frame or self._capture("launcher-before-once")
@@ -1367,7 +1378,7 @@ class FirmwareShellAcceptance:
         self._probe_mode("fluid_box", "launch")
         fluid = self._capture("fluid-after-launch")
         self._assert_distinct(launcher, fluid, "launch")
-        action_end = self.dev.checkpoint()
+        action_end = self.device.checkpoint()
         self._assert_health(health, action_end, "launch/home")
 
         self._transition("input pwr 120", MODE_LAUNCHER)
@@ -1384,7 +1395,7 @@ class FirmwareShellAcceptance:
         self._transition("input plus", MODE_FLUID)
         self._probe_mode("fluid_box", "transition-cycle health warm-up")
         health = self._health_baseline(
-            self.dev.checkpoint(),
+            self.device.checkpoint(),
             "{} transition cycles".format(self.args.cycles),
         )
         self._transition("input pwr 120", MODE_LAUNCHER)
@@ -1408,7 +1419,7 @@ class FirmwareShellAcceptance:
                         "{} plain relaunch cycles changed reset_epoch from {} to {}"
                         .format(self.args.cycles, baseline_epoch.epoch, final_epoch.epoch)
                     )
-                action_end = self.dev.checkpoint()
+                action_end = self.device.checkpoint()
                 self._assert_health(health, action_end, "transition cycles")
             self._transition("input pwr 120", MODE_LAUNCHER)
             if cycle == 1 or cycle % 10 == 0 or cycle == self.args.cycles:
@@ -1416,7 +1427,7 @@ class FirmwareShellAcceptance:
 
     def check_freeze(self):
         self._ensure_fluid()
-        entry_sequence = self.dev.checkpoint()
+        entry_sequence = self.device.checkpoint()
         initial = self._wait_epoch(
             entry_sequence,
             lambda sample: sample.epoch is not None,
@@ -1425,7 +1436,7 @@ class FirmwareShellAcceptance:
         health = self._health_baseline(entry_sequence, "freeze/resume")
 
         self._send_wait_prefix("motion 0 0 6 0", "@DEV MOTION ")
-        reset_checkpoint = self.dev.checkpoint()
+        reset_checkpoint = self.device.checkpoint()
         self._send_wait_exact("reset", "@DEV RESET_REQUESTED")
         reset_sample = self._wait_epoch(
             reset_checkpoint,
@@ -1454,7 +1465,7 @@ class FirmwareShellAcceptance:
             )
 
         calibration_drifts = [
-            frame_distance(left, right)
+            mean_frame_distance(left, right)
             for left, right in zip(calibration_frames, calibration_frames[1:])
         ]
         normal_drift_min = min(calibration_drifts)
@@ -1489,8 +1500,8 @@ class FirmwareShellAcceptance:
                 .format(reset_sample.epoch, resumed_sample.epoch)
             )
 
-        distance_to_frozen = frame_distance(evolved, resumed)
-        distance_to_reset = frame_distance(reset_frame, resumed)
+        distance_to_frozen = mean_frame_distance(evolved, resumed)
+        distance_to_reset = mean_frame_distance(reset_frame, resumed)
         print(
             "[accept] resume distances: frozen={:.6f} reset={:.6f} "
             "absolute tolerance={:.6f}"
@@ -1514,8 +1525,8 @@ class FirmwareShellAcceptance:
                 .format(distance_to_frozen, distance_to_reset)
             )
 
-        plus_checkpoint = self.dev.checkpoint()
-        self.dev.echo_send("input plus")
+        plus_checkpoint = self.device.checkpoint()
+        self.device.echo_send("input plus")
         plus_sample = self._wait_epoch(
             plus_checkpoint,
             lambda sample: sample.epoch is not None and sample.epoch != resumed_sample.epoch,
@@ -1527,7 +1538,7 @@ class FirmwareShellAcceptance:
                 .format(resumed_sample.epoch, plus_sample.epoch)
             )
 
-        action_end = self.dev.checkpoint()
+        action_end = self.device.checkpoint()
         self._assert_health(health, action_end, "freeze/resume")
         self._transition("input pwr 120", MODE_LAUNCHER)
         self.launcher_frame = launcher
@@ -1546,12 +1557,12 @@ class FirmwareShellAcceptance:
             self._ensure_launcher()
             soak_entry = self._transition("input plus", MODE_FLUID)
         else:
-            soak_entry = self.dev.checkpoint()
+            soak_entry = self.device.checkpoint()
 
         label = "bounded soak"
 
         def reject_forbidden_line(line: str):
-            self.dev._raise_if_command_rejected(line, label)
+            self.device._raise_if_command_rejected(line, label)
             stripped = line.strip()
             if stripped == MODE_LAUNCHER:
                 raise UserError(
@@ -1592,7 +1603,7 @@ class FirmwareShellAcceptance:
             timeout: float,
             description: str,
         ) -> tuple[int, str]:
-            return self.dev.wait_line(
+            return self.device.wait_line(
                 observe_complete_telemetry,
                 after,
                 timeout,
@@ -1622,7 +1633,7 @@ class FirmwareShellAcceptance:
 
         def scan_through(after: int, through: int) -> int:
             cursor = after
-            for sequence, line in self.dev.lines_since(after):
+            for sequence, line in self.device.lines_since(after):
                 if sequence > through:
                     break
                 reject_forbidden_line(line)
@@ -1644,7 +1655,7 @@ class FirmwareShellAcceptance:
         cursor = scan_through(entry_checkpoint, baseline_sequence)
 
         start_frame = self._capture("fluid-soak-start")
-        cursor = scan_through(cursor, self.dev.checkpoint())
+        cursor = scan_through(cursor, self.device.checkpoint())
         deadline = time.monotonic() + self.args.soak_seconds
 
         while True:
@@ -1662,7 +1673,7 @@ class FirmwareShellAcceptance:
                     ).format(label),
                 )
             except AcceptanceTimeout:
-                cursor = scan_through(cursor, self.dev.checkpoint())
+                cursor = scan_through(cursor, self.device.checkpoint())
                 if time.monotonic() >= deadline:
                     break
                 raise
@@ -1671,7 +1682,7 @@ class FirmwareShellAcceptance:
         end_frame = self._capture("fluid-soak-end")
         self._assert_frame_shape(start_frame, "fluid-soak-start")
         self._assert_frame_shape(end_frame, "fluid-soak-end")
-        action_end = self.dev.checkpoint()
+        action_end = self.device.checkpoint()
         cursor = scan_through(cursor, action_end)
 
         post_sequence, _ = wait_complete_telemetry(
@@ -1684,12 +1695,12 @@ class FirmwareShellAcceptance:
         cursor = scan_through(cursor, post_sequence)
         self._assert_health(health, action_end, label)
 
-        home_checkpoint = self.dev.checkpoint()
+        home_checkpoint = self.device.checkpoint()
         cursor = scan_through(cursor, home_checkpoint)
-        self.dev.echo_send("input pwr 120")
+        self.device.echo_send("input pwr 120")
 
         def accept_cleanup_launcher(line: str) -> bool:
-            self.dev._raise_if_command_rejected(
+            self.device._raise_if_command_rejected(
                 line, "the deliberate cleanup Home for {}".format(label)
             )
             stripped = line.strip()
@@ -1718,7 +1729,7 @@ class FirmwareShellAcceptance:
             validate_telemetry_health(0, line)
             return False
 
-        self.dev.wait_line(
+        self.device.wait_line(
             accept_cleanup_launcher,
             home_checkpoint,
             self.args.timeout,
@@ -1735,17 +1746,17 @@ class FirmwareShellAcceptance:
             raise UserError(
                 "--power-off-min-absence must be less than --power-off-timeout"
             )
-        checkpoint = self.dev.checkpoint()
-        self.dev.echo_send("input pwr 3000")
+        checkpoint = self.device.checkpoint()
+        self.device.echo_send("input pwr 3000")
         deadline = time.monotonic() + self.args.power_off_timeout
         poweroff_marker_seen = False
         marker_seen_at = None
         absent_since = None
 
-        def reject_protocol_activity(dev):
+        def reject_protocol_activity(device):
             nonlocal poweroff_marker_seen, marker_seen_at
-            for _, line in dev.lines_since(checkpoint):
-                dev._raise_if_command_rejected(
+            for _, line in device.lines_since(checkpoint):
+                device._raise_if_command_rejected(
                     line,
                     "battery-latch release after long PWR input",
                 )
@@ -1761,16 +1772,16 @@ class FirmwareShellAcceptance:
                     )
 
         def close_and_scan_device():
-            dev = self.dev
-            dev.close()
-            reject_protocol_activity(dev)
-            self.dev = None
+            device = self.device
+            device.close()
+            reject_protocol_activity(device)
+            self.device = None
 
         while time.monotonic() < deadline:
-            if self.dev is not None:
-                reject_protocol_activity(self.dev)
+            if self.device is not None:
+                reject_protocol_activity(self.device)
                 transport_lost = (
-                    not self.dev.reader.is_alive()
+                    not self.device.reader.is_alive()
                     or (
                         self._identity_was_enumerated
                         and not self.port_identity.present_devices()
@@ -1779,7 +1790,7 @@ class FirmwareShellAcceptance:
                 if transport_lost:
                     close_and_scan_device()
 
-            if self.dev is None:
+            if self.device is None:
                 present = self.port_identity.present_devices()
                 now = time.monotonic()
                 if not present:
@@ -1806,7 +1817,7 @@ class FirmwareShellAcceptance:
                         min(STATUS_RETRY_SECONDS, remaining),
                     )
                 except AcceptanceTimeout as exc:
-                    reject_protocol_activity(self.dev)
+                    reject_protocol_activity(self.device)
                     raise UserError(
                         "long PWR input kept USB connected but did not return one "
                         "fresh STATUS after the synthetic release/debounce window"
@@ -1815,9 +1826,9 @@ class FirmwareShellAcceptance:
                     close_and_scan_device()
                     continue
 
-                reject_protocol_activity(self.dev)
+                reject_protocol_activity(self.device)
                 transport_lost = (
-                    not self.dev.reader.is_alive()
+                    not self.device.reader.is_alive()
                     or (
                         self._identity_was_enumerated
                         and not self.port_identity.present_devices()
@@ -1847,9 +1858,9 @@ class FirmwareShellAcceptance:
 
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
-        if self.dev is not None:
-            reject_protocol_activity(self.dev)
-            if self.dev.reader.is_alive():
+        if self.device is not None:
+            reject_protocol_activity(self.device)
+            if self.device.reader.is_alive():
                 if not poweroff_marker_seen:
                     raise UserError(
                         "long PWR input did not emit the required post-command "

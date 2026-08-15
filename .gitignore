@@ -11,3 +11,4 @@ __pycache__/
 
 # Machine-local tool configuration
 eim_config.toml
+omp-session-*.html
